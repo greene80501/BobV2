@@ -348,15 +348,184 @@ Bob has `WebSearchMode` in config and the config schema references it, but wheth
 
 ---
 
+---
+
+## 11. Voice & Realtime Conversation
+
+### 11.1 Voice Input / STT `[CC+CX]` MISSING
+Both Claude Code and Codex have full voice-to-text support:
+- Real-time audio streaming from microphone
+- STT (speech-to-text) transcription fed as prompt text
+- Audio device selection (microphone/speaker)
+- Voice mode toggle via `/voice` (Claude Code)
+
+Bob has no audio input/output at all.
+
+**Fix**: Wire up `openai.audio.speech` (TTS) and `openai.audio.transcriptions` (STT) via a `/voice` toggle command. Could use `sounddevice` + `openai` Whisper endpoint. Lower priority than code features but important for accessibility.
+
+### 11.2 Realtime Conversation Protocol `[CC+CX]` MISSING
+Claude Code and Codex both support OpenAI's Realtime API — continuous two-way audio with the model, without the turn-based prompt loop. Bob has `enable_realtime: bool` in config but it's wired to nothing.
+
+---
+
+## 12. Rich Output Rendering
+
+### 12.1 Streaming Markdown in Responses `[CC+CX]` MISSING
+Both Claude Code (React/Ink renderer) and Codex (`markdown_render.rs` — 41KB) render the model's responses with **live markdown formatting**:
+- Bold (`**text**`) rendered bold in terminal
+- Code fences with syntax highlighting
+- Bullet lists with proper indentation
+- Headers as bold+underline lines
+- Inline code with background highlight
+
+Bob streams raw text with no markdown rendering — the `•` prefix is the only formatting.
+
+**Fix**: Parse markdown in `TextDeltaEvent` using `rich.markdown.Markdown` or a streaming state machine. At minimum handle bold, inline code, and code fences.
+
+### 12.2 Colored Diff Rendering `[CC+CX]` MISSING
+Codex has a dedicated `diff_render.rs` (97KB). Claude Code has a `colorDiff.ts` and structured diff component. Both render:
+- `+` lines in green with green background
+- `-` lines in red with red background
+- `@@` hunk headers in cyan/dim
+- Context lines dim
+
+Already listed in §1.2 but worth noting it's a dedicated large module in both peers — not an afterthought.
+
+### 12.3 Reasoning / Thinking Block Display `[CC+CX]` PARTIAL
+Claude Code shows thinking blocks as collapsible sections with a shimmer animation while thinking. Codex streams reasoning summaries. Bob has `show_reasoning: bool` in config but the `_consume_events` loop has no handler for `ReasoningDeltaEvent` or `ReasoningSummaryEvent`.
+
+**Fix**: Add event handlers for reasoning events and render them collapsed by default:
+```
+  ⟨thinking⟩ 847 tokens  [expand]
+```
+
+---
+
+## 13. Diagnostics & Developer Tools
+
+### 13.1 `/doctor` Diagnostic Screen `[CC]` MISSING
+Claude Code's `/doctor` command runs a full diagnostic check:
+- API key validity
+- Network connectivity
+- Config file syntax
+- Permission state
+- Version checks
+- MCP server status
+- Memory system health
+
+Bob has no equivalent. Debugging issues requires reading logs manually.
+
+**Fix**: Add `SlashCommand.DOCTOR` that runs async checks and prints a color-coded report. Highly useful for users troubleshooting setup issues.
+
+### 13.2 `/cost` and `/usage` Commands `[CC]` MISSING
+Claude Code tracks and displays:
+- Per-session token spend (input/output separately)
+- Estimated dollar cost
+- Context window % used
+- Rate limit fill bar
+
+Bob has `CostEstimateEvent` and `TokenBudgetEvent` in the event protocol but discards both in the UI.
+
+**Fix**: Accumulate token counts and cost from events. Display inline after each turn (§1.1 above) and add `/cost` / `/usage` slash commands to show session totals.
+
+### 13.3 Frame Rate Limiting `[CX]` MISSING
+Codex has `frame_rate_limiter.rs` — throttles terminal redraws to ~60fps so streaming output doesn't hammer the terminal and cause flickering or CPU waste. On fast model responses Bob can output characters faster than the terminal can render them cleanly.
+
+---
+
+## 14. Advanced Sandbox Architecture
+
+### 14.1 macOS Seatbelt Policy Files `[CX]` MISSING
+Codex ships `.sbpl` policy files:
+- `seatbelt_base_policy.sbpl` — base sandbox
+- `seatbelt_network_policy.sbpl` — network isolation
+- `restricted_read_only_platform_defaults.sbpl` — read-only mode
+
+Bob's `sandbox/macos.py` exists but likely calls subprocess without a real Seatbelt profile. True sandboxing requires the `sandbox-exec` syscall with a compiled policy.
+
+### 14.2 Linux bubblewrap + Landlock `[CX]` MISSING
+Codex uses `bwrap` (bubblewrap) for container-level isolation on Linux, plus `Landlock` LSM for filesystem access control at the kernel level. Bob's `sandbox/linux.py` needs to be verified — it may be a stub.
+
+### 14.3 Shell Escalation Detection `[CX]` MISSING
+Codex has a `shell-escalation` module that detects when a tool tries to escape the sandbox via shell metacharacters, `sudo`, `su`, `chroot`, `nsenter`, etc. Bob has no equivalent detection.
+
+---
+
+## 15. Models & API
+
+### 15.1 Model Catalog `[CX]` MISSING
+Codex ships `models.json` (252KB) — a comprehensive registry of all supported models with:
+- Context window sizes
+- Pricing per token
+- Feature flags (supports vision, tools, reasoning, etc.)
+- Recommended defaults per use case
+
+Bob hardcodes `model: str = "gpt-5.1-codex-mini"` in config with no model metadata.
+
+**Fix**: Add a `models.json` catalog (or fetch dynamically via `/v1/models`). Use it to display model capabilities, context limits, and cost estimates.
+
+### 15.2 Prompt Caching Headers `[CC+CX]` MISSING
+Already in §6.1 — worth repeating as the agent confirmed both peers do this. The OpenAI API supports `cache_control` on messages. Anthropic uses `cache_control: {"type": "ephemeral"}`. This is a **free 70-90% cost reduction** on long sessions with stable system prompts.
+
+### 15.3 Extended Thinking / Ultrathink `[CC]` MISSING
+Claude Code has full extended thinking support:
+- Budget token configuration
+- Adaptive thinking based on query complexity
+- Rainbow visualization for thinking blocks
+- Trigger keyword detection (`ultrathink`, `think hard`, etc.)
+- Streaming thinking deltas
+- Collapsible thinking block display
+
+---
+
+## 16. Comparison Summary Table
+
+| Feature Category | Bob V2 | Codex | Claude Code |
+|---|---|---|---|
+| Slash commands | ~35 impl'd of 52 defined | 67 | 105+ |
+| Model tools available | 9 | 13 | 46 |
+| Multi-agent system | Stub only | Full Rust impl | Extensive |
+| Reasoning modes | Basic effort | Full | Ultrathink |
+| Voice / Realtime | None | Partial | Full STT/TTS |
+| Native sandboxing | Basic modes | Seatbelt + bwrap + Landlock | Toggle only |
+| Vi/vim input mode | None | Partial | Full |
+| Theme system | None | Yes | 6 themes |
+| Memory system | Phase1/2 basic | Yes | Extensive |
+| Skills system | Manager exists | Registry | Advanced |
+| Markdown rendering | None | 41KB renderer | Yes |
+| Diff rendering | None | 97KB renderer | Yes |
+| Prompt caching | None | Yes | Yes |
+| Parallel tool execution | No | Yes | Yes |
+| Token/cost display | None | Yes | Yes |
+| Web fetch | None | Partial | Yes |
+| LSP integration | None | None | Yes (LSPTool) |
+| IDE bridge | None | None | Yes (VS Code) |
+| Voice support | None | Partial | Full |
+| Jupyter notebooks | None | None | Yes (NotebookEditTool) |
+| Diagnostics (/doctor) | None | None | Yes |
+| Analytics/telemetry | None | Partial | Yes |
+| Session sharing | None | None | Yes |
+| Git worktrees | None | None | Yes |
+| Persistent history | ✓ (just added) | Yes | Yes |
+
+---
+
 ## Quick Win Priority List (Do These First)
 
-1. **Token + cost display after each turn** — 1 hour, high visibility, data already available
-2. **Persistent command history** — swap `InMemoryHistory` for `FileHistory` — 15 minutes
-3. **`/help` command** — render COMMAND_DESCRIPTIONS nicely — 30 minutes
-4. **`/model` slash command** — change model at runtime — 1 hour
-5. **`/effort` slash command** — change reasoning effort at runtime — 30 minutes
-6. **Brand-orange `•` for assistant output** — change `_p("• ", end="")` to use `\033[38;2;215;119;87m` — 5 minutes
-7. **Spinner shows tool name** — pass tool name to spinner when it starts — 30 minutes
+**Already done this session:**
+- ✓ Brand-orange `•` for assistant output (`\033[38;2;215;119;87m`)
+- ✓ Persistent command history (`FileHistory` → `~/.bob/history`)
+- ✓ Exact Anthropic brand color in welcome screen (24-bit RGB)
+
+**Next — low effort, high visibility:**
+
+1. **Token + cost display after each turn** — 1 hour, data already available in `TurnEndedEvent`
+2. **`/help` command** — render COMMAND_DESCRIPTIONS nicely — 30 minutes
+3. **`/model` slash command** — change model at runtime — 1 hour
+4. **`/effort` slash command** — change reasoning effort at runtime — 30 minutes
+5. **Spinner shows current tool name** — pass tool label to spinner — 30 minutes
+6. **Reasoning block display** — add handler for `ReasoningDeltaEvent` — 1 hour
+7. **`/doctor` diagnostic command** — check API, config, MCP — 2 hours
 8. **Parallel tool execution** with `asyncio.gather` in `turn.py` — 2 hours, big speed win
 9. **Colored patch/diff output** in `_print_tool_output` — 2 hours
-10. **Prompt caching headers** on system message — 1 hour, reduces cost 70%+ on long sessions
+10. **Prompt caching headers** on system message — 1 hour, **reduces cost 70%+ on long sessions**

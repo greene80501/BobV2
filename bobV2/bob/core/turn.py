@@ -222,6 +222,10 @@ async def run_turn(
 
             current_history = session.context_manager.raw_items()
             tool_specs = session.tool_registry.get_tool_specs()
+            # In plan mode: only expose read-only tools
+            if getattr(session, "_plan_mode", False):
+                _write_tools = {"write_file", "edit_file", "shell", "apply_patch"}
+                tool_specs = [s for s in tool_specs if s.get("function", {}).get("name") not in _write_tools]
 
             text_parts: list[str] = []
             tool_calls: list[ClientToolCall] = []
@@ -538,6 +542,8 @@ async def run_turn(
                     ctx = ToolContext(session)
                     ctx.on_output_delta = on_output_delta
                     ctx.on_plan_update = on_plan_update
+                    ctx.thread_manager = session.ensure_thread_manager()
+                    ctx.on_request_user_input = session.request_user_input
 
                     import time
                     t0 = time.monotonic()

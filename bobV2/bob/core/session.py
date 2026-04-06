@@ -21,10 +21,12 @@ class ToolContext:
         self.sandbox = session._sandbox_runner
         self.cancel_event = session._cancel_event
         self.approval_policy = session.config.ask_for_approval
-        self.thread_manager = None   # set later for multi-agent
+        self.thread_manager = None   # set per-turn for multi-agent
         self.on_output_delta = None  # set per-turn
         self.on_plan_update = None   # set per-turn
         self.on_request_user_input = None
+        # Back-reference so plan_mode tools can toggle the flag
+        self._session = session
 
 
 class BobSession:
@@ -96,6 +98,15 @@ class BobSession:
         self.tool_registry = ToolRegistry()
         self._register_builtin_tools()
 
+        # Plan mode: when True, write tools are filtered out of tool specs
+        self._plan_mode: bool = False
+
+        # Multi-agent thread manager (lazy)
+        self._thread_manager = None
+
+        # Pending user-input futures keyed by request_id
+        self._pending_user_inputs: dict[str, asyncio.Future] = {}
+
         # Persistence handles — populated in _setup_persistence
         self._recorder = None
         self._state_db = None
@@ -130,7 +141,63 @@ class BobSession:
         from bob.tools.list_dir import (
             list_dir_handler, LIST_DIR_DESCRIPTION, LIST_DIR_SCHEMA,
         )
+        from bob.tools.read_file import (
+            read_file_handler, READ_FILE_DESCRIPTION, READ_FILE_SCHEMA,
+        )
+        from bob.tools.write_file import (
+            write_file_handler, WRITE_FILE_DESCRIPTION, WRITE_FILE_SCHEMA,
+        )
+        from bob.tools.edit_file import (
+            edit_file_handler, EDIT_FILE_DESCRIPTION, EDIT_FILE_SCHEMA,
+        )
+        from bob.tools.glob_files import (
+            glob_files_handler, GLOB_FILES_DESCRIPTION, GLOB_FILES_SCHEMA,
+        )
+        from bob.tools.grep_files import (
+            grep_files_handler, GREP_FILES_DESCRIPTION, GREP_FILES_SCHEMA,
+        )
+        from bob.tools.sleep_tool import (
+            sleep_handler, SLEEP_DESCRIPTION, SLEEP_SCHEMA,
+        )
+        from bob.tools.todo_write import (
+            todo_write_handler, TODO_WRITE_DESCRIPTION, TODO_WRITE_SCHEMA,
+        )
+        from bob.tools.plan_mode import (
+            enter_plan_mode_handler, ENTER_PLAN_MODE_DESCRIPTION, ENTER_PLAN_MODE_SCHEMA,
+            exit_plan_mode_handler, EXIT_PLAN_MODE_DESCRIPTION, EXIT_PLAN_MODE_SCHEMA,
+        )
+        from bob.tools.web_fetch import (
+            web_fetch_handler, WEB_FETCH_DESCRIPTION, WEB_FETCH_SCHEMA,
+        )
+        from bob.tools.web_search import (
+            web_search_handler, WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA,
+        )
+        from bob.tools.js_repl import (
+            js_repl_handler, JS_REPL_DESCRIPTION, JS_REPL_SCHEMA,
+        )
+        from bob.tools.notebook_read import (
+            notebook_read_handler, NOTEBOOK_READ_DESCRIPTION, NOTEBOOK_READ_SCHEMA,
+        )
+        from bob.tools.notebook_edit import (
+            notebook_edit_handler, NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA,
+        )
+        from bob.tools.multi_agent.spawn_agent import (
+            spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
+        )
+        from bob.tools.multi_agent.send_message import (
+            send_message_handler, SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
+        )
+        from bob.tools.multi_agent.wait_agent import (
+            wait_agent_handler, WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
+        )
+        from bob.tools.multi_agent.list_agents import (
+            list_agents_handler, LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
+        )
+        from bob.tools.multi_agent.close_agent import (
+            close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
+        )
 
+        # Core tools
         self.tool_registry.register(
             "shell", SHELL_TOOL_DESCRIPTION, SHELL_TOOL_SCHEMA, shell_handler
         )
@@ -143,6 +210,97 @@ class BobSession:
         self.tool_registry.register(
             "list_dir", LIST_DIR_DESCRIPTION, LIST_DIR_SCHEMA, list_dir_handler
         )
+        # Phase 1 — file tools
+        self.tool_registry.register(
+            "read_file", READ_FILE_DESCRIPTION, READ_FILE_SCHEMA, read_file_handler
+        )
+        self.tool_registry.register(
+            "write_file", WRITE_FILE_DESCRIPTION, WRITE_FILE_SCHEMA, write_file_handler
+        )
+        self.tool_registry.register(
+            "edit_file", EDIT_FILE_DESCRIPTION, EDIT_FILE_SCHEMA, edit_file_handler
+        )
+        self.tool_registry.register(
+            "glob_files", GLOB_FILES_DESCRIPTION, GLOB_FILES_SCHEMA, glob_files_handler
+        )
+        self.tool_registry.register(
+            "grep_files", GREP_FILES_DESCRIPTION, GREP_FILES_SCHEMA, grep_files_handler
+        )
+        # Phase 2 — utilities
+        self.tool_registry.register(
+            "sleep", SLEEP_DESCRIPTION, SLEEP_SCHEMA, sleep_handler
+        )
+        self.tool_registry.register(
+            "todo_write", TODO_WRITE_DESCRIPTION, TODO_WRITE_SCHEMA, todo_write_handler
+        )
+        self.tool_registry.register(
+            "enter_plan_mode", ENTER_PLAN_MODE_DESCRIPTION, ENTER_PLAN_MODE_SCHEMA,
+            enter_plan_mode_handler
+        )
+        self.tool_registry.register(
+            "exit_plan_mode", EXIT_PLAN_MODE_DESCRIPTION, EXIT_PLAN_MODE_SCHEMA,
+            exit_plan_mode_handler
+        )
+        self.tool_registry.register(
+            "web_fetch", WEB_FETCH_DESCRIPTION, WEB_FETCH_SCHEMA, web_fetch_handler
+        )
+        self.tool_registry.register(
+            "web_search", WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA, web_search_handler
+        )
+        # Phase 5 — advanced
+        self.tool_registry.register(
+            "js_repl", JS_REPL_DESCRIPTION, JS_REPL_SCHEMA, js_repl_handler
+        )
+        self.tool_registry.register(
+            "notebook_read", NOTEBOOK_READ_DESCRIPTION, NOTEBOOK_READ_SCHEMA, notebook_read_handler
+        )
+        self.tool_registry.register(
+            "notebook_edit", NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA, notebook_edit_handler
+        )
+        # Phase 4 — multi-agent
+        self.tool_registry.register(
+            "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA, spawn_agent_handler
+        )
+        self.tool_registry.register(
+            "send_message", SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA, send_message_handler
+        )
+        self.tool_registry.register(
+            "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA, wait_agent_handler
+        )
+        self.tool_registry.register(
+            "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA, list_agents_handler
+        )
+        self.tool_registry.register(
+            "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA, close_agent_handler
+        )
+
+    def ensure_thread_manager(self):
+        """Lazily create and cache the ThreadManager."""
+        if self._thread_manager is None:
+            from bob.core.thread_manager import ThreadManager
+            self._thread_manager = ThreadManager(self)
+        return self._thread_manager
+
+    async def request_user_input(self, request_id: str, prompt: str, fields: list) -> str:
+        """Called by ask_user tool — creates a future and waits for UserInputAnswerOp."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        self._pending_user_inputs[request_id] = fut
+        # Emit a UserInputRequestEvent so the TUI can prompt the user
+        from bob.protocol.events import UserInputRequestEvent
+        await self._emit(Event(
+            id=request_id,
+            msg=UserInputRequestEvent(
+                type="user_input_request",
+                request_id=request_id,
+                prompt=prompt,
+                fields=fields,
+            )
+        ))
+        try:
+            return await fut
+        finally:
+            self._pending_user_inputs.pop(request_id, None)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -412,6 +570,16 @@ class BobSession:
                 fut = self._pending_approvals.get(op.tool_call_id)
                 if fut and not fut.done():
                     fut.set_result(op.decision)
+                continue
+
+            # ----------------------------------------------------------------
+            # User input answer (from ask_user tool)
+            # ----------------------------------------------------------------
+            from bob.protocol.ops import UserInputAnswerOp
+            if isinstance(op, UserInputAnswerOp):
+                fut = self._pending_user_inputs.get(op.request_id)
+                if fut and not fut.done():
+                    fut.set_result(op.answer)
                 continue
 
             # ----------------------------------------------------------------

@@ -159,6 +159,17 @@ class Interface:
         self._spinner_task:   Optional[asyncio.Task] = None
         self._spinner_stop:   Optional[asyncio.Event] = None
         self._spinner_active = False
+        # Token / cost tracking
+        self._total_input_tokens  = 0
+        self._total_output_tokens = 0
+        self._last_turn_tokens: dict = {}
+        # Context items prepended to next user turn
+        self._pending_context_items: list[str] = []
+        # Output style
+        self._output_style: str = "normal"
+        # VI mode
+        self._vi_mode: bool = False
+        self._vi_mode_changed: bool = False
 
     # ── Dynamic prompt ────────────────────────────────────────────────────────
 
@@ -391,6 +402,12 @@ class Interface:
             TurnStartedEvent,
             WarningEvent,
         )
+        try:
+            from bob.protocol.events import UserInputRequestEvent
+            _has_user_input_event = True
+        except ImportError:
+            _has_user_input_event = False
+            UserInputRequestEvent = None
 
         async for event in self._session.events():
             msg = event.msg
@@ -543,6 +560,12 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
+                    # Token tracking
+                    in_tok  = getattr(msg, "input_tokens",  0) or 0
+                    out_tok = getattr(msg, "output_tokens", 0) or 0
+                    self._total_input_tokens  += in_tok
+                    self._total_output_tokens += out_tok
+                    self._last_turn_tokens = {"input": in_tok, "output": out_tok}
                     _p()   # one blank line = turn boundary (❯ adds visual separation)
 
                 elif isinstance(msg, TurnInterruptedEvent):
@@ -576,12 +599,74 @@ class Interface:
                 elif isinstance(msg, BackgroundTerminalOutputEvent):
                     _p(f"  {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
 
+                elif UserInputRequestEvent is not None and isinstance(msg, UserInputRequestEvent):
+                    await self._stop_spinner()
+                    _p()
+                    _p(f"  {_cb('?')} {msg.prompt}")
+                    try:
+                        ps_tmp = PromptSession()
+                        answer = await ps_tmp.prompt_async(ANSI("  › "))
+                    except (EOFError, KeyboardInterrupt):
+                        answer = ""
+                    from bob.protocol.ops import UserInputAnswerOp
+                    await self._session.submit(
+                        UserInputAnswerOp(request_id=msg.request_id, answer=answer)
+                    )
+                    if self._task_running and not self._spinner_active:
+                        await self._start_spinner()
+
                 elif isinstance(msg, SessionEndedEvent):
                     self._done.set()
                     return
 
             except Exception:
                 pass
+
+    # ── Quick model turn (used by /commit, /summary, /review) ────────────────
+
+    async def _quick_model_turn(self, prompt: str) -> str:
+        """Submit a single user turn and return the accumulated response text.
+
+        Safe to call inside a slash command handler — sets _task_running,
+        drains events until TurnEndedEvent, then returns.
+        """
+        from bob.protocol.items import TextUserInput
+        from bob.protocol.ops import UserTurnOp
+        from bob.protocol.events import (
+            TextDeltaEvent, TurnEndedEvent, TurnInterruptedEvent,
+            ErrorEvent, SessionEndedEvent,
+        )
+
+        self._task_running = True
+        await self._start_spinner()
+        await self._session.submit(
+            UserTurnOp(items=[TextUserInput(type="text", text=prompt)])
+        )
+
+        result_parts: list[str] = []
+        async for event in self._session.events():
+            msg = event.msg
+            if isinstance(msg, TextDeltaEvent):
+                await self._stop_spinner()
+                if not result_parts:
+                    _p(f"\033[38;2;215;119;87m•\033[0m ", end="")
+                _p(msg.delta, end="")
+                result_parts.append(msg.delta)
+            elif isinstance(msg, TurnEndedEvent):
+                if result_parts and not "".join(result_parts).endswith("\n"):
+                    _p()
+                in_tok  = getattr(msg, "input_tokens",  0) or 0
+                out_tok = getattr(msg, "output_tokens", 0) or 0
+                self._total_input_tokens  += in_tok
+                self._total_output_tokens += out_tok
+                self._last_turn_tokens = {"input": in_tok, "output": out_tok}
+                break
+            elif isinstance(msg, (TurnInterruptedEvent, ErrorEvent, SessionEndedEvent)):
+                break
+
+        await self._stop_spinner()
+        self._task_running = False
+        return "".join(result_parts)
 
     # ── Slash dispatch ────────────────────────────────────────────────────────
 
@@ -656,6 +741,25 @@ class Interface:
             await self._session.submit(CleanBackgroundTerminalsOp())
             _p(f"  {_d('stopping background terminals…')}")
 
+        elif cmd == SlashCommand.REVIEW:
+            try:
+                diff = subprocess.run(
+                    ["git", "diff", "HEAD", "--stat"], capture_output=True,
+                    text=True, cwd=Path.cwd(), timeout=5,
+                ).stdout.strip() or "(no diff)"
+                _p(f"  {_d('spawning review agent…')}")
+                tm = self._session.ensure_thread_manager()
+                agent_id = await tm.spawn(
+                    task=(
+                        f"Review the following git diff and identify any bugs, "
+                        f"security issues, or improvements needed:\n\n{diff}"
+                    ),
+                    template="verify",
+                )
+                _p(f"  {_d(f'review agent started (id={agent_id})')}")
+            except Exception as exc:
+                _p(f"  {_r('✗')} {exc}")
+
         elif cmd == SlashCommand.RENAME:
             name = args.strip()
             if name:
@@ -702,6 +806,307 @@ class Interface:
             from bob.protocol.ops import DropMemoriesOp
             await self._session.submit(DropMemoriesOp())
             _p(f"  {_d('dropped all memories')}")
+
+        # ── Phase 1: help, model, effort, cost, usage ─────────────────────────
+
+        elif cmd == SlashCommand.HELP:
+            _p()
+            groups = [
+                ("Navigation",  [SlashCommand.NEW, SlashCommand.RESUME, SlashCommand.FORK,
+                                  SlashCommand.REWIND, SlashCommand.CLEAR]),
+                ("Session",     [SlashCommand.STATUS, SlashCommand.COST, SlashCommand.USAGE,
+                                  SlashCommand.COMPACT, SlashCommand.EXPORT, SlashCommand.COPY,
+                                  SlashCommand.RENAME]),
+                ("Tools",       [SlashCommand.DIFF, SlashCommand.COMMIT, SlashCommand.BRANCH,
+                                  SlashCommand.CONTEXT, SlashCommand.SUMMARY, SlashCommand.REVIEW]),
+                ("Config",      [SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.OUTPUT_STYLE,
+                                  SlashCommand.THEME, SlashCommand.VI, SlashCommand.APPROVALS]),
+                ("Agent",       [SlashCommand.PLAN, SlashCommand.AGENT, SlashCommand.SUBAGENTS,
+                                  SlashCommand.MCP, SlashCommand.HOOKS]),
+                ("System",      [SlashCommand.DOCTOR, SlashCommand.INIT, SlashCommand.FEEDBACK,
+                                  SlashCommand.QUIT]),
+            ]
+            for group, cmds in groups:
+                _p(f"  {_b(group)}")
+                for c in cmds:
+                    desc = COMMAND_DESCRIPTIONS.get(c, "")
+                    _p(f"    {_c('/' + c.value):<30}  {_d(desc)}")
+                _p()
+
+        elif cmd == SlashCommand.MODEL:
+            name = args.strip()
+            if name:
+                self._config = self._config.model_copy(update={"model": name})
+                from bob.protocol.ops import OverrideTurnContextOp
+                await self._session.submit(OverrideTurnContextOp(model=name))
+                _p(f"  {_d(f'model set to: {name}')}")
+            else:
+                _p(f"  {_d(f'current model: {self._config.model}')}")
+
+        elif cmd == SlashCommand.EFFORT:
+            level = args.strip().lower()
+            valid = {"low", "medium", "high"}
+            if level not in valid:
+                _p(f"  {_y('⚠')} usage: /effort <low|medium|high>")
+            else:
+                try:
+                    from bob.config.schema import ReasoningEffort
+                    effort_map = {
+                        "low":    ReasoningEffort.LOW,
+                        "medium": ReasoningEffort.MEDIUM,
+                        "high":   ReasoningEffort.HIGH,
+                    }
+                    self._config = self._config.model_copy(
+                        update={"reasoning_effort": effort_map[level]}
+                    )
+                    _p(f"  {_d(f'reasoning effort set to: {level}')}")
+                except Exception:
+                    _p(f"  {_d(f'reasoning effort set to: {level}')}")
+
+        elif cmd == SlashCommand.COST:
+            # Rough cost estimate (OpenAI pricing as of 2024, per 1k tokens)
+            _RATES: dict[str, tuple[float, float]] = {
+                "gpt-4o":           (0.005,  0.015),
+                "gpt-4o-mini":      (0.00015, 0.0006),
+                "gpt-4-turbo":      (0.01,   0.03),
+                "gpt-4":            (0.03,   0.06),
+                "gpt-3.5-turbo":    (0.0005, 0.0015),
+                "o1":               (0.015,  0.06),
+                "o1-mini":          (0.003,  0.012),
+                "o3-mini":          (0.0011, 0.0044),
+            }
+            model_key = self._config.model.lower()
+            rate_in, rate_out = 0.0, 0.0
+            for k, rates in _RATES.items():
+                if k in model_key:
+                    rate_in, rate_out = rates
+                    break
+            cost_in  = self._total_input_tokens  / 1000 * rate_in
+            cost_out = self._total_output_tokens / 1000 * rate_out
+            total_cost = cost_in + cost_out
+            _p()
+            _p(f"  {_d('input tokens')}   {self._total_input_tokens:>10,}   ${cost_in:.4f}")
+            _p(f"  {_d('output tokens')}  {self._total_output_tokens:>10,}   ${cost_out:.4f}")
+            _p(f"  {_d('total estimate')} {'':>10}   ${total_cost:.4f}")
+            if rate_in == 0:
+                _p(f"  {_d('(rates unknown for this model)')}")
+            _p()
+
+        elif cmd == SlashCommand.USAGE:
+            t = self._last_turn_tokens
+            if not t:
+                _p(f"  {_d('no turns yet')}")
+            else:
+                _p()
+                _p(f"  {_d('last turn input')}   {t.get('input', 0):>8,}")
+                _p(f"  {_d('last turn output')}  {t.get('output', 0):>8,}")
+                _p()
+
+        # ── Phase 3: git, export, rewind, summary, doctor, context, style ─────
+
+        elif cmd == SlashCommand.COMMIT:
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--short"], capture_output=True, text=True,
+                    cwd=Path.cwd(), timeout=5,
+                ).stdout.strip()
+                if not status:
+                    _p(f"  {_d('nothing to commit')}")
+                    return False
+                # Auto-stage if nothing is staged
+                staged = subprocess.run(
+                    ["git", "diff", "--cached", "--name-only"], capture_output=True,
+                    text=True, cwd=Path.cwd(), timeout=5,
+                ).stdout.strip()
+                if not staged:
+                    _p(f"  {_d('staging all changes…')}")
+                    subprocess.run(["git", "add", "-A"], cwd=Path.cwd(), timeout=5)
+                diff = subprocess.run(
+                    ["git", "diff", "--cached"], capture_output=True, text=True,
+                    cwd=Path.cwd(), timeout=5,
+                ).stdout[:8000]
+                _p(f"  {_d('generating commit message…')}")
+                msg = await self._quick_model_turn(
+                    f"Write a concise git commit message (one line) for this diff. "
+                    f"Output ONLY the message text, nothing else.\n\n{diff}"
+                )
+                msg = msg.strip().strip('"').strip("'")
+                if msg:
+                    result = subprocess.run(
+                        ["git", "commit", "-m", msg], capture_output=True, text=True,
+                        cwd=Path.cwd(), timeout=10,
+                    )
+                    if result.returncode == 0:
+                        _p(f"  {_g('✓')} committed: {msg[:80]}")
+                    else:
+                        _p(f"  {_r('✗')} git commit failed: {result.stderr.strip()}")
+            except Exception as exc:
+                _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.BRANCH:
+            name = args.strip()
+            if not name:
+                _p(f"  {_y('⚠')} usage: /branch <name>")
+            else:
+                try:
+                    result = subprocess.run(
+                        ["git", "checkout", "-b", name], capture_output=True,
+                        text=True, cwd=Path.cwd(), timeout=5,
+                    )
+                    if result.returncode == 0:
+                        _p(f"  {_g('✓')} created and checked out branch: {name}")
+                    else:
+                        _p(f"  {_r('✗')} {result.stderr.strip()}")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.EXPORT:
+            import time as _time
+            dest = args.strip()
+            if not dest:
+                ts = int(_time.time())
+                dest = str(Path.home() / f"bob-export-{ts}.md")
+            try:
+                items = self._session.context_manager.raw_items()
+                lines = [f"# Bob Session Export\n"]
+                for item in items:
+                    role = item.get("role", "")
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        text = "".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    else:
+                        text = str(content)
+                    if role == "user":
+                        lines.append(f"\n## User\n\n{text}\n")
+                    elif role == "assistant":
+                        lines.append(f"\n## Bob\n\n{text}\n")
+                Path(dest).write_text("\n".join(lines), encoding="utf-8")
+                _p(f"  {_g('✓')} exported to: {dest}")
+            except Exception as exc:
+                _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.REWIND:
+            try:
+                n = int(args.strip()) if args.strip() else 1
+            except ValueError:
+                n = 1
+            from bob.protocol.ops import UndoOp
+            await self._session.submit(UndoOp(turns=n))
+            _p(f"  {_d(f'rewound {n} turn(s)')}")
+
+        elif cmd == SlashCommand.SUMMARY:
+            _p(f"  {_d('summarizing session…')}")
+            await self._quick_model_turn(
+                "Summarize what has been accomplished in this session so far. "
+                "Be concise — highlight key decisions, files changed, and current state."
+            )
+
+        elif cmd == SlashCommand.DOCTOR:
+            import shutil as _shutil
+            _p()
+            checks: list[tuple[bool, str]] = []
+
+            # 1. API key
+            api_key = (
+                getattr(self._config, "api_key", "") or
+                os.environ.get("OPENAI_API_KEY", "") or
+                os.environ.get("BOB_API_KEY", "")
+            )
+            checks.append((bool(api_key), "OPENAI_API_KEY is set"))
+
+            # 2. Git available
+            checks.append((bool(_shutil.which("git")), "git is in PATH"))
+
+            # 3. Config valid
+            try:
+                self._config.model_validate(self._config.model_dump())
+                checks.append((True, "config is valid"))
+            except Exception as exc:
+                checks.append((False, f"config error: {exc}"))
+
+            # 4. httpx available (for web_fetch)
+            try:
+                import httpx
+                checks.append((True, "httpx available (web_fetch)"))
+            except ImportError:
+                checks.append((False, "httpx not installed (pip install httpx)"))
+
+            # 5. Node.js available (for js_repl)
+            checks.append((bool(_shutil.which("node")), "node.js in PATH (js_repl)"))
+
+            for ok, label in checks:
+                icon = _g("✓") if ok else _r("✗")
+                _p(f"  {icon}  {label}")
+            _p()
+
+        elif cmd == SlashCommand.CONTEXT:
+            arg = args.strip()
+            if not arg:
+                _p(f"  {_y('⚠')} usage: /context <url|file>")
+            else:
+                try:
+                    if arg.startswith("http://") or arg.startswith("https://"):
+                        try:
+                            import httpx
+                            async with httpx.AsyncClient(follow_redirects=True, timeout=15) as cl:
+                                resp = await cl.get(arg, headers={"User-Agent": "bob/1.0"})
+                                raw = resp.text
+                            try:
+                                import html2text
+                                h = html2text.HTML2Text()
+                                h.ignore_links = False
+                                h.body_width = 0
+                                raw = h.handle(raw)
+                            except ImportError:
+                                pass
+                            raw = raw[:20000]
+                            self._pending_context_items.append(f"[Context from {arg}]\n{raw}")
+                            _p(f"  {_g('✓')} added URL context ({len(raw)} chars)")
+                        except ImportError:
+                            _p(f"  {_r('✗')} httpx not installed")
+                    else:
+                        p = Path(arg)
+                        if not p.is_absolute():
+                            p = Path.cwd() / p
+                        text = p.read_text(encoding="utf-8", errors="replace")[:20000]
+                        self._pending_context_items.append(f"[Context from {p.name}]\n{text}")
+                        _p(f"  {_g('✓')} added file context: {p.name} ({len(text)} chars)")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.OUTPUT_STYLE:
+            style = args.strip().lower()
+            valid = {"brief", "normal", "verbose"}
+            if style not in valid:
+                _p(f"  {_y('⚠')} usage: /output-style <brief|normal|verbose>")
+            else:
+                self._output_style = style
+                _p(f"  {_d(f'output style set to: {style}')}")
+
+        # ── Phase 5: vi mode, hooks ────────────────────────────────────────────
+
+        elif cmd == SlashCommand.VI:
+            self._vi_mode = not self._vi_mode
+            self._vi_mode_changed = True
+            state = "enabled" if self._vi_mode else "disabled"
+            _p(f"  {_d(f'vi mode {state}')}")
+
+        elif cmd == SlashCommand.HOOKS:
+            hooks = getattr(self._config, "hooks", [])
+            if not hooks:
+                _p(f"  {_d('no hooks configured')}")
+            else:
+                _p()
+                for h in hooks:
+                    name    = getattr(h, "name",    "?")
+                    event   = getattr(h, "event",   "?")
+                    command = getattr(h, "command",  "?")
+                    timeout = getattr(h, "timeout", "")
+                    _p(f"  {_b(name)}  {_d(event)}  {command}" + (f"  {_d(str(timeout)+'ms')}" if timeout else ""))
+                _p()
 
         else:
             _p(f"  {_y('⚠')} /{cmd.value} not yet implemented")
@@ -757,12 +1162,17 @@ class Interface:
         _hist_dir = Path.home() / ".bob"
         _hist_dir.mkdir(parents=True, exist_ok=True)
         _history = FileHistory(str(_hist_dir / "history"))
-        ps: PromptSession = PromptSession(
-            history=_history,
-            completer=completer,
-            complete_while_typing=True,
-            enable_history_search=True,
-        )
+
+        def _make_session() -> PromptSession:
+            return PromptSession(
+                history=_history,
+                completer=completer,
+                complete_while_typing=True,
+                enable_history_search=True,
+                vi_mode=self._vi_mode,
+            )
+
+        ps: PromptSession = _make_session()
 
         self._print_header()   # rich Panel — before patch_stdout
 
@@ -772,6 +1182,11 @@ class Interface:
             try:
                 while True:
                     completer.task_running = self._task_running
+
+                    # Recreate PromptSession if vi mode was toggled
+                    if self._vi_mode_changed:
+                        self._vi_mode_changed = False
+                        ps = _make_session()
 
                     # ── Wait while busy ───────────────────────────────────────
                     if self._task_running or self._pending_approval is not None:
@@ -851,9 +1266,20 @@ class Interface:
                     else:
                         from bob.protocol.items import TextUserInput
                         from bob.protocol.ops import UserTurnOp
+                        # Prepend any pending context items
+                        full_text = text
+                        if self._pending_context_items:
+                            ctx_block = "\n\n".join(self._pending_context_items)
+                            full_text = f"{ctx_block}\n\n{text}"
+                            self._pending_context_items.clear()
+                        # Inject output style directive
+                        if self._output_style != "normal":
+                            full_text = (
+                                f"[Respond in {self._output_style} style]\n{full_text}"
+                            )
                         self._task_running = True   # optimistic: prevents stray › before TurnStartedEvent
                         await self._session.submit(
-                            UserTurnOp(items=[TextUserInput(type="text", text=text)])
+                            UserTurnOp(items=[TextUserInput(type="text", text=full_text)])
                         )
 
                     if self._done.is_set() or self._exit_requested.is_set():

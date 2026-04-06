@@ -50,6 +50,23 @@ class SlashCommand(str, Enum):
     SUBAGENTS = "subagents"
     DEBUG_M_DROP = "debug-m-drop"
     DEBUG_M_UPDATE = "debug-m-update"
+    # Phase 1 additions
+    HELP = "help"
+    EFFORT = "effort"
+    COST = "cost"
+    USAGE = "usage"
+    # Phase 3 additions
+    COMMIT = "commit"
+    BRANCH = "branch"
+    EXPORT = "export"
+    REWIND = "rewind"
+    SUMMARY = "summary"
+    DOCTOR = "doctor"
+    CONTEXT = "context"
+    OUTPUT_STYLE = "output-style"
+    # Phase 5 additions
+    VI = "vi"
+    HOOKS = "hooks"
 
 
 COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
@@ -96,6 +113,23 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.SUBAGENTS: "switch the active agent thread",
     SlashCommand.DEBUG_M_DROP: "drop all memories (debug)",
     SlashCommand.DEBUG_M_UPDATE: "update memories (debug)",
+    # Phase 1
+    SlashCommand.HELP: "show all available slash commands",
+    SlashCommand.EFFORT: "set reasoning effort: low, medium, or high",
+    SlashCommand.COST: "show estimated token cost for this session",
+    SlashCommand.USAGE: "show token usage breakdown for the last turn",
+    # Phase 3
+    SlashCommand.COMMIT: "generate a commit message and commit staged changes",
+    SlashCommand.BRANCH: "create and checkout a new git branch: /branch <name>",
+    SlashCommand.EXPORT: "export conversation to a Markdown file",
+    SlashCommand.REWIND: "undo the last N turns: /rewind [N]",
+    SlashCommand.SUMMARY: "summarize what has been accomplished this session",
+    SlashCommand.DOCTOR: "run system health checks",
+    SlashCommand.CONTEXT: "add a URL or file as context for the next message",
+    SlashCommand.OUTPUT_STYLE: "set response style: brief, normal, or verbose",
+    # Phase 5
+    SlashCommand.VI: "toggle vi input mode",
+    SlashCommand.HOOKS: "list configured hooks",
 }
 
 AVAILABLE_DURING_TASK: set[SlashCommand] = {
@@ -111,6 +145,9 @@ AVAILABLE_DURING_TASK: set[SlashCommand] = {
 SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.REVIEW, SlashCommand.RENAME, SlashCommand.PLAN,
     SlashCommand.FAST, SlashCommand.SANDBOX_READ_ROOT,
+    SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.BRANCH,
+    SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
+    SlashCommand.OUTPUT_STYLE,
 }
 
 
