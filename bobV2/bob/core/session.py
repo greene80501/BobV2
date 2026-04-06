@@ -91,6 +91,7 @@ class BobSession:
             api_key=api_key,
             base_url=config.base_url,
             model=config.model,
+            enable_prompt_caching=True,  # Enable prompt caching for 70% cost reduction
         )
 
         # Tool registry

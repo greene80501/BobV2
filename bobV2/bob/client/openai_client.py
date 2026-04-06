@@ -48,6 +48,7 @@ class CompletedEvent:
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    cached_input_tokens: int = 0  # Tokens read from cache (cost savings)
 
 
 @dataclass
@@ -81,9 +82,11 @@ class BobClient:
         api_key: str,
         base_url: str = "https://api.openai.com/v1",
         model: str = "gpt-5.1-codex-mini",
+        enable_prompt_caching: bool = True,
     ) -> None:
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.enable_prompt_caching = enable_prompt_caching
 
     # ------------------------------------------------------------------
     # Public streaming method
@@ -251,8 +254,20 @@ class BobClient:
             "temperature": temperature,
             **extra_params,
         }
-        if tools:
-            build_kwargs["tools"] = tools
+        
+        # Enable prompt caching for system instructions and tools
+        if self.enable_prompt_caching:
+            # Mark instructions as cacheable (system prompt rarely changes)
+            build_kwargs["instructions_cache_control"] = {"type": "ephemeral"}
+            
+            # Mark tools as cacheable (tool definitions are stable)
+            if tools:
+                build_kwargs["tools"] = tools
+                build_kwargs["tools_cache_control"] = {"type": "ephemeral"}
+        else:
+            if tools:
+                build_kwargs["tools"] = tools
+                
         if max_output_tokens is not None:
             build_kwargs["max_output_tokens"] = max_output_tokens
 
@@ -332,12 +347,14 @@ class BobClient:
                             input_tokens=getattr(usage, "input_tokens", 0),
                             output_tokens=getattr(usage, "output_tokens", 0),
                             total_tokens=getattr(usage, "total_tokens", 0),
+                            cached_input_tokens=getattr(usage, "cached_input_tokens", 0),
                         )
                     else:
                         yield CompletedEvent(
                             input_tokens=0,
                             output_tokens=0,
                             total_tokens=0,
+                            cached_input_tokens=0,
                         )
 
             # ----------------------------------------------------------

@@ -61,7 +61,7 @@ class TurnEndedEvent(BaseModel):
     # Total token usage for this turn
     input_tokens: int = 0
     output_tokens: int = 0
-    cached_tokens: int = 0
+    cached_input_tokens: int = 0  # Tokens read from cache (cost savings)
 
 
 class TurnInterruptedEvent(BaseModel):
