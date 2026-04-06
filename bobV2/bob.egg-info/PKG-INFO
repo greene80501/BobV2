@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: bob
+Version: 0.1.0
+Summary: bob — Your AI-Powered Development Partner
+Requires-Python: >=3.11
+Requires-Dist: openai>=1.30.0
+Requires-Dist: textual>=0.80.0
+Requires-Dist: typer>=0.12.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: aiosqlite>=0.20.0
+Requires-Dist: aiofiles>=23.0.0
+Requires-Dist: mcp>=1.0.0
+Requires-Dist: prompt_toolkit>=3.0.0
+Requires-Dist: rapidfuzz>=3.0.0
+Requires-Dist: pyperclip>=1.8.0
+Requires-Dist: watchfiles>=0.21.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: textual-dev>=0.80.0; extra == "dev"
+Provides-Extra: windows
+Requires-Dist: pywin32>=306; extra == "windows"
+Provides-Extra: websocket
+Requires-Dist: websockets>=12.0; extra == "websocket"

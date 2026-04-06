@@ -1,0 +1,2 @@
+[console_scripts]
+bob = bob.cli.main:cli_main
