@@ -248,6 +248,25 @@ class ElicitationRequestedEvent(BaseModel):
 class ElicitationResolvedEvent(BaseModel):
     type: Literal["elicitation_resolved"] = "elicitation_resolved"
     elicitation_id: str
+
+
+class PlanApprovalRequestedEvent(BaseModel):
+    """Emitted when model exits plan mode and requests approval."""
+    type: Literal["plan_approval_requested"] = "plan_approval_requested"
+    plan_summary: str
+
+
+class PlanApprovedEvent(BaseModel):
+    """Emitted after user approves the plan."""
+    type: Literal["plan_approved"] = "plan_approved"
+
+
+class PlanRejectedEvent(BaseModel):
+    """Emitted after user rejects the plan."""
+    type: Literal["plan_rejected"] = "plan_rejected"
+    reason: str = ""
+
+
     action: str  # ElicitationAction value
     data: Optional[dict[str, Any]] = None
 

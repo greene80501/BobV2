@@ -28,6 +28,8 @@ from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from rich.console import Console
@@ -67,6 +69,9 @@ def _g(s: str) -> str:   return f"{_GRN}{s}{_R}"
 def _y(s: str) -> str:   return f"{_YLW}{s}{_R}"
 def _c(s: str) -> str:   return f"{_PRP}{s}{_R}"
 def _cb(s: str) -> str:  return f"{_BLU}{_BLD}{s}{_R}"
+def _cg(s: str) -> str:  return f"{_GRN}{s}{_R}"
+def _bold(s: str) -> str: return f"{_BLD}{s}{_R}"
+
 
 
 def _truncate_cmd(s: str, max_len: int = 120) -> str:
@@ -258,6 +263,7 @@ class Interface:
         self._spinner_task:   Optional[asyncio.Task] = None
         self._spinner_stop:   Optional[asyncio.Event] = None
         self._spinner_active = False
+        self._spinner_label: str = "Thinking…"
         # Token / cost tracking
         self._total_input_tokens  = 0
         self._total_output_tokens = 0
@@ -270,6 +276,8 @@ class Interface:
         # VI mode
         self._vi_mode: bool = False
         self._vi_mode_changed: bool = False
+        # Extended thinking
+        self._next_turn_thinking_budget: Optional[int] = None
 
     # ── Dynamic prompt ────────────────────────────────────────────────────────
 
@@ -277,11 +285,28 @@ class Interface:
         """❯ — never shown while task is running (main loop guards this)."""
         return ANSI("❯ ")
 
+    async def _save_config(self):
+        """Save current config to ~/.bob/config.toml"""
+        import toml
+        from pathlib import Path
+        
+        config_path = Path.home() / ".bob" / "config.toml"
+        
+        # Convert config to dict
+        config_dict = self._config.dict()
+        
+        # Write to file
+        try:
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, 'w') as f:
+                toml.dump(config_dict, f)
+        except Exception as exc:
+            _p(f"  {_y('⚠')} Failed to save config: {exc}")
+
     # ── Header — Claude Code-style welcome panel ──────────────────────────────
 
     def _print_header(self) -> None:
         """Print the welcome header directly to sys.__stdout__ before patch_stdout."""
-        import copy
         bob_version = "0.1.0"
         try:
             from bob import __version__
@@ -427,18 +452,19 @@ class Interface:
         """Animate via sys.__stdout__ (bypasses patch_stdout proxy so \\r works)."""
         out    = sys.__stdout__
         frames = _SPINNER_FRAMES
-        label  = _SPINNER_LABEL
-        width  = len(label) + 6
         i = 0
         try:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
+                label = self._spinner_label
+                width = len(label) + 6
                 out.write(f"\r  {frame} \033[2m{label}\033[0m")
                 out.flush()
                 i += 1
                 await asyncio.sleep(0.08)
         finally:
-            out.write("\r" + " " * width + "\r")
+            # Clear with max possible width
+            out.write("\r" + " " * 80 + "\r")
             out.flush()
 
     # ── Tool-call block helpers ───────────────────────────────────────────────
@@ -492,13 +518,30 @@ class Interface:
         suf = f"  {_d(suffix)}" if suffix else ""
         _p(f"  {_c('●')} {_b(tool)}({_c(arg)}){suf}")
 
-    def _print_tool_output(self, lines: list[str]) -> None:
+    def _colorize_diff_line(self, line: str) -> str:
+        """Colorize a single diff line: + green, - red, @@ cyan."""
+        stripped = line.lstrip()
+        if stripped.startswith("+++") or stripped.startswith("---"):
+            return _d(line)  # file headers dim
+        elif stripped.startswith("+"):
+            return _g(line)  # additions green
+        elif stripped.startswith("-"):
+            return _r(line)  # deletions red
+        elif stripped.startswith("@@"):
+            return _c(line)  # hunk headers cyan/purple
+        elif stripped.startswith("***"):
+            return _c(line)  # patch file markers cyan
+        return line
+
+    def _print_tool_output(self, lines: list[str], colorize_diff: bool = False) -> None:
         """⎿ on first output line, indent on rest, dim for collapsed-count sentinel."""
         for i, line in enumerate(lines):
             if line.startswith("\x00DIM"):        # collapsed count sentinel
                 _p(f"     {_d(line[4:])}")
                 continue
             prefix = "  ⎿ " if i == 0 else "     "
+            if colorize_diff:
+                line = self._colorize_diff_line(line)
             _p(f"{prefix}{line}")
 
     # ── Event consumer ────────────────────────────────────────────────────────
@@ -513,6 +556,10 @@ class Interface:
             ExecStartedEvent,
             InfoEvent,
             PatchApprovalRequestedEvent,
+            PlanApprovalRequestedEvent,
+            PlanApprovedEvent,
+            PlanRejectedEvent,
+            ReasoningDeltaEvent,
             SessionEndedEvent,
             TextDeltaEvent,
             TurnEndedEvent,
@@ -552,8 +599,25 @@ class Interface:
                             _p()
                         self._after_tool = False
                         _p("• ", end="")
+                    # Print delta immediately for real-time streaming
                     _p(msg.delta, end="")
+                    # Also accumulate for markdown rendering at turn end
                     self._current_buf += msg.delta
+
+                # ── Extended thinking ─────────────────────────────────────────
+
+                elif isinstance(msg, ReasoningDeltaEvent):
+                    if not hasattr(self, '_reasoning_started') or not self._reasoning_started:
+                        await self._stop_spinner()
+                        self._reasoning_started = True
+                        if self._after_tool:
+                            _p()
+                        self._after_tool = False
+                        # Start reasoning block with thinking icon
+                        _p(f"{_d('💭 thinking...')}")
+                        self._reasoning_buf = ""
+                    # Accumulate reasoning silently - will be displayed at end
+                    self._reasoning_buf += msg.delta
 
                 # ── Command execution ─────────────────────────────────────────
 
@@ -563,13 +627,19 @@ class Interface:
                         _p()
                     self._current_buf     = ""
                     self._exec_output_buf = []
+                    # Track if this is apply_patch for diff colorization
+                    self._is_apply_patch = (msg.command and msg.command[0] == "apply_patch")
                     if msg.tool_call_id not in self._approved_ids:
                         tool_label, cmd_arg = self._format_command(msg.command)
+                        # Update spinner label to show tool name
+                        self._spinner_label = f"Running {tool_label}…"
                         # blank line before tool header only when following prose
                         if not self._after_tool:
                             _p()
                         self._print_tool_header(tool_label, cmd_arg)
                         self._after_tool = False
+                        # Start spinner to show tool execution
+                        await self._start_spinner()
                     else:
                         self._approved_ids.discard(msg.tool_call_id)
 
@@ -577,8 +647,13 @@ class Interface:
                     self._exec_output_buf.extend(msg.data.splitlines())
 
                 elif isinstance(msg, ExecCompletedEvent):
-                    self._print_tool_output(_collapse_lines(self._exec_output_buf))
+                    await self._stop_spinner()
+                    # Reset spinner label to default
+                    self._spinner_label = "Thinking…"
+                    colorize = getattr(self, '_is_apply_patch', False)
+                    self._print_tool_output(_collapse_lines(self._exec_output_buf), colorize_diff=colorize)
                     self._exec_output_buf = []
+                    self._is_apply_patch = False
                     code = msg.exit_code
                     ms   = msg.duration_ms
                     if code != 0:
@@ -669,11 +744,56 @@ class Interface:
 
                 elif isinstance(msg, TurnEndedEvent):
                     await self._stop_spinner()
-                    if self._current_buf and not self._current_buf.endswith("\n"):
-                        _p()
+                    
+                    # Display reasoning block if we have thinking content
+                    if hasattr(self, '_reasoning_buf') and self._reasoning_buf:
+                        lines = self._reasoning_buf.splitlines()
+                        if len(lines) <= 10:
+                            # Short reasoning - show all
+                            _p(f"{_d('💭 Extended Thinking:')}")
+                            for line in lines:
+                                _p(f"{_d('  ')}{_d(line)}")
+                        else:
+                            # Long reasoning - show first 5 and last 5 with "..." in between
+                            _p(f"{_d('💭 Extended Thinking:')}")
+                            for line in lines[:5]:
+                                _p(f"{_d('  ')}{_d(line)}")
+                            _p(f"{_d('  ... ')}{_d(f'({len(lines) - 10} more lines)')}")
+                            for line in lines[-5:]:
+                                _p(f"{_d('  ')}{_d(line)}")
+                        _p()  # Blank line after reasoning
+                        self._reasoning_buf = ""
+                        self._reasoning_started = False
+                    
+                    # Render accumulated markdown if we have text
+                    if self._current_buf:
+                        # Clear the raw text line
+                        if not self._current_buf.endswith("\n"):
+                            _p()
+                        # Re-render with markdown formatting
+                        try:
+                            from rich.markdown import Markdown
+                            from rich.console import Console
+                            import io
+                            
+                            # Capture rich output to string
+                            string_io = io.StringIO()
+                            console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns - 4)
+                            md = Markdown(self._current_buf)
+                            console.print(md)
+                            rendered = string_io.getvalue()
+                            
+                            # Print the rendered markdown
+                            for line in rendered.splitlines():
+                                _p(f"  {line}")
+                        except Exception:
+                            # Fallback to raw text if markdown rendering fails
+                            if not self._current_buf.endswith("\n"):
+                                _p()
                     elif self._after_tool and not self._current_buf:
                         # Turn ended with only tool calls and no prose — add spacing
                         _p()
+                    
                     self._last_assistant_text = self._current_buf
                     self._current_buf  = ""
                     self._after_tool   = False
@@ -686,6 +806,22 @@ class Interface:
                     self._total_output_tokens += out_tok
                     self._total_cached_input_tokens += cached_tok
                     self._last_turn_tokens = {"input": in_tok, "output": out_tok, "cached": cached_tok}
+                    
+                    # Display token/cost status line
+                    if hasattr(self._session, 'analytics') and self._session.analytics:
+                        try:
+                            from bob.llm.catalog import get_catalog
+                            catalog = get_catalog()
+                            ctx_window = catalog.get_context_window(self._config.model) if catalog.is_populated() else None
+                            status = self._session.analytics.format_last_turn_status(
+                                model=self._config.model,
+                                context_window=ctx_window
+                            )
+                            if status:
+                                _p(f"  {_d(status)}")
+                        except Exception:
+                            pass
+                    
                     _p()   # one blank line = turn boundary (❯ adds visual separation)
 
                 elif isinstance(msg, TurnInterruptedEvent):
@@ -722,12 +858,63 @@ class Interface:
                 elif UserInputRequestEvent is not None and isinstance(msg, UserInputRequestEvent):
                     await self._stop_spinner()
                     _p()
-                    _p(f"  {_cb('?')} {msg.prompt}")
-                    try:
-                        ps_tmp = PromptSession()
-                        answer = await ps_tmp.prompt_async(ANSI("  › "))
-                    except (EOFError, KeyboardInterrupt):
-                        answer = ""
+                    
+                    # Distinct visual style for questions
+                    _p(f"  {_cb('❓')} {_bold('Question from Bob:')}")
+                    _p(f"  {_d('│')}")
+                    
+                    # Word-wrap the prompt at terminal width
+                    import shutil
+                    import textwrap
+                    term_width = shutil.get_terminal_size().columns
+                    wrapped_lines = textwrap.wrap(msg.prompt, width=term_width - 6)
+                    for line in wrapped_lines:
+                        _p(f"  {_d('│')} {line}")
+                    _p(f"  {_d('└─')}")
+                    _p()
+                    
+                    # Handle structured fields if present
+                    if hasattr(msg, 'fields') and msg.fields:
+                        import json
+                        answers = {}
+                        for field in msg.fields:
+                            field_type = field.get('type', 'text')
+                            label = field.get('label', field.get('name', ''))
+                            
+                            if field_type == 'boolean':
+                                _p(f"  {label} (y/n): ", end="")
+                                ps_tmp = PromptSession()
+                                answer = await ps_tmp.prompt_async("")
+                                answers[field['name']] = answer.lower() in ('y', 'yes', 'true', '1')
+                            
+                            elif field_type == 'select':
+                                options = field.get('options', [])
+                                _p(f"  {label}")
+                                for i, opt in enumerate(options, 1):
+                                    _p(f"    {i}. {opt}")
+                                ps_tmp = PromptSession()
+                                answer = await ps_tmp.prompt_async(f"  Select (1-{len(options)}): ")
+                                try:
+                                    idx = int(answer) - 1
+                                    answers[field['name']] = options[idx] if 0 <= idx < len(options) else ""
+                                except ValueError:
+                                    answers[field['name']] = ""
+                            
+                            else:  # text
+                                ps_tmp = PromptSession()
+                                answer = await ps_tmp.prompt_async(f"  {label}: ")
+                                answers[field['name']] = answer
+                        
+                        # Format as JSON for structured response
+                        answer = json.dumps(answers)
+                    else:
+                        # Simple text input with custom prompt style
+                        try:
+                            ps_tmp = PromptSession()
+                            answer = await ps_tmp.prompt_async(ANSI(f"  {_cg('›')} "))
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                    
                     from bob.protocol.ops import UserInputAnswerOp
                     await self._session.submit(
                         UserInputAnswerOp(request_id=msg.request_id, answer=answer)
@@ -736,6 +923,68 @@ class Interface:
                         await self._start_spinner()
 
                 elif isinstance(msg, SessionEndedEvent):
+                    pass  # Session ended, no action needed
+
+                elif isinstance(msg, PlanApprovalRequestedEvent):
+                    await self._stop_spinner()
+                    _p()
+                    _p(f"  {_cy('📋')} {_bold('Plan Summary:')}")
+                    _p(f"  {_d('┌─────────────────────────────────────')}")
+                    
+                    # Word-wrap and display plan
+                    import shutil
+                    import textwrap
+                    term_width = shutil.get_terminal_size().columns
+                    wrapped_lines = textwrap.wrap(msg.plan_summary, width=term_width - 6)
+                    for line in wrapped_lines:
+                        _p(f"  {_d('│')} {line}")
+                    
+                    _p(f"  {_d('└─────────────────────────────────────')}")
+                    _p()
+                    _p(f"  {_y('⚠')} This plan will unlock write tools and allow file modifications.")
+                    _p()
+                    
+                    # Prompt for approval
+                    try:
+                        ps_tmp = PromptSession()
+                        response = await ps_tmp.prompt_async(
+                            ANSI(f"  Approve this plan? (y/n/feedback): ")
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        response = "n"
+                    
+                    response = response.strip().lower()
+                    
+                    if response in ('y', 'yes'):
+                        from bob.protocol.ops import PlanApprovalOp
+                        await self._session.submit(PlanApprovalOp(approved=True))
+                        _p(f"  {_g('✓')} Plan approved")
+                    elif response in ('n', 'no'):
+                        from bob.protocol.ops import PlanApprovalOp
+                        await self._session.submit(PlanApprovalOp(approved=False))
+                        _p(f"  {_r('✗')} Plan rejected")
+                    else:
+                        # Treat as feedback
+                        from bob.protocol.ops import PlanApprovalOp
+                        await self._session.submit(
+                            PlanApprovalOp(approved=False, feedback=response)
+                        )
+                        _p(f"  {_y('⚠')} Plan rejected with feedback")
+                    
+                    _p()
+                    if self._task_running and not self._spinner_active:
+                        await self._start_spinner()
+
+                elif isinstance(msg, PlanApprovedEvent):
+                    _p(f"  {_g('✓')} Full tool access restored")
+
+                elif isinstance(msg, PlanRejectedEvent):
+                    if msg.reason:
+                        _p(f"  {_y('⚠')} Staying in plan mode. Feedback: {msg.reason}")
+                    else:
+                        _p(f"  {_y('⚠')} Staying in plan mode")
+
+
                     self._done.set()
                     return
 
@@ -816,11 +1065,17 @@ class Interface:
         elif cmd == SlashCommand.DIFF:
             try:
                 result = subprocess.run(
-                    ["git", "diff", "--stat", "HEAD"],
+                    ["git", "diff", "HEAD"],
                     capture_output=True, text=True, cwd=Path.cwd(), timeout=5,
                 )
                 out = result.stdout or result.stderr or "(no changes)"
-                _p(_d(out.rstrip()))
+                if out.strip():
+                    _p()
+                    for line in out.splitlines():
+                        _p(f"  {self._colorize_diff_line(line)}")
+                    _p()
+                else:
+                    _p(_d("  (no changes)"))
             except Exception as e:
                 _p(f"  {_r('✗')} git diff failed: {e}")
 
@@ -1163,6 +1418,74 @@ class Interface:
 
             for ok, label in checks:
                 icon = _g("✓") if ok else _r("✗")
+
+        elif cmd == SlashCommand.TASKS:
+            # Display task list
+            task_db = getattr(self._session, '_task_db', None)
+            if task_db is None:
+                _p(f"  {_r('✗')} Task database not available")
+            else:
+                from bob.core.task_db import TaskStatus
+                
+                # Parse optional status filter
+                status_filter = None
+                if args.strip():
+                    try:
+                        status_filter = TaskStatus(args.strip().lower())
+                    except ValueError:
+                        _p(f"  {_r('✗')} Invalid status: {args.strip()}")
+                        _p(f"  Available: pending, in_progress, completed, cancelled")
+                        return False
+                
+                try:
+                    tasks = task_db.list_tasks(status=status_filter)
+                    
+                    if not tasks:
+                        if status_filter:
+                            _p(f"  {_d(f'No tasks with status: {status_filter.value}')}")
+                        else:
+                            _p(f"  {_d('No tasks found')}")
+                    else:
+                        _p()
+                        if status_filter:
+                            _p(f"  {_b(f'Tasks ({status_filter.value}):')}")
+                        else:
+                            _p(f"  {_b('All Tasks:')}")
+                        _p()
+                        
+                        for task in tasks:
+                            task_id = task.get('task_id', '?')
+                            title = task.get('title', '')
+                            status = task.get('status', '?')
+                            priority = task.get('priority', '?')
+                            
+                            # Color-code by status
+                            if status == 'completed':
+                                status_icon = _g('✓')
+                            elif status == 'in_progress':
+                                status_icon = _cy('▶')
+                            elif status == 'cancelled':
+                                status_icon = _r('✗')
+                            else:
+                                status_icon = _d('○')
+                            
+                            # Color-code by priority
+                            if priority == 'high':
+                                priority_text = _r(priority)
+                            elif priority == 'medium':
+                                priority_text = _y(priority)
+                            else:
+                                priority_text = _d(priority)
+                            
+                            _p(f"  {status_icon} [{_cy(task_id)}] {title}")
+                            _p(f"    {_d('Status:')} {status} {_d('|')} {_d('Priority:')} {priority_text}")
+                        
+                        _p()
+                        _p(f"  {_d(f'Total: {len(tasks)} task(s)')}")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} Error listing tasks: {exc}")
+
+
                 _p(f"  {icon}  {label}")
             _p()
 
@@ -1202,13 +1525,39 @@ class Interface:
                     _p(f"  {_r('✗')} {exc}")
 
         elif cmd == SlashCommand.OUTPUT_STYLE:
-            style = args.strip().lower()
-            valid = {"brief", "normal", "verbose"}
-            if style not in valid:
-                _p(f"  {_y('⚠')} usage: /output-style <brief|normal|verbose>")
+            from bob.protocol.config_types import OutputStyle
+            
+            if not args.strip():
+                # Show current style
+                current = self._config.output_style.value
+                _p(f"  Current output style: {_cy(current)}")
+                _p(f"  Available: {_d('brief')}, {_d('normal')}, {_d('verbose')}")
             else:
-                self._output_style = style
-                _p(f"  {_d(f'output style set to: {style}')}")
+                style_arg = args.strip().lower()
+                try:
+                    new_style = OutputStyle(style_arg)
+                    self._config.output_style = new_style
+                    
+                    # Persist to config file
+                    await self._save_config()
+                    
+                    # Reload system prompt for next turn
+                    await self._session._load_system_prompt()
+                    
+                    _p(f"  {_g('✓')} Output style set to: {_cy(new_style.value)}")
+                    _p(f"  {_d('Takes effect on next turn')}")
+                except ValueError:
+                    _p(f"  {_r('✗')} Invalid style: {style_arg}")
+                    _p(f"  Available: {_d('brief')}, {_d('normal')}, {_d('verbose')}")
+
+        elif cmd == SlashCommand.BRIEF:
+            # Alias for /output-style brief
+            from bob.protocol.config_types import OutputStyle
+            self._config.output_style = OutputStyle.BRIEF
+            await self._save_config()
+            await self._session._load_system_prompt()
+            _p(f"  {_g('✓')} Output style set to: {_cy('brief')}")
+            _p(f"  {_d('Takes effect on next turn')}")
 
         # ── Phase 5: vi mode, hooks ────────────────────────────────────────────
 
@@ -1231,6 +1580,17 @@ class Interface:
                     timeout = getattr(h, "timeout", "")
                     _p(f"  {_b(name)}  {_d(event)}  {command}" + (f"  {_d(str(timeout)+'ms')}" if timeout else ""))
                 _p()
+
+        elif cmd == SlashCommand.THINK:
+            try:
+                budget = int(args.strip()) if args.strip() else 5000
+                if budget < 0:
+                    _p(f"  {_y('⚠')} thinking budget must be positive")
+                else:
+                    self._next_turn_thinking_budget = budget
+                    _p(f"  {_d(f'thinking budget set to {budget:,} tokens for next turn')}")
+            except ValueError:
+                _p(f"  {_y('⚠')} usage: /think [budget_tokens]  (default: 5000)")
 
         else:
             _p(f"  {_y('⚠')} /{cmd.value} not yet implemented")
@@ -1401,12 +1761,29 @@ class Interface:
         _history = FileHistory(str(_hist_dir / "history"))
 
         def _make_session() -> PromptSession:
+            # Custom key bindings for multi-line input
+            kb = KeyBindings()
+            
+            @kb.add(Keys.Enter)
+            def _(event):
+                """Enter submits the input."""
+                event.current_buffer.validate_and_handle()
+            
+            @kb.add(Keys.Escape, Keys.Enter)  # Alt+Enter for newline (works cross-platform)
+            def _(event):
+                """Alt+Enter inserts a newline."""
+                event.current_buffer.insert_text('\n')
+            
             return PromptSession(
                 history=_history,
                 completer=completer,
                 complete_while_typing=True,
+                complete_in_thread=True,
                 enable_history_search=True,
                 vi_mode=self._vi_mode,
+                multiline=True,
+                key_bindings=kb,
+                complete_style='MULTI_COLUMN',
             )
 
         ps: PromptSession = _make_session()
@@ -1514,10 +1891,30 @@ class Interface:
                             full_text = (
                                 f"[Respond in {self._output_style} style]\n{full_text}"
                             )
+                        
+                        # Detect thinking trigger keywords
+                        text_lower = text.lower()
+                        thinking_triggers = ["ultrathink", "think hard", "think deeply", "think step by step", "think carefully"]
+                        if any(trigger in text_lower for trigger in thinking_triggers):
+                            if self._next_turn_thinking_budget is None:
+                                self._next_turn_thinking_budget = 10000
+                                _p(f"  {_d('💭 extended thinking enabled (10k tokens)')}")
+                        
+                        # Apply thinking budget if set
+                        if self._next_turn_thinking_budget is not None:
+                            self._config = self._config.model_copy(
+                                update={"thinking_budget_tokens": self._next_turn_thinking_budget}
+                            )
+                            self._next_turn_thinking_budget = None  # Reset after use
+                        
                         self._task_running = True   # optimistic: prevents stray › before TurnStartedEvent
                         await self._session.submit(
                             UserTurnOp(items=[TextUserInput(type="text", text=full_text)])
                         )
+                        
+                        # Reset thinking budget after turn
+                        if self._config.thinking_budget_tokens > 0:
+                            self._config = self._config.model_copy(update={"thinking_budget_tokens": 0})
 
                     if self._done.is_set() or self._exit_requested.is_set():
                         break

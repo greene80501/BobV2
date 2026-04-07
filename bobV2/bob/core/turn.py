@@ -240,11 +240,21 @@ async def run_turn(
             # ----------------------------------------------------------
             # Stream from model
             # ----------------------------------------------------------
+            # Build extra_params for extended thinking if enabled
+            extra_params = {}
+            if session.config.thinking_budget_tokens > 0:
+                # Anthropic extended thinking format
+                extra_params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": session.config.thinking_budget_tokens
+                }
+            
             try:
                 async for ev in session.client.stream_turn(
                     input=current_history,
                     instructions=session._system_prompt or "",
                     tools=tool_specs,
+                    extra_params=extra_params,
                 ):
                     if cancel_event.is_set():
                         break
@@ -357,7 +367,104 @@ async def run_turn(
             # ----------------------------------------------------------
             tool_results: list[dict] = []
 
-            for tc in tool_calls:
+            # Classify tools as read-only (safe for parallel) vs write (sequential)
+            READ_ONLY_TOOLS = frozenset({
+                "read_file", "list_dir", "glob_files", "grep_files",
+                "web_fetch", "web_search", "view_image", "notebook_read",
+                "task_list", "task_get",  # read-only task tools
+            })
+            
+            # Check if in plan mode and block write tools
+            if getattr(session, '_plan_mode', False):
+                blocked_calls = [tc for tc in tool_calls if tc.name not in READ_ONLY_TOOLS]
+                if blocked_calls:
+                    # Block all write tools in plan mode
+                    for tc in blocked_calls:
+                        await emit(ToolCallStartedEvent(
+                            type="tool_call_started",
+                            tool_call_id=tc.id,
+                            tool_name=tc.name,
+                            tool_input=tc.input,
+                        ))
+                        await emit(ToolCallCompletedEvent(
+                            type="tool_call_completed",
+                            tool_call_id=tc.id,
+                            tool_name=tc.name,
+                            output=f"❌ Tool '{tc.name}' blocked in Plan mode. Only read-only tools are available. Use exit_plan_mode to unlock.",
+                            duration_ms=0,
+                        ))
+                        tool_results.append({
+                            "type": "function_call_output",
+                            "call_id": tc.id,
+                            "output": f"❌ Tool '{tc.name}' blocked in Plan mode. Only read-only tools are available. Use exit_plan_mode to unlock.",
+                        })
+                    # Only process read-only tools
+                    tool_calls = [tc for tc in tool_calls if tc.name in READ_ONLY_TOOLS]
+                    if not tool_calls:
+                        # All tools were blocked, continue to next iteration
+                        continue
+            
+            # Separate tool calls into parallel-safe and sequential groups
+            read_only_calls = [tc for tc in tool_calls if tc.name in READ_ONLY_TOOLS]
+            write_calls = [tc for tc in tool_calls if tc.name not in READ_ONLY_TOOLS]
+            
+            # Execute read-only tools in parallel
+            if read_only_calls:
+                async def execute_read_only_tool(tc):
+                    """Execute a single read-only tool and return its result."""
+                    if cancel_event.is_set():
+                        return None
+                    
+                    call_id = tc.id
+                    tool_name = tc.name
+                    
+                    await emit(ToolCallStartedEvent(
+                        type="tool_call_started",
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        tool_input=tc.input,
+                    ))
+                    
+                    from bob.core.session import ToolContext
+                    ctx = ToolContext(session)
+                    ctx.on_output_delta = on_output_delta
+                    ctx.on_plan_update = on_plan_update
+                    ctx.thread_manager = session.ensure_thread_manager()
+                    ctx.on_request_user_input = session.request_user_input
+                    
+                    import time
+                    t0 = time.monotonic()
+                    try:
+                        result_text = await session.tool_registry.dispatch(
+                            tool_name, tc.input, ctx
+                        )
+                    except Exception as exc:
+                        result_text = f"Error: {exc}"
+                    duration_ms = int((time.monotonic() - t0) * 1000)
+                    
+                    await emit(ToolCallCompletedEvent(
+                        type="tool_call_completed",
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        output=result_text,
+                        duration_ms=duration_ms,
+                    ))
+                    
+                    return {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result_text,
+                    }
+                
+                # Execute all read-only tools in parallel
+                parallel_results = await asyncio.gather(
+                    *[execute_read_only_tool(tc) for tc in read_only_calls],
+                    return_exceptions=False
+                )
+                tool_results.extend([r for r in parallel_results if r is not None])
+            
+            # Execute write tools sequentially (includes shell, write_file, edit_file, etc.)
+            for tc in write_calls:
                 if cancel_event.is_set():
                     break
 

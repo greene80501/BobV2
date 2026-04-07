@@ -12,6 +12,7 @@ from bob.protocol.config_types import (
     CollaborationModeKind,
     CollaborationModeSettings,
     GranularApproval,
+    OutputStyle,
     Personality,
     ReasoningEffort,
     ReasoningSummary,
@@ -87,11 +88,13 @@ class BobConfig(BaseModel):
     # ------------------------------------------------------------------
     reasoning_effort: ReasoningEffort = ReasoningEffort.MEDIUM
     reasoning_summary: ReasoningSummary = ReasoningSummary.DISABLED
+    thinking_budget_tokens: int = 0  # 0 = disabled, >0 = enabled with budget
 
     # ------------------------------------------------------------------
     # Personality
     # ------------------------------------------------------------------
     personality: Personality = Personality.PRAGMATIC
+    output_style: OutputStyle = OutputStyle.NORMAL
 
     # ------------------------------------------------------------------
     # Approval / safety

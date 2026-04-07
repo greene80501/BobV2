@@ -98,6 +98,19 @@ class UserInputAnswerOp(BaseModel):
 
 class RequestPermissionsResponseOp(BaseModel):
     type: Literal["request_permissions_response"] = "request_permissions_response"
+
+
+# ---------------------------------------------------------------------------
+# PlanApprovalOp
+# ---------------------------------------------------------------------------
+
+class PlanApprovalOp(BaseModel):
+    """User's response to a plan approval request."""
+    type: Literal["plan_approval"] = "plan_approval"
+    approved: bool
+    feedback: str = ""  # Optional feedback if rejected
+
+
     request_id: str
     granted: bool
     # Permissions that were actually granted (subset of requested)

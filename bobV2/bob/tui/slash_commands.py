@@ -67,6 +67,9 @@ class SlashCommand(str, Enum):
     # Phase 5 additions
     VI = "vi"
     HOOKS = "hooks"
+    THINK = "think"
+    BRIEF = "brief"
+    TASKS = "tasks"
 
 
 COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
@@ -130,6 +133,9 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     # Phase 5
     SlashCommand.VI: "toggle vi input mode",
     SlashCommand.HOOKS: "list configured hooks",
+    SlashCommand.THINK: "set thinking budget for next turn: /think [tokens]",
+    SlashCommand.BRIEF: "alias for /output-style brief",
+    SlashCommand.TASKS: "list all tasks or filter by status: /tasks [status]",
 }
 
 AVAILABLE_DURING_TASK: set[SlashCommand] = {
@@ -147,7 +153,7 @@ SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.FAST, SlashCommand.SANDBOX_READ_ROOT,
     SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.BRANCH,
     SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
-    SlashCommand.OUTPUT_STYLE,
+    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK,
 }
 
 

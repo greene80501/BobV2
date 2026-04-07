@@ -45,6 +45,12 @@ class Personality(str, Enum):
     PRAGMATIC = "pragmatic"
 
 
+class OutputStyle(str, Enum):
+    BRIEF = "brief"
+    NORMAL = "normal"
+    VERBOSE = "verbose"
+
+
 class ReasoningEffort(str, Enum):
     LOW = "low"
     MEDIUM = "medium"

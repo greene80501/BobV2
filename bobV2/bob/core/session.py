@@ -27,6 +27,8 @@ class ToolContext:
         self.on_request_user_input = None
         # Back-reference so plan_mode tools can toggle the flag
         self._session = session
+        # Task database for task management tools
+        self.task_db = session._task_db
 
 
 class BobSession:
@@ -110,6 +112,10 @@ class BobSession:
         # System prompt cache
         self._system_prompt: Optional[str] = None
 
+        # Task database
+        from bob.core.task_db import TaskDB
+        self._task_db = TaskDB(self.bob_home / "tasks.db")
+
     # ------------------------------------------------------------------
     # Bob home helper
     # ------------------------------------------------------------------
@@ -191,6 +197,44 @@ class BobSession:
         from bob.tools.multi_agent.close_agent import (
             close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
         )
+        from bob.tools.task_create import (
+            task_create_handler, TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA,
+        )
+        from bob.tools.task_update import (
+            task_update_handler, TASK_UPDATE_DESCRIPTION, TASK_UPDATE_SCHEMA,
+        )
+        from bob.tools.task_list import (
+            task_list_handler, TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA,
+        )
+        from bob.tools.task_get import (
+            task_get_handler, TASK_GET_DESCRIPTION, TASK_GET_SCHEMA,
+        )
+        from bob.tools.task_output import (
+            task_output_handler, TASK_OUTPUT_DESCRIPTION, TASK_OUTPUT_SCHEMA,
+        )
+        from bob.tools.task_stop import (
+            task_stop_handler, TASK_STOP_DESCRIPTION, TASK_STOP_SCHEMA,
+        )
+        from bob.tools.request_user_input import (
+            request_user_input_handler, REQUEST_USER_INPUT_DESCRIPTION, REQUEST_USER_INPUT_SCHEMA,
+        )
+        from bob.tools.git_worktree import (
+            enter_worktree_handler, ENTER_WORKTREE_DESCRIPTION, ENTER_WORKTREE_SCHEMA,
+            exit_worktree_handler, EXIT_WORKTREE_DESCRIPTION, EXIT_WORKTREE_SCHEMA,
+        )
+        from bob.tools.lsp_tools import (
+            lsp_diagnostics_handler, LSP_DIAGNOSTICS_DESCRIPTION, LSP_DIAGNOSTICS_SCHEMA,
+            lsp_hover_handler, LSP_HOVER_DESCRIPTION, LSP_HOVER_SCHEMA,
+            lsp_definition_handler, LSP_DEFINITION_DESCRIPTION, LSP_DEFINITION_SCHEMA,
+            lsp_references_handler, LSP_REFERENCES_DESCRIPTION, LSP_REFERENCES_SCHEMA,
+            lsp_rename_handler, LSP_RENAME_DESCRIPTION, LSP_RENAME_SCHEMA,
+        )
+        from bob.tools.ide_bridge import (
+            ide_get_open_files_handler, IDE_GET_OPEN_FILES_DESCRIPTION, IDE_GET_OPEN_FILES_SCHEMA,
+            ide_get_selection_handler, IDE_GET_SELECTION_DESCRIPTION, IDE_GET_SELECTION_SCHEMA,
+            ide_get_diagnostics_handler, IDE_GET_DIAGNOSTICS_DESCRIPTION, IDE_GET_DIAGNOSTICS_SCHEMA,
+            ide_get_active_file_handler, IDE_GET_ACTIVE_FILE_DESCRIPTION, IDE_GET_ACTIVE_FILE_SCHEMA,
+        )
 
         # Core tools
         self.tool_registry.register(
@@ -267,6 +311,77 @@ class BobSession:
         )
         self.tool_registry.register(
             "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA, close_agent_handler
+        )
+        # Task management tools
+        self.tool_registry.register(
+            "task_create", TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA, task_create_handler
+        )
+        self.tool_registry.register(
+            "task_update", TASK_UPDATE_DESCRIPTION, TASK_UPDATE_SCHEMA, task_update_handler
+        )
+        self.tool_registry.register(
+            "task_list", TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA, task_list_handler
+        )
+        self.tool_registry.register(
+            "task_get", TASK_GET_DESCRIPTION, TASK_GET_SCHEMA, task_get_handler
+        )
+        self.tool_registry.register(
+            "task_output", TASK_OUTPUT_DESCRIPTION, TASK_OUTPUT_SCHEMA, task_output_handler
+        )
+        self.tool_registry.register(
+            "task_stop", TASK_STOP_DESCRIPTION, TASK_STOP_SCHEMA, task_stop_handler
+        )
+        # User interaction tool
+        self.tool_registry.register(
+            "request_user_input", REQUEST_USER_INPUT_DESCRIPTION, REQUEST_USER_INPUT_SCHEMA,
+            request_user_input_handler
+        )
+        # Git worktree tools
+        self.tool_registry.register(
+            "enter_worktree", ENTER_WORKTREE_DESCRIPTION, ENTER_WORKTREE_SCHEMA,
+            enter_worktree_handler
+        )
+        self.tool_registry.register(
+            "exit_worktree", EXIT_WORKTREE_DESCRIPTION, EXIT_WORKTREE_SCHEMA,
+            exit_worktree_handler
+        )
+        # LSP integration tools
+        self.tool_registry.register(
+            "lsp_diagnostics", LSP_DIAGNOSTICS_DESCRIPTION, LSP_DIAGNOSTICS_SCHEMA,
+            lsp_diagnostics_handler
+        )
+        self.tool_registry.register(
+            "lsp_hover", LSP_HOVER_DESCRIPTION, LSP_HOVER_SCHEMA,
+            lsp_hover_handler
+        )
+        self.tool_registry.register(
+            "lsp_definition", LSP_DEFINITION_DESCRIPTION, LSP_DEFINITION_SCHEMA,
+            lsp_definition_handler
+        )
+        self.tool_registry.register(
+            "lsp_references", LSP_REFERENCES_DESCRIPTION, LSP_REFERENCES_SCHEMA,
+            lsp_references_handler
+        )
+        self.tool_registry.register(
+            "lsp_rename", LSP_RENAME_DESCRIPTION, LSP_RENAME_SCHEMA,
+            lsp_rename_handler
+        )
+        # IDE bridge tools
+        self.tool_registry.register(
+            "ide_get_open_files", IDE_GET_OPEN_FILES_DESCRIPTION, IDE_GET_OPEN_FILES_SCHEMA,
+            ide_get_open_files_handler
+        )
+        self.tool_registry.register(
+            "ide_get_selection", IDE_GET_SELECTION_DESCRIPTION, IDE_GET_SELECTION_SCHEMA,
+            ide_get_selection_handler
+        )
+        self.tool_registry.register(
+            "ide_get_diagnostics", IDE_GET_DIAGNOSTICS_DESCRIPTION, IDE_GET_DIAGNOSTICS_SCHEMA,
+            ide_get_diagnostics_handler
+        )
+        self.tool_registry.register(
+            "ide_get_active_file", IDE_GET_ACTIVE_FILE_DESCRIPTION, IDE_GET_ACTIVE_FILE_SCHEMA,
+            ide_get_active_file_handler
         )
 
     def ensure_thread_manager(self):
@@ -412,6 +527,28 @@ class BobSession:
 
         env_ctx = EnvironmentContext.build(self.cwd)
         base += f"\n\n# Environment\n\n{env_ctx.to_prompt_text()}"
+
+        # Add output style directive
+        from bob.protocol.config_types import OutputStyle
+        if self.config.output_style == OutputStyle.BRIEF:
+            base += (
+                "\n\n# OUTPUT STYLE: BRIEF\n"
+                "- Be extremely concise\n"
+                "- One sentence answers when possible\n"
+                "- No explanations unless asked\n"
+                "- Skip pleasantries and acknowledgments\n"
+                "- Get straight to the point"
+            )
+        elif self.config.output_style == OutputStyle.VERBOSE:
+            base += (
+                "\n\n# OUTPUT STYLE: VERBOSE\n"
+                "- Provide detailed explanations\n"
+                "- Include reasoning and context\n"
+                "- Explain trade-offs and alternatives\n"
+                "- Add examples when helpful\n"
+                "- Be thorough and educational"
+            )
+        # NORMAL style has no extra directive
 
         self._system_prompt = base
 
@@ -593,6 +730,27 @@ class BobSession:
                 fut = self._pending_approvals.get(op.tool_call_id)
                 if fut and not fut.done():
                     fut.set_result(op.decision)
+                continue
+
+            # ----------------------------------------------------------------
+            # Plan approval (from exit_plan_mode tool)
+            # ----------------------------------------------------------------
+            from bob.protocol.ops import PlanApprovalOp
+            if isinstance(op, PlanApprovalOp):
+                if op.approved:
+                    self._plan_mode = False
+                    from bob.protocol.events import PlanApprovedEvent
+                    await self._emit(Event(
+                        id=sub_id,
+                        msg=PlanApprovedEvent(type="plan_approved")
+                    ))
+                else:
+                    # Stay in plan mode
+                    from bob.protocol.events import PlanRejectedEvent
+                    await self._emit(Event(
+                        id=sub_id,
+                        msg=PlanRejectedEvent(type="plan_rejected", reason=op.feedback)
+                    ))
                 continue
 
             # ----------------------------------------------------------------
