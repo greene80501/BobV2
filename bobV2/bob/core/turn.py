@@ -26,7 +26,7 @@ from bob.protocol.events import (
     TokenBudgetEvent,
     ErrorEvent,
 )
-from bob.client.openai_client import (
+from bob.llm.client import (
     TextDeltaEvent as ClientTextDelta,
     ToolCallEvent as ClientToolCall,
     CompletedEvent as ClientCompleted,
@@ -126,6 +126,10 @@ async def run_turn(
     # Turn started                                                        #
     # ------------------------------------------------------------------ #
     await emit(TurnStartedEvent(type="turn_started", turn_id=turn_id))
+
+    # Analytics: begin timing this turn
+    if hasattr(session, "analytics") and session.analytics is not None:
+        session.analytics.start_turn(session.session_id, turn_id, session.config.model)
 
     if session._recorder:
         await session._recorder.write({
@@ -600,6 +604,10 @@ async def run_turn(
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
             })
+
+        # Analytics: record tokens, cost, and latency for this turn
+        if hasattr(session, "analytics") and session.analytics is not None:
+            await session.analytics.finish_turn(total_input_tokens, total_output_tokens)
 
     except asyncio.CancelledError:
         await emit(TurnInterruptedEvent(

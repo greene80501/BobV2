@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional, Union
 
 from openai import AsyncOpenAI, APIConnectionError, APIError, RateLimitError
@@ -19,42 +19,18 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Typed events yielded by stream_turn
+# Typed events — imported from bob.llm.client so all clients share the same
+# classes and isinstance() checks in turn.py work regardless of which client
+# is active.
 # ---------------------------------------------------------------------------
 
-@dataclass
-class TextDeltaEvent:
-    """A streaming text chunk from the model's output."""
-    delta: str
-
-
-@dataclass
-class ToolCallEvent:
-    """A fully-assembled tool call (emitted once the call is complete)."""
-    id: str
-    name: str
-    input: dict[str, Any]
-
-
-@dataclass
-class ReasoningDeltaEvent:
-    """A streaming reasoning/thinking token."""
-    delta: str
-
-
-@dataclass
-class CompletedEvent:
-    """Emitted once the full response is done.  Carries token usage."""
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-
-
-@dataclass
-class StreamErrorEvent:
-    """Emitted when a (possibly-transient) error occurs during streaming."""
-    message: str
-    retry_count: int
+from bob.llm.client import (  # noqa: E402
+    TextDeltaEvent,
+    ToolCallEvent,
+    ReasoningDeltaEvent,
+    CompletedEvent,
+    StreamErrorEvent,
+)
 
 
 # ---------------------------------------------------------------------------

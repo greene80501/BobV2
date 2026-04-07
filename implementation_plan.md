@@ -1,526 +1,567 @@
-# Bob V2 — Implementation Plan
-**Sections 2, 3 & 4: Tools, Multi-Agent, Slash Commands**  
-_Generated: 2026-04-06_
+# Bob V2 — Remaining Implementation Work
+
+Everything listed here is not yet working end-to-end. Items marked **[data done]** have a
+backend/data layer built but no user-visible wiring yet.
 
 ---
 
-## Architecture Contract
+## 1. Terminal UI & Prompt Experience
 
-Every new feature must follow these rules:
+**1.1 Token/cost status line** [data done — analytics tracker has the data]
+After each turn, render a dim one-liner below the response:
+  claude-sonnet-4-5  ·  1,234 in  456 out  ·  $0.018  ·  12% ctx  ·  2,341ms
+Wire `session.analytics.format_last_turn_status(model, context_window)` into the TUI's
+`_consume_events` handler when it sees `TurnEndedEvent`. Context window comes from
+`catalog.get_context_window(model)`.
 
-**Model Tools**: A module in `bob/tools/` that exports a handler, description, and JSON schema. Registration happens in `bob/core/session.py` inside `_register_builtin_tools()`. The `ToolContext` object exposes `.cwd`, `.sandbox`, `.cancel_event`, `.on_output_delta`, `.on_plan_update`, `.on_request_user_input`, and `.thread_manager`.
+**1.2 Colored diff output on patch**
+When `apply_patch` runs, render a colored unified diff instead of silence:
+  ● Patch(src/main.py)
+  ⎿  - old line       (red)
+     + new line       (green)
+In `_print_tool_output` / `ExecCompletedEvent`, detect apply_patch calls and parse the
+patch argument. Color `+` lines green (`\033[32m`), `-` lines red (`\033[31m`), `@@`
+headers cyan.
 
-**Slash Commands**: Enum values in `bob/tui/slash_commands.py`. Dispatched in `bob/tui/interface.py` inside `_dispatch_slash()`. The `else` fallback at the end prints "not yet implemented".
+**1.3 Vi/vim input mode**
+`/vim` slash command is defined in the enum but never dispatched. Fix:
+- Add dispatch case in `interface.py` slash command handler.
+- Toggle a session-level `_vi_mode: bool` flag.
+- Re-create `PromptSession` with `vi_mode=True` when toggled on.
 
-**Events**: All event types live in `bob/protocol/events.py`. Prefer reusing `InfoEvent` for subagent output rather than adding new event types (which require changes in 4+ files).
+**1.4 Multi-line input with Shift+Enter**
+`PromptSession` is single-line. Fix:
+- Create a custom `KeyBindings` object where `Enter` submits and `Shift+Enter`
+  inserts `\n`.
+- Pass `multiline=True` and the custom bindings to `PromptSession`.
 
-**Multi-Agent**: The stubs in `bob/tools/multi_agent/` all delegate to `context.thread_manager`, which is currently `None` in `ToolContext.__init__` in `session.py`. A `ThreadManager` must be created and injected.
+**1.5 Theme system**
+`no_color` config field exists but TUI hardcodes dark ANSI colors. Implement:
+- Add `theme: str` to `BobConfig` (values: `dark`, `light`, `no-color`).
+- Create a `Theme` dataclass with color constants (BRAND, DIM, BOLD, ERROR, etc.).
+- Pass active theme into `interface.py`; all color codes reference theme, not literals.
+- Wire `/theme` slash command to switch and persist to config.
 
----
+**1.6 Status line hooks**
+`bob/hooks/runner.py` exists but output is never surfaced in the UI. Wire:
+- After each turn, run configured `post_turn` hooks.
+- Display stdout of hooks in a dim status line below the response.
+- Add hook config section to `~/.bob/config.toml` schema.
 
-## Key Architectural Decisions (read before implementing)
-
-1. **Tool handlers are pure Python, not shell wrappers.** This gives better error messages, cross-platform behavior, and cancellation support.
-
-2. **Multi-agent uses in-process `BobSession` instances, not subprocesses.** In-process sessions share the asyncio event loop, making `wait_for_agent` a simple `await done_event.wait()`.
-
-3. **Subagent output surfaces via `InfoEvent`, not custom events.** Zero-protocol-change path, still renders correctly in the TUI.
-
-4. **`/commit` uses a `_quick_model_turn()` helper.** Submits a real model turn within a slash command handler. Set `self._task_running = True` before and restore on completion.
-
-5. **Plan mode uses tool filtering at spec-generation time.** When `session._plan_mode = True`, the `get_tool_specs()` call in `turn.py` returns only read-only tools. Cleaner than rejecting at dispatch.
-
----
-
-## Phase 1 — Days 1–2: File Tools + Easy Slash Commands
-
-### New Tools
-
-#### 1.1 `read_file` — `bob/tools/read_file.py` (~60 lines)
-- Use `pathlib.Path.read_text(encoding="utf-8", errors="replace")`
-- Cap at 10,000 lines with truncation note
-- Support optional `start_line`/`end_line` slice (1-indexed, inclusive)
-- Schema: `path` (required), `start_line` (opt int), `end_line` (opt int), `encoding` (opt, default `"utf-8"`)
-- Context used: `context.cwd` only
-- No blockers
-
-#### 1.2 `write_file` — `bob/tools/write_file.py` (~40 lines)
-- `path.parent.mkdir(parents=True, exist_ok=True)` then `path.write_text(content)`
-- Return confirmation string with byte count
-- Schema: `path` (required), `content` (required), `encoding` (opt, default `"utf-8"`)
-- Context used: `context.cwd`
-- No blockers
-
-#### 1.3 `edit_file` — `bob/tools/edit_file.py` (~70 lines)
-- Exact string replacement: read file, assert `old_string` appears exactly once, replace with `new_string`, write back
-- Error if zero matches; warn if multiple
-- `create` mode: empty `old_string` + file doesn't exist → write the file
-- Schema: `path` (required), `old_string` (required), `new_string` (required)
-- Context used: `context.cwd`
-- No blockers
-
-#### 1.4 `glob_files` — `bob/tools/glob_files.py` (~50 lines)
-- Use `pathlib.Path.glob()` relative to `cwd`
-- Return newline-delimited list of matching paths, cap at 1,000 results
-- Schema: `pattern` (required), `path` (opt string for root override)
-- Context used: `context.cwd`
-- No blockers
-
-#### 1.5 `grep_files` — `bob/tools/grep_files.py` (~90 lines)
-- Walk file tree, open each file, find lines matching regex
-- Return `filepath:lineno:line` format, cap total output at 500 lines
-- Schema: `pattern` (required, regex), `path` (opt search root), `file_pattern` (opt glob filter e.g. `"*.py"`), `case_insensitive` (opt bool), `max_results` (opt int, default 200)
-- Context used: `context.cwd`
-- No extra dependencies (pure stdlib `re` + `pathlib`)
-
-#### 1.6 Register all Phase 1 tools
-- **File**: `bob/core/session.py` → `_register_builtin_tools()`
-- Add import + register block for each tool after the `list_dir` registration
-- ~30 lines added
+**1.7 Image attachment in TUI**
+`view_image.py` tool exists but there's no way to attach an image from the prompt.
+Implement `@image` syntax:
+- In the prompt completer, detect `@` prefix and offer file path completion.
+- When input is submitted, scan for `@/path/to/image.png` tokens.
+- Convert matched paths to `ImageUserInput` items passed to `UserTurnOp`.
 
 ---
 
-### New Slash Commands (Phase 1)
+## 2. Tools — Missing or Incomplete
 
-**File**: `bob/tui/slash_commands.py` — add to `SlashCommand` enum + `COMMAND_DESCRIPTIONS`  
-**File**: `bob/tui/interface.py` — add `elif` blocks in `_dispatch_slash()`
+**2.1 Task management system**
+`todo_write.py` and `update_plan.py` exist but there's no structured task tracker
+the model can manipulate as discrete objects. Build:
+- `TaskCreate(title, description)` → returns task_id
+- `TaskUpdate(task_id, status)` → status: pending / in_progress / completed / cancelled
+- `TaskList()` → returns all tasks with status
+- `TaskGet(task_id)` → returns single task details
+- `TaskOutput(task_id, text)` → append output log to a task
+- `TaskStop(task_id)` → cancel a running task
+Store in a SQLite table at `~/.bob/tasks.db`. Register all in `session.py`.
 
-#### 1.7 `/help`
-- Add `HELP = "help"` to enum
-- Render `COMMAND_DESCRIPTIONS` as a grouped two-column table via `_p()` calls
-- Groups: Navigation, Session, Tools, Config, Agent
-- ~25 lines in `_dispatch_slash`
+**2.2 AskUserQuestion distinct rendering**
+`request_user_input.py` exists but its TUI rendering is identical to the approval flow.
+Fix:
+- Detect `UserInputRequestEvent` separately in `_consume_events`.
+- Render with a distinct visual style (e.g. `? ` prefix in blue, inline input box).
+- Separate code path from the `ExecApprovalRequestedEvent` handler.
 
-#### 1.8 `/model <name>`
-- Add `MODEL = "model"` (already in enum — just needs dispatch wiring)
-- If `args.strip()` is non-empty: update `self._config.model = args.strip()`; submit `OverrideTurnContextOp(model=args.strip())` which already exists in `ops.py`
-- If no args: display current model
-- ~15 lines
+**2.3 Locked Plan Mode gate**
+`plan_mode.py` and `session._plan_mode` exist as a simple toggle. The missing piece:
+- When `_plan_mode == True`, block tool execution entirely (not just filter specs).
+- When model calls `exit_plan_mode`, surface the plan to the user for approval.
+- Only unlock write tools after explicit user confirmation (`y` / `n` prompt).
+- Show plan summary in the TUI before the approval prompt.
 
-#### 1.9 `/effort <low|medium|high>`
-- Add `EFFORT = "effort"` to enum (already exists — wire dispatch)
-- Map `low/medium/high` strings to `ReasoningEffort` enum values
-- Store on `self._config.reasoning_effort`
-- ~20 lines
+**2.4 Git Worktree tools**
+No worktree isolation exists. Build:
+- `EnterWorktreeTool(branch_name)` → runs `git worktree add`, sets session cwd to
+  new worktree path, records original cwd.
+- `ExitWorktreeTool()` → removes worktree, restores original cwd.
+- Register both in `session.py`. Add `worktree_path` to `ToolContext`.
 
-#### 1.10 `/cost` and token tracking
-- Add `COST = "cost"` to enum
-- In `Interface.__init__`: add `self._total_input_tokens = 0`, `self._total_output_tokens = 0`, `self._estimated_cost_usd = 0.0`
-- In `_consume_events` at the `TurnEndedEvent` handler: increment totals from `msg.input_tokens` + `msg.output_tokens`; compute cost using a model-rate dict (hardcode rates per 1k tokens for known models)
-- `/cost` dispatch: display formatted totals
-- ~30 lines total across both locations
+**2.5 Cron/Schedule tools**
+No scheduling system exists. Build:
+- `ScheduleCronTool(cron_expr, task_description)` → saves schedule to
+  `~/.bob/schedules.db`, returns schedule_id.
+- `RemoteTriggerTool(schedule_id)` → manually fires a scheduled task.
+- A background runner (separate process or thread) that executes due tasks.
 
-#### 1.11 `/usage`
-- Add `USAGE = "usage"` to enum
-- Store `self._last_turn_tokens: dict = {}` in `__init__`, update in `_consume_events` on `TurnEndedEvent`
-- `/usage` dispatch: display per-turn token breakdown
-- ~20 lines
+**2.6 LSP integration**
+No language server connection. Build:
+- `LSPTool` that starts/connects to the appropriate language server for the current
+  file type (pyright for Python, tsserver for TS, rust-analyzer for Rust).
+- Expose: `lsp_hover(file, line, col)`, `lsp_diagnostics(file)`,
+  `lsp_definition(file, line, col)`, `lsp_references(file, line, col)`.
+- Use `pygls` or direct subprocess JSON-RPC to the LSP.
 
----
-
-### Phase 1 File Summary
-
-| Action | File | Lines |
-|--------|------|-------|
-| CREATE | `bob/tools/read_file.py` | ~60 |
-| CREATE | `bob/tools/write_file.py` | ~40 |
-| CREATE | `bob/tools/edit_file.py` | ~70 |
-| CREATE | `bob/tools/glob_files.py` | ~50 |
-| CREATE | `bob/tools/grep_files.py` | ~90 |
-| MODIFY | `bob/core/session.py` | +30 |
-| MODIFY | `bob/tui/slash_commands.py` | +12 |
-| MODIFY | `bob/tui/interface.py` | +80 |
-
----
-
-## Phase 2 — Days 3–5: Web, Ask User, Plan Mode, Todo, Sleep
-
-### New Tools
-
-#### 2.1 `web_fetch` — `bob/tools/web_fetch.py` (~80 lines)
-- `httpx` async to fetch URL; `html2text` to convert HTML → Markdown
-- Truncate at 50,000 characters with note
-- Return raw text for non-HTML content types
-- Schema: `url` (required), `max_length` (opt int, default 50000), `start_index` (opt int for pagination)
-- **Blocker**: `httpx` and `html2text` must be in `pyproject.toml` / installed
-- Register in `session.py` `_register_builtin_tools()`
-
-#### 2.2 `web_search` — `bob/tools/web_search.py` (~70 lines)
-- Use `duckduckgo_search` pip package (no API key needed) for MVP
-- Return top N results as Markdown (title + URL + snippet)
-- Only activate when `config.web_search_mode != DISABLED`
-- Schema: `query` (required), `max_results` (opt int, default 5)
-- Emit `WebSearchStartedEvent` / `WebSearchCompletedEvent` (already defined in `events.py`)
-- **Modification to `ToolContext`**: Add `self.emit = None` in `ToolContext.__init__` in `session.py`; set it per-turn in `run_turn`
-- **Blocker**: `duckduckgo_search` must be installed
-
-#### 2.3 `ask_user` — wire up existing `request_user_input.py`
-- The tool exists; the callback `context.on_request_user_input` is currently `None`
-- **Modify `bob/core/session.py`**:
-  - Add `self._pending_user_inputs: dict[str, asyncio.Future] = {}` to `__init__`
-  - Add handling of `UserInputAnswerOp` in `_agent_loop` (mirror the `ExecApprovalOp` pattern)
-  - Add `async def request_user_input(self, request_id, prompt, fields) -> str` method
-- **Modify `bob/core/turn.py`**: In "Attach per-turn callbacks" section, add `ctx.on_request_user_input = session.request_user_input`
-- **Modify `bob/tui/interface.py`**: Add handler for `UserInputRequestEvent` in `_consume_events` — stop spinner, print prompt, read user input via `ps.prompt_async()`, submit `UserInputAnswerOp`
-- ~50 lines across three files
-
-#### 2.4 `sleep` — `bob/tools/sleep_tool.py` (~25 lines)
-- `await asyncio.sleep(seconds)` with periodic checks of `cancel_event`
-- Cap at 300 seconds
-- Schema: `seconds` (required number, 0–300)
-- Context used: `context.cancel_event`
-- No blockers
-
-#### 2.5 `todo_write` — `bob/tools/todo_write.py` (~60 lines)
-- Manage `.bob-todos.json` in workspace root
-- Read on each call, merge in new items, write back
-- Schema: `todos` (required array of `{id, content, status, priority}`)
-- `status` values: `pending`, `in_progress`, `done`
-- Context used: `context.cwd`
-- No blockers
-
-#### 2.6 `enter_plan_mode` / `exit_plan_mode` — `bob/tools/plan_mode.py` (~40 lines)
-- Two tools: `enter_plan_mode` and `exit_plan_mode`, both take no inputs
-- **Modify `bob/core/session.py`**: Add `self._plan_mode: bool = False`
-- **Modify `bob/core/turn.py`**: When calling `session.tool_registry.get_tool_specs()`, filter out write tools (`write_file`, `edit_file`, `shell`, `apply_patch`) when `session._plan_mode == True`
-- Register both in `_register_builtin_tools()`
+**2.7 BriefTool / output-style toggle**
+`Personality` enum in config covers this partially. Complete:
+- Add `OutputStyle` enum: `brief`, `normal`, `verbose`.
+- Inject current style into the system prompt (brief: "Be extremely concise. One
+  sentence answers where possible." etc.).
+- Wire `/output-style` slash command to toggle and persist.
+- Add `/brief` as an alias.
 
 ---
 
-### Phase 2 File Summary
+## 3. Agent & Multi-Agent
 
-| Action | File | Lines |
-|--------|------|-------|
-| CREATE | `bob/tools/web_fetch.py` | ~80 |
-| CREATE | `bob/tools/web_search.py` | ~70 |
-| CREATE | `bob/tools/sleep_tool.py` | ~25 |
-| CREATE | `bob/tools/todo_write.py` | ~60 |
-| CREATE | `bob/tools/plan_mode.py` | ~40 |
-| MODIFY | `bob/core/session.py` | +50 |
-| MODIFY | `bob/core/turn.py` | +20 |
-| MODIFY | `bob/tui/interface.py` | +30 |
+**3.1 Built-in curated sub-agent templates**
+`agent_templates.py` has tool restriction lists but no identity/system prompts.
+Build dedicated templates with full system prompts for:
+- `explore` — fast filesystem/codebase explorer, read-only, returns structured findings
+- `plan` — software architect, produces implementation plans, no writes
+- `verify` — runs tests, checks diffs, validates changes, reports pass/fail
+- `write` — focused implementation agent, given a specific task and file scope
+- `review` — code reviewer, reads PR diff, produces structured review comments
+Each template: name, description, system_prompt, allowed_tools list, default model.
 
----
+**3.2 Agent memory snapshots**
+No mechanism to capture what a sub-agent learned between runs. Build:
+- At sub-agent shutdown, extract a "memory snapshot" (summary of findings, key facts,
+  files modified) from the agent's final context.
+- Store snapshot keyed by agent name + session in `~/.bob/agent_memory.db`.
+- On next spawn with same agent name, inject prior snapshot into context.
 
-## Phase 3 — Week 2: Medium Slash Commands
-
-All changes go into `bob/tui/interface.py` and `bob/tui/slash_commands.py`.
-
-### Required Helper First
-
-#### 3.0 `_quick_model_turn(prompt: str) -> str` — add to `Interface` (~40 lines)
-- Submits `UserTurnOp`, sets `self._task_running = True`
-- Waits for `TurnEndedEvent` by draining the event queue
-- Returns accumulated `TextFinalEvent` text
-- Used by `/commit`, `/summary`, `/review`
-- **Add to `bob/tui/interface.py`** before `_dispatch_slash`
-
-### Commands
-
-#### 3.1 `/commit` (~60 lines)
-1. Run `git status --short` and `git diff --cached` (subprocess)
-2. If nothing staged: confirm with user then run `git add -A`
-3. Call `_quick_model_turn(f"Write a concise git commit message for this diff:\n{diff}")` 
-4. Run `git commit -m "<response>"`
-- Add `COMMIT = "commit"` to `SlashCommand` (already in enum — wire dispatch)
-
-#### 3.2 `/branch <name>` (~15 lines)
-- Run `git checkout -b <name>` as subprocess, print result
-- Add `BRANCH = "branch"` to enum (already exists — wire dispatch)
-
-#### 3.3 `/export [file]` (~50 lines)
-- Walk `session.context_manager.raw_items()` (already exists in `context_manager.py`)
-- Format user/assistant turns as Markdown
-- Write to `args.strip()` if given, else `~/bob-export-<timestamp>.md`
-- Add `EXPORT = "export"` to enum
-
-#### 3.4 `/rewind [N]` (~15 lines)
-- `UndoOp(turns=N)` already exists in `ops.py` and is handled in `session.py`
-- Parse int arg, call `await self._session.submit(UndoOp(turns=n))`
-- Add `REWIND = "rewind"` to enum
-
-#### 3.5 `/summary` (~20 lines)
-- Call `_quick_model_turn("Summarize what has been accomplished in this session so far")`
-- Depends on 3.0 being done first
-- Add `SUMMARY = "summary"` to enum (already exists — wire dispatch)
-
-#### 3.6 `/doctor` (~60 lines)
-Checks to run:
-1. `OPENAI_API_KEY` env var set?
-2. HTTP connectivity to `config.base_url` (quick `HEAD` via `httpx`)
-3. `BobConfig.model_validate(config.model_dump())` — config valid?
-4. Each MCP server in `config.mcp_servers` — command exists in PATH?
-5. Print `✓`/`✗` color-coded for each check
-- Add `DOCTOR = "doctor"` to enum
-
-#### 3.7 `/context <url|file>` (~50 lines)
-- If arg starts with `http://` or `https://`: use `web_fetch` logic to fetch + convert to Markdown
-- If arg is a file path: read with `pathlib`
-- Store in `self._pending_context_items: list[str] = []` (add to `__init__`)
-- In `run()` loop where `UserTurnOp` is built: prepend items to user message text, then clear list
-- Add `CONTEXT = "context"` to enum
-
-#### 3.8 `/output-style <brief|normal|verbose>` (~30 lines)
-- Store `self._output_style: str = "normal"` in `__init__`
-- Inject a style directive into the next `UserTurnOp` system message
-- Add `OUTPUT_STYLE = "output-style"` to enum (already exists — wire dispatch)
+**3.3 Parallel tool execution**
+`turn.py` executes tool calls sequentially in a `for tc in tool_calls` loop. Fix:
+- Classify tools as concurrency-safe (read-only: read_file, glob, grep, web_fetch)
+  vs. unsafe (write_file, edit_file, shell, apply_patch).
+- When a batch of tool calls arrives, group by safety class.
+- Execute safe tools with `asyncio.gather()`.
+- Execute unsafe tools sequentially after safe ones complete.
+- Requires care around approval flow — approval must still happen before execution.
 
 ---
 
-### Phase 3 File Summary
+## 4. Slash Commands — Not Dispatched
 
-| Action | File | Lines |
-|--------|------|-------|
-| MODIFY | `bob/tui/slash_commands.py` | +16 |
-| MODIFY | `bob/tui/interface.py` | +290 total |
+All of the following are defined in `SlashCommand` enum in `slash_commands.py` but have
+no handler in `interface.py`'s dispatch block:
 
----
+**4.1 /cost**
+Display session cost from `session.analytics.format_session_cost()`. Also show model
+catalog pricing for current model from `catalog.get_pricing(model)`.
 
-## Phase 4 — Week 3: Multi-Agent System
+**4.2 /usage**
+Display full token breakdown: session input tokens, output tokens, total, by-turn
+history. Pull from `await session._analytics_db.session_totals(session.session_id)`.
 
-### 4.1 `ThreadManager` — `bob/core/thread_manager.py` (~200 lines)
+**4.3 /vim**
+Toggle vi input mode. Re-create `PromptSession(vi_mode=True/False)`. See §1.3.
 
-**Architecture**:
-```python
-@dataclass
-class AgentRecord:
-    id: str
-    session: BobSession
-    task: str
-    status: str          # pending | running | completed | failed
-    result: Optional[str]
-    color: str           # ANSI escape for this agent's output
-    task_ref: Optional[asyncio.Task]
-    done_event: asyncio.Event
+**4.4 /theme**
+Switch color theme. See §1.5.
 
-class ThreadManager:
-    parent_session: BobSession
-    _agents: dict[str, AgentRecord]
-    _color_palette: list[str]    # 8 ANSI colors, assigned round-robin
-```
+**4.5 /export**
+Export current session conversation to a Markdown file. Walk
+`session.context_manager.raw_items()`, format as Markdown, write to
+`~/bob-export-{timestamp}.md`. Print confirmation with path.
 
-**Color palette** (8 entries, round-robin assignment):
-```
-\033[36m  cyan
-\033[32m  green
-\033[33m  yellow
-\033[35m  magenta
-\033[34m  blue
-\033[31m  red
-\033[37m  white
-\033[96m  bright cyan
-```
+**4.6 /context**
+Add a file or URL to the next turn's context:
+- `/context path/to/file.py` → reads file, prepends as a context item.
+- `/context https://example.com/docs` → fetches URL, prepends as context.
+- Show what's currently attached to context.
 
-**Key methods**:
+**4.7 /config**
+Show current `~/.bob/config.toml` contents in a formatted table. Optionally open in
+`$EDITOR`. Show active overrides (CLI flags, env vars).
 
-`async spawn(task, model=None, cwd=None, template=None) -> str`
-1. Copy `parent_session.config`; override model if given
-2. Instantiate `BobSession(config, cwd or parent.cwd)`
-3. Assign `AgentRecord` with new `uuid4()` id + next color
-4. `await agent_record.session.start()`
-5. Create asyncio Task calling `_agent_worker(agent_id, task)`
-6. Return `agent_id`
+**4.8 /hooks**
+List configured hooks from config. Show: event type, command, last run status.
+Allow adding/removing hooks interactively.
 
-`async _agent_worker(agent_id, task)`
-1. Submit `UserTurnOp(items=[TextUserInput(text=task)])` to subagent session
-2. Drain events until `TurnEndedEvent` or `SessionEndedEvent`
-3. Forward each event to parent via `InfoEvent(message=f"[{color}{agent_id}\033[0m] {text}")`
-4. Collect final text as `agent_record.result`
-5. Set `agent_record.status = "completed"`, signal `done_event`
+**4.9 /output-style**
+Toggle between `brief`, `normal`, `verbose`. See §2.7.
 
-`async send_message(agent_id, message)` — submit new `UserTurnOp` to subagent
+**4.10 /issue**
+Open a GitHub issue from the current task:
+- Prompt for title + body (pre-filled from conversation summary).
+- Run `gh issue create` via shell tool.
+- Print the created issue URL.
 
-`async wait_for_agent(agent_id, timeout=None) -> Optional[str]` — `await asyncio.wait_for(done_event.wait(), timeout=timeout)`
+**4.11 /pr_comments**
+Pull PR review comments as context:
+- Prompt for PR number or URL.
+- Run `gh pr view {n} --comments --json` to fetch.
+- Inject as a context item for the next turn.
 
-`async close_agent(agent_id, reason="")` — cancel task, `await session.shutdown()`
+**4.12 /memory**
+Show/edit the Bob memory file (`~/.bob/memory.md`):
+- `/memory` → print current contents.
+- `/memory edit` → open in `$EDITOR`.
+- `/memory clear` → wipe and confirm.
 
-`list_agents(include_completed=False) -> list` — return descriptors from `_agents`
+**4.13 /stats**
+Show session statistics: turns taken, tools called (by name + count), total tokens,
+total cost, avg latency per turn. Pull from `session.analytics` and
+`await session._analytics_db.session_totals()`.
 
----
+**4.14 /share**
+Export session as a shareable artifact (local file or URL). Minimum viable: write
+a self-contained HTML file of the conversation transcript.
 
-### 4.2 Wire `ThreadManager` into `ToolContext`
+**4.15 /session**
+Show metadata about the current session: session_id, start time, model, cwd, tool
+count, context size (tokens), sandbox mode.
 
-**Modify `bob/core/session.py`**:
-- Add `self._thread_manager: Optional[ThreadManager] = None` to `__init__`
-- Add method `def ensure_thread_manager(self) -> ThreadManager:` — lazily creates and caches
+**4.16 /rewind**
+Undo last N turns. `UndoOp` exists in protocol and `drop_last_n_user_turns()` exists
+in context_manager. Wire: parse `/rewind N`, submit `UndoOp(n=N)` to session. Clear
+the corresponding rollout entries from the recorder.
 
-**Modify `bob/core/turn.py`** — in "Attach per-turn callbacks" section:
-```python
-ctx.thread_manager = session.ensure_thread_manager()
-```
-~5 lines added
-
----
-
-### 4.3 Register multi-agent tools
-
-**Modify `bob/core/session.py`** → `_register_builtin_tools()`:
-- Add imports and registration blocks for all 5 stubs in `bob/tools/multi_agent/`
-- `spawn_agent`, `send_message`, `wait_agent`, `list_agents`, `close_agent`
-- ~25 lines added
+**4.17 /doctor**
+Run diagnostic checks and print a color-coded report:
+- API key present and valid (test with a minimal API call)
+- Network connectivity (ping api.openai.com or configured base_url)
+- Config file exists and parses cleanly
+- MCP servers reachable (if configured)
+- Model catalog present (`~/.bob/llm_database.db`)
+- Analytics DB accessible (`~/.bob/analytics.db`)
+- Sandbox mode and path grants
+- Bob version and Python version
 
 ---
 
-### 4.4 TUI: Subagent output rendering
+## 5. Configuration — Missing Options
 
-No changes needed in `interface.py`. `ThreadManager._agent_worker` emits forwarded events as `InfoEvent(message=f"[{color}{short_id}\033[0m] {text}")`, which the existing `InfoEvent` handler at line 574 renders as `_d(msg.message)`. The color codes inside the message string pass through.
+Add these fields to `BobConfig` in `bob/config/schema.py` and load from
+`~/.bob/config.toml`:
 
----
-
-### 4.5 Built-in agent templates — `bob/core/agent_templates.py` (~80 lines)
-
-```python
-@dataclass
-class AgentTemplate:
-    system_prompt_suffix: str
-    allowed_tools: set[str]  # if empty, allow all
-
-AGENT_TEMPLATES = {
-    "explore": AgentTemplate(
-        system_prompt_suffix="You are a fast filesystem exploration agent...",
-        allowed_tools={"shell", "list_dir", "glob_files", "grep_files", "read_file"},
-    ),
-    "plan": AgentTemplate(
-        system_prompt_suffix="You are a planning agent. Do not write or modify files...",
-        allowed_tools={"read_file", "glob_files", "grep_files", "list_dir", "update_plan"},
-    ),
-    "verify": AgentTemplate(
-        system_prompt_suffix="You are a verification agent. Run tests and check correctness...",
-        allowed_tools={"shell", "read_file", "glob_files", "grep_files"},
-    ),
-}
-```
-
-Add `template` field to `spawn_agent` schema. In `spawn_agent_handler`, look up the template and pass it to `ThreadManager.spawn()`. The thread manager applies the suffix and filters tool specs for the subagent.
-
-**Modify `bob/tools/multi_agent/spawn_agent.py`**: Add `template` field support (+20 lines)
+- `output_style: OutputStyle = OutputStyle.NORMAL` — brief / normal / verbose
+- `prompt_caching: bool = True` — enable cache_control headers (see §6.1)
+- `max_context_tokens: int = 0` — 0 = use model default; set to cap context window
+- `mcp_auth_tokens: dict[str, str] = {}` — per-server auth tokens for MCP
+- `git_commit_attribution: str = ""` — Co-authored-by line appended to AI commits
+- `network_proxy: str = ""` — HTTP proxy URL for all outbound requests
+- `stream_responses: bool = True` — False = buffer full response before display
+- `feature_flags: dict[str, bool] = {}` — named feature toggles
+- `shell: str = ""` — override shell detection (bash/zsh/fish/pwsh); auto-detect if empty
+- `auto_compact_threshold: float = 0.8` — compact when context exceeds this fraction
 
 ---
 
-### 4.6 `/review` slash command (~30 lines)
+## 6. Performance
 
-`SlashCommand.REVIEW` already exists in the enum. Wire dispatch:
-1. Get last git diff (`git diff HEAD --stat`)
-2. Spawn a `verify` template agent with the diff as task context
-3. Print a message with the agent ID and color
+**6.1 Prompt caching**
+No `cache_control` headers are sent. This costs 70–90% more than necessary on long
+sessions. Fix in `bob/llm/client.py` (`_to_chat_messages` or the kwargs builder):
+- Add `cache_control: {"type": "ephemeral"}` to the system message.
+- Add `cache_control` to long static context blocks (AGENTS.md content, instructions).
+- Anthropic: add `cache_control` field to message content parts.
+- OpenAI: no equivalent yet — skip for OpenAI models.
 
-**Modify `bob/tui/interface.py`** — add `elif cmd == SlashCommand.REVIEW:` in `_dispatch_slash`
+**6.2 Session pre-warm**
+First response is cold (TCP + TLS + model warmup). Fix:
+- In `session.start()`, fire a background task that sends a minimal keepalive request
+  to the API endpoint immediately on startup.
+- Don't await it — just let it run so the connection is warm by the time the user
+  submits their first message.
 
----
-
-### Phase 4 File Summary
-
-| Action | File | Lines |
-|--------|------|-------|
-| CREATE | `bob/core/thread_manager.py` | ~200 |
-| CREATE | `bob/core/agent_templates.py` | ~80 |
-| MODIFY | `bob/core/session.py` | +45 |
-| MODIFY | `bob/core/turn.py` | +5 |
-| MODIFY | `bob/tools/multi_agent/spawn_agent.py` | +20 |
-| MODIFY | `bob/tui/interface.py` | +30 |
-
----
-
-## Phase 5 — Week 4+: Complex Features
-
-### 5.1 `js_repl` — `bob/tools/js_repl.py` (~60 lines)
-- `asyncio.create_subprocess_exec("node", "--input-type=module", stdin=PIPE, stdout=PIPE, stderr=PIPE)`
-- Pipe `code` to stdin, cap execution at 10 seconds, use `cancel_event`
-- Return stdout + stderr
-- Schema: `code` (required), `timeout` (opt int ms, default 10000)
-- **Blocker**: Node.js must be in PATH — check and return clear error if missing
-
-### 5.2 `notebook_read` — `bob/tools/notebook_read.py` (~80 lines)
-- `.ipynb` files are JSON — use `json.loads(path.read_text())`
-- Format each cell: `[Cell N - code/markdown]` + source + truncated outputs
-- Schema: `path` (required), `include_outputs` (opt bool, default True)
-- No extra dependencies (pure stdlib)
-
-### 5.3 `notebook_edit` — `bob/tools/notebook_edit.py` (~70 lines)
-- Read `.ipynb` JSON, locate cell by index, replace source, optionally clear outputs, write back
-- Schema: `path` (required), `cell_index` (required int), `new_source` (required), `clear_outputs` (opt bool, default False)
-- No extra dependencies
-
-### 5.4 `/vi` — vi input mode (~20 lines)
-- Add `self._vi_mode: bool = False` to `Interface.__init__`
-- Add `VI = "vi"` to `SlashCommand`
-- Toggle flag in dispatch. At top of `run()` loop, recreate `PromptSession(vi_mode=self._vi_mode, ...)` when flag changes
-- `prompt_toolkit` supports vi mode natively — no extra deps
-
-### 5.5 `/theme <dark|light|no-color>` (~60 lines)
-- Refactor module-level color helpers (`_d`, `_r`, `_g`, etc.) into methods on `Interface` or a `_Theme` dataclass that the helpers delegate to
-- `dark` = current ANSI colors; `light` = inverted dim/bright; `no-color` = all helpers return input unchanged
-- `THEME = "theme"` already in `SlashCommand` enum — wire dispatch
-- **Note**: This is the only change with internal refactor risk. Do it in a separate branch.
-
-### 5.6 `/hooks` slash command (~30 lines)
-- Add `HOOKS = "hooks"` to `SlashCommand` enum
-- List `self._config.hooks` with name, event, command, timeout
-- Wire dispatch in `_dispatch_slash`
+**6.3 Frame rate limiting**
+Fast streaming can flood the terminal. Fix:
+- In the TUI's event consumption loop, track the last render time.
+- Batch `TextDeltaEvent` chunks that arrive within 16ms (60fps) and render them
+  together in one `print()` call.
+- Use `asyncio.sleep(0)` between batches to yield to the event loop.
 
 ---
 
-### Phase 5 File Summary
+## 7. Security & Sandbox
 
-| Action | File | Lines |
-|--------|------|-------|
-| CREATE | `bob/tools/js_repl.py` | ~60 |
-| CREATE | `bob/tools/notebook_read.py` | ~80 |
-| CREATE | `bob/tools/notebook_edit.py` | ~70 |
-| MODIFY | `bob/tui/interface.py` | +60 |
-| MODIFY | `bob/tui/slash_commands.py` | +4 |
+**7.1 Windows sandbox path grants**
+`WindowsSandboxLevel` is in config but `bob/sandbox/windows.py` doesn't enforce
+fine-grained read/write path grants. Implement:
+- Parse `sandbox_read_dirs` and `sandbox_write_dirs` from config.
+- Before executing a shell command, check that the target path falls within granted
+  directories.
+- Reject with a clear error message if not.
 
----
+**7.2 Network approval flow**
+`network_access: bool` in config is all-or-nothing. Build per-request approval:
+- Intercept outbound HTTP calls from `web_fetch` and `web_search` tools.
+- Check domain against an approved-domains list in config.
+- If not approved, emit `NetworkApprovalRequestedEvent` and pause — same flow as
+  `ExecApprovalRequestedEvent`.
+- User can approve once, approve always, or deny.
 
-## Dependency Order (Critical Path)
+**7.3 Command canonicalization in approval**
+`_format_command` in `interface.py` normalizes for display only. The approval system
+sees the raw command. Fix:
+- In `exec_policy.py` / `needs_approval()`, normalize the command before matching
+  trusted patterns (unwrap `cmd /c`, `powershell -Command`, resolve `./` paths).
+- This prevents approval bypasses via shell metacharacter wrapping.
 
-```
-Phase 1 (no deps)
-  └── 1.6 Register tools → depends on 1.1–1.5 existing
-  └── 1.10 /cost tracking → depends on TurnEndedEvent having token fields (it does)
+**7.4 macOS Seatbelt policy files**
+`sandbox/macos.py` likely calls subprocess without a real Seatbelt profile. Build:
+- Write `.sbpl` policy files: base policy, network isolation policy, read-only mode.
+- Call `sandbox-exec -f policy.sbpl` when running commands in sandbox mode.
+- Ship the `.sbpl` files as package data.
 
-Phase 2
-  └── 2.1 web_fetch → httpx + html2text must be installed
-  └── 2.3 ask_user → requires ToolContext.emit + session._pending_user_inputs
-  └── 2.6 plan_mode → requires session._plan_mode + turn.py filter
+**7.5 Linux bubblewrap + Landlock**
+`sandbox/linux.py` is likely a stub. Build:
+- Use `bwrap` (bubblewrap) for container-level isolation: bind-mount workspace,
+  block /proc, /sys, network namespace.
+- Use `Landlock` via ctypes for kernel-level filesystem access control.
+- Fall back gracefully if bwrap is not installed.
 
-Phase 3
-  └── 3.0 _quick_model_turn() → MUST be done before 3.1, 3.5, 4.6
-  └── 3.7 /context → web_fetch (2.1) must exist for URL fetching
-
-Phase 4
-  └── 4.1 ThreadManager → MUST be done before 4.2, 4.3
-  └── 4.2 Wire ToolContext → depends on 4.1
-  └── 4.3 Register tools → depends on 4.2
-  └── 4.5 Agent templates → depends on 4.1
-  └── 4.6 /review → depends on 3.0 + 4.5
-
-Phase 5 (independent of phases 1–4 except vi/theme are pure TUI)
-```
-
----
-
-## Total Effort Estimate
-
-| Phase | New Files | Modified Files | Total New Lines | Est. Time |
-|-------|-----------|----------------|-----------------|-----------|
-| 1 | 5 | 3 | ~370 | Day 1–2 |
-| 2 | 5 | 3 | ~305 | Day 3–5 |
-| 3 | 0 | 2 | ~306 | Week 2 |
-| 4 | 2 | 4 | ~380 | Week 3 |
-| 5 | 3 | 2 | ~274 | Week 4+ |
-| **Total** | **15** | **14** | **~1,635** | **~4 weeks** |
+**7.6 Shell escalation detection**
+No detection of sandbox-escape attempts. Add to `exec_policy.py`:
+- Reject or require explicit approval for: `sudo`, `su`, `chroot`, `nsenter`,
+  `unshare`, `ptrace`, `LD_PRELOAD`, shell metacharacters in trusted-command paths.
+- Log all escalation attempts.
 
 ---
 
-## Critical Files for Implementation (Reference Often)
+## 8. Session & Memory
 
-| File | Why Critical |
-|------|-------------|
-| `bob/core/session.py` | Tool registration, ToolContext, session lifecycle |
-| `bob/core/turn.py` | Tool call dispatch, parallel execution, callbacks |
-| `bob/tui/interface.py` | All slash command dispatch, event rendering, UI |
-| `bob/tui/slash_commands.py` | SlashCommand enum, descriptions |
-| `bob/tools/multi_agent/spawn_agent.py` | Template-based agent spawning |
-| `bob/protocol/ops.py` | All operations (UndoOp, OverrideTurnContextOp, etc.) |
-| `bob/protocol/events.py` | All event types (UserInputRequestEvent, etc.) |
+**8.1 Session export**
+Rollout recorder writes JSONL but there's no `/export` command that produces a
+human-readable file. Implement:
+- Walk `session.context_manager.raw_items()`.
+- Format as Markdown: user turns as `**You:**`, assistant turns as `**Bob:**`,
+  tool calls as code blocks.
+- Write to `~/bob-session-{timestamp}.md`.
+- Print path and byte size.
+
+**8.2 Session sharing**
+No `/share` mechanism. Minimum viable:
+- Generate a self-contained HTML file with inline CSS rendering the conversation.
+- Open it in the default browser (`webbrowser.open()`).
+- Future: upload to a pastebin/gist and return URL.
+
+**8.3 Turn diff tracking**
+No record of which files changed in each turn. Build:
+- Before each turn, snapshot a hash of all files in `session.cwd` (or track via
+  `write_file`/`edit_file`/`apply_patch` calls).
+- After the turn, compute which files changed.
+- Store as a per-turn diff summary in the analytics DB.
+- Surface in `/stats` and the turn status line.
+
+**8.4 Rewind/undo**
+`UndoOp` is in the protocol, `drop_last_n_user_turns()` is in context_manager, but
+`/rewind N` isn't wired. See §4.16. Also:
+- Clear the corresponding rollout file entries so a resumed session doesn't replay
+  the undone turns.
+- Reset analytics session accumulators for the dropped turns.
+
+---
+
+## 9. Integrations
+
+**9.1 Full git integration**
+`/diff` works. Missing:
+- `/commit` — Bob writes the commit message (via a quick model call on the current
+  diff), runs `git add -A && git commit -m "..."`. User can edit before confirm.
+- `/branch` — create or switch branches: `/branch feature-xyz` runs
+  `git checkout -b feature-xyz`.
+- `/pr_comments` — see §4.11.
+- `/issue` — see §4.10.
+- `/autofix-pr` — fetch PR diff + review comments, feed to Bob as context, let Bob
+  apply fixes automatically.
+
+**9.2 IDE bridge tool**
+`app_server/` exists for JSON-RPC but no tool is exposed to the model to read IDE
+state. Build:
+- `ide_get_open_files()` → list of open file paths in VS Code / JetBrains.
+- `ide_get_selection()` → current selected text + file + line range.
+- `ide_get_diagnostics()` → problems panel contents (errors, warnings).
+- Requires the IDE extension to be running and connected to the app_server.
+
+**9.3 Web search end-to-end verification**
+`web_search.py` exists. Verify and fix:
+- Confirm `web_search` is registered in `session._register_builtin_tools()` — it is,
+  but test that it's actually callable by the model in a live session.
+- Confirm DuckDuckGo API calls work without a key.
+- Add a fallback (SerpAPI or Brave Search) when DDG is rate-limited.
+- Wire `web_search_mode` config field to conditionally register the tool.
+
+---
+
+## 10. Quality of Life
+
+**10.1 Syntax-highlighted code blocks**
+Model responses stream as raw text. When a turn completes and `TextFinalEvent` fires,
+re-render the full text through `rich.markdown.Markdown` with `rich.syntax.Syntax`
+for code fences. Or render incrementally using a streaming Markdown state machine.
+
+**10.2 Word-wrap at terminal width**
+Long lines are not wrapped. Fix:
+- Detect terminal width via `shutil.get_terminal_size()`.
+- Wrap text at that width before printing each `TextDeltaEvent` delta.
+- Update on terminal resize (listen for `SIGWINCH` on Unix).
+
+**10.3 /help with formatted output**
+`/help` is dispatched but renders a flat list. Replace with:
+- Group commands by category (Session, Code, Config, Experimental, etc.).
+- Use `rich.table.Table` or `rich.columns.Columns` for alignment.
+- Show key bindings alongside each command.
+- Include short descriptions from `COMMAND_DESCRIPTIONS` dict.
+
+**10.4 @filename autocomplete**
+No `@` mention system exists. Build:
+- In the `PromptCompleter`, detect when input contains `@`.
+- After `@`, complete with file paths relative to `session.cwd`.
+- On submit, resolve `@path` tokens and attach file contents as context items.
+
+**10.5 #tool mention autocomplete**
+No `#tool` mention system. Build:
+- In the `PromptCompleter`, detect `#` prefix.
+- Complete with registered tool names from `session.tool_registry`.
+- On submit, `#tool_name` injects a hint into the user message telling the model
+  to prefer that tool.
+
+**10.6 Spinner shows current tool name**
+Spinner always shows "Thinking…". Fix:
+- When `ToolCallStartedEvent` fires, update the spinner label to
+  `"Running {tool_name}…"`.
+- When `ToolCallCompletedEvent` fires, revert to `"Thinking…"` (if more turns remain)
+  or clear entirely.
+- Pass tool name into the spinner update method in `interface.py`.
+
+**10.7 Error messages with file:line context**
+Errors are plain strings. Improve:
+- In `StreamErrorEvent` and `ErrorEvent` handlers, parse Python tracebacks if present.
+- Highlight file paths and line numbers using `rich.traceback.Traceback`.
+- For tool errors, include the tool name and input in the display.
+
+**10.8 Welcome screen with real recent sessions**
+Welcome screen shows hardcoded "No recent activity". Fix:
+- On startup, query `session._session_index` for the 5 most recent sessions.
+- Display: session name, date, model, turn count, cost.
+- Make each entry selectable to resume that session directly.
+
+---
+
+## 11. Voice & Realtime
+
+**11.1 Voice input / STT**
+No audio input. Build (behind `/voice` toggle):
+- Use `sounddevice` to capture microphone audio in a background thread.
+- Stream to OpenAI Whisper (`openai.audio.transcriptions.create`) or a local
+  Whisper model.
+- Inject transcribed text as the prompt input.
+- Show a "🎤 Recording…" indicator in the TUI.
+
+**11.2 Realtime API conversation**
+`enable_realtime: bool` is in config but wired to nothing. Build:
+- Connect to OpenAI Realtime API via WebSocket.
+- Bidirectional audio: capture mic → send audio chunks → receive audio response.
+- Render transcript alongside audio playback.
+- Toggle with `/realtime` command.
+
+---
+
+## 12. Rich Output Rendering
+
+**12.1 Streaming markdown rendering**
+Model responses stream as raw text — `**bold**`, ` ```code``` `, bullet lists all
+appear literally. Fix:
+- Implement a streaming Markdown state machine in `interface.py` (or use
+  `rich.markdown.Markdown` on completed text).
+- At minimum handle: **bold**, *italic*, `inline code`, ``` code fences ```,
+  `# headers`, `- bullet lists`, `> blockquotes`.
+- For code fences: detect language tag, use `rich.syntax.Syntax` for highlighting.
+
+**12.2 Colored diff rendering**
+No `+`/`-` line coloring anywhere in the TUI. See §1.2 — same fix applies both to
+`apply_patch` preview and to `/diff` output.
+
+**12.3 Reasoning block display**
+`show_reasoning: bool` is in config. `ReasoningDeltaEvent` is in the protocol and
+now emitted by `LiteLLMClient` (for Anthropic extended thinking). The TUI has no
+handler. Fix:
+- In `_consume_events`, add a case for `ReasoningDeltaEvent`.
+- Buffer reasoning tokens separately from text tokens.
+- Display collapsed by default: `⟨thinking⟩ 847 tokens` with expand option.
+- When `show_reasoning = True` in config, stream inline with a dim prefix `│ `.
+
+---
+
+## 13. Diagnostics
+
+**13.1 /doctor diagnostic screen**
+No diagnostic runner exists. See §4.17 for full spec.
+
+**13.2 /cost and /usage display** [data done — analytics tracker accumulates]
+`session.analytics.format_session_cost()` is available. Wire:
+- `/cost` slash command → call `format_session_cost()` + show per-model breakdown
+  from `await session._analytics_db.model_breakdown(session.session_id)`.
+- `/usage` slash command → show per-turn token table from
+  `await session._analytics_db.recent_turns(20)`.
+- Also wire `format_last_turn_status()` into the `TurnEndedEvent` handler so it
+  displays after every response.
+
+**13.3 Frame rate limiting**
+See §6.3.
+
+---
+
+## 14. Sandbox — Advanced
+
+**14.1 macOS Seatbelt policy files** — see §7.4
+**14.2 Linux bubblewrap + Landlock** — see §7.5
+**14.3 Shell escalation detection** — see §7.6
+
+---
+
+## 15. Models & API
+
+**15.1 Model catalog integration** [catalog.py built — commands not wired]
+`catalog.py` and `~/.bob/llm_database.db` exist. Wire:
+- `/model` slash command → list available models from `catalog.list_models()`,
+  let user pick, update `session.client.model` and `session.config.model`.
+- At session start, log context window for current model from
+  `catalog.get_context_window(model)` and use it for the `% ctx` display.
+- In `/doctor`, report whether catalog is populated.
+- Show pricing in `/cost` output via `catalog.get_pricing(model)`.
+
+**15.2 Prompt caching headers** — see §6.1
+
+**15.3 Extended thinking / Ultrathink**
+`ReasoningDeltaEvent` now flows through `LiteLLMClient`. Complete the feature:
+- Add `thinking_budget_tokens: int = 0` to `BobConfig` (0 = disabled).
+- Detect trigger keywords in user input: `ultrathink`, `think hard`, `think deeply`,
+  `think step by step` → automatically set a high budget.
+- Pass `thinking: {"type": "enabled", "budget_tokens": N}` in the Anthropic request
+  via `extra_params`.
+- Render thinking blocks per §12.3.
+- Add `/think` slash command to set budget for next turn only.
+
+---
+
+## Priority Order (highest impact first)
+
+1. **§13.2 /cost + /usage display** — data is already tracked; just wire the TUI. 30 min.
+2. **§1.1 Token/cost status line** — call `format_last_turn_status()` in `TurnEndedEvent` handler. 20 min.
+3. **§12.1 Streaming markdown** — biggest visible UX gap. Use `rich.markdown.Markdown` on `TextFinalEvent`. 2–3 hrs.
+4. **§3.3 Parallel tool execution** — `asyncio.gather()` in `turn.py` for read-only tools. 2 hrs.
+5. **§6.1 Prompt caching** — add `cache_control` to system message in `client.py`. 1 hr. Free 70–90% cost cut.
+6. **§1.2 Colored diff output** — parse apply_patch arg and colorize. 1–2 hrs.
+7. **§12.3 Reasoning block display** — add `ReasoningDeltaEvent` handler in TUI. 1 hr.
+8. **§10.6 Spinner shows tool name** — update spinner label in `ToolCallStartedEvent` handler. 20 min.
+9. **§4.17 /doctor** — diagnostic runner. 2 hrs.
+10. **§15.1 /model command** — list from catalog, let user pick. 1 hr.
+11. **§4.16 /rewind** — wire `UndoOp` to `/rewind N`. 30 min.
+12. **§1.3 Vi mode** — `PromptSession(vi_mode=True)`. 20 min.
+13. **§1.4 Multi-line input** — custom `KeyBindings`. 30 min.
+14. **§15.3 Extended thinking** — budget tokens + trigger detection. 2 hrs.
+15. **§2.3 Parallel tool execution** — see item 4 above (same).
+16. **§3.1 Curated sub-agent templates** — write system prompts for explore/plan/verify/write/review. 2 hrs.
+17. **§2.1 Task management tools** — TaskCreate/Update/List/Get/Output/Stop. 3 hrs.
+18. **§9.1 Git integration** — /commit, /branch, /autofix-pr. 3 hrs.
+19. **§10.1 Syntax highlighted code blocks** — rich.syntax in output. 1 hr.
+20. **§10.8 Welcome screen with real sessions** — query session index. 1 hr.

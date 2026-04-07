@@ -34,6 +34,7 @@ from rich.console import Console
 
 from bob.config.schema import BobConfig
 from bob.tui.slash_commands import (
+    AVAILABLE_DURING_TASK,
     COMMAND_DESCRIPTIONS,
     SlashCommand,
     fuzzy_match_commands,
@@ -109,24 +110,120 @@ def _collapse_lines(lines: list[str]) -> list[str]:
 # ── Slash completer ───────────────────────────────────────────────────────────
 
 class _SlashCompleter(Completer):
+    """Inline slash-command + model completer.
+
+    Behaviour:
+      /          → all commands alphabetically (multi-column grid)
+      /mo        → fuzzy-filtered commands ("model", "mcp", …)
+      /model     → all commands still, "model" highlighted
+      /model     → (after space) model names from the catalog, filterable
+      /effort    → effort levels: low / medium / high
+      /approvals → approval policy values
+    """
+
     task_running: bool = False
+
+    # ── Argument completers for specific commands ─────────────────────────
+
+    _EFFORT_LEVELS = ["high", "low", "medium"]
+    _APPROVAL_VALUES = ["auto-edit", "full-auto", "on-failure", "on-request", "suggest"]
+    _OUTPUT_STYLES = ["brief", "normal", "verbose"]
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         if not text.startswith("/"):
             return
-        if " " in text:
+
+        # ── After a space: complete arguments for known commands ──────────
+        space = text.find(" ")
+        if space != -1:
+            cmd_part = text[1:space].lower()
+            arg_part = text[space + 1:]
+            yield from self._complete_args(cmd_part, arg_part)
             return
+
+        # ── No space yet: complete the command name itself ────────────────
         query = text[1:]
-        for m in fuzzy_match_commands(query, self.task_running):
-            val  = m.command.value
-            desc = COMMAND_DESCRIPTIONS.get(m.command, "")
-            yield Completion(
-                val,
-                start_position=-len(query),
-                display=val,
-                display_meta=desc,
+
+        if not query:
+            # Just "/" typed — show ALL commands alphabetically
+            cmds = sorted(
+                [c for c in SlashCommand
+                 if not self.task_running or c in AVAILABLE_DURING_TASK],
+                key=lambda c: c.value,
             )
+            for c in cmds:
+                desc = COMMAND_DESCRIPTIONS.get(c, "")
+                yield Completion(
+                    c.value,
+                    start_position=0,
+                    display=c.value,
+                    display_meta=desc,
+                )
+        else:
+            # Partial input — fuzzy filter
+            for m in fuzzy_match_commands(query, self.task_running):
+                val  = m.command.value
+                desc = COMMAND_DESCRIPTIONS.get(m.command, "")
+                yield Completion(
+                    val,
+                    start_position=-len(query),
+                    display=val,
+                    display_meta=desc,
+                )
+
+    def _complete_args(self, cmd: str, arg: str):
+        """Yield completions for the argument portion of a command."""
+        q = arg.lower()
+
+        if cmd == "model":
+            yield from self._complete_model(arg)
+
+        elif cmd == "effort":
+            for level in self._EFFORT_LEVELS:
+                if level.startswith(q):
+                    meta = {"low": "faster & cheaper", "medium": "balanced",
+                            "high": "most thorough"}[level]
+                    yield Completion(level, start_position=-len(arg),
+                                     display=level, display_meta=meta)
+
+        elif cmd in ("approvals", "permissions"):
+            for val in self._APPROVAL_VALUES:
+                if q in val:
+                    yield Completion(val, start_position=-len(arg), display=val)
+
+        elif cmd == "output-style":
+            for style in self._OUTPUT_STYLES:
+                if style.startswith(q):
+                    yield Completion(style, start_position=-len(arg), display=style)
+
+    def _complete_model(self, query: str):
+        """Yield model-name completions from the catalog."""
+        try:
+            from bob.llm.catalog import get_catalog
+            catalog = get_catalog()
+            if not catalog.is_populated():
+                return
+            if query:
+                models = catalog.search_models(query)
+            else:
+                models = catalog.list_models(status="active")
+            for m in models[:40]:
+                mid      = m["model_id"]
+                provider = m.get("provider") or ""
+                ctx      = m.get("context_window")
+                ctx_str  = f"{ctx // 1000}K" if ctx else ""
+                inp      = m.get("input_price_per_1m")
+                price    = f"${inp:.2f}/1M" if inp is not None else ""
+                meta     = "  ".join(x for x in [provider, ctx_str, price] if x)
+                yield Completion(
+                    mid,
+                    start_position=-len(query),
+                    display=mid,
+                    display_meta=meta,
+                )
+        except Exception:
+            pass
 
 
 # ── Spinner ───────────────────────────────────────────────────────────────────
@@ -834,14 +931,7 @@ class Interface:
                 _p()
 
         elif cmd == SlashCommand.MODEL:
-            name = args.strip()
-            if name:
-                self._config = self._config.model_copy(update={"model": name})
-                from bob.protocol.ops import OverrideTurnContextOp
-                await self._session.submit(OverrideTurnContextOp(model=name))
-                _p(f"  {_d(f'model set to: {name}')}")
-            else:
-                _p(f"  {_d(f'current model: {self._config.model}')}")
+            await self._handle_model_picker(args.strip())
 
         elif cmd == SlashCommand.EFFORT:
             level = args.strip().lower()
@@ -1155,6 +1245,119 @@ class Interface:
                         return
         finally:
             await self._stop_spinner()
+
+    async def _handle_model_picker(self, search: str) -> None:
+        """Interactive /model picker — filter by search string, pick by number."""
+        from bob.llm.catalog import get_catalog
+
+        catalog = get_catalog()
+        current = self._config.model
+
+        # ── No catalog: fall back to direct set or show current ──────────
+        if not catalog.is_populated():
+            if search and not search.isdigit():
+                # Treat as a direct model name — backward-compat
+                self._config = self._config.model_copy(update={"model": search})
+                self._session.client = self._session._make_client(search)
+                _p(f"  {_g('✓')} Model set to: {_b(search)}")
+                _p(f"  {_d('(tip: run  python scripts/build_model_catalog.py  for the full picker)')}")
+            else:
+                _p(f"  current model: {_b(current)}")
+                _p(f"  {_d('Model catalog not built — run: python scripts/build_model_catalog.py')}")
+                _p(f"  {_d('Usage: /model <name>   e.g.  /model claude-3-5-sonnet-20241022')}")
+            return
+
+        # ── Filter models ─────────────────────────────────────────────────
+        all_models = catalog.list_models(status="active")
+        if search:
+            s = search.lower()
+            models = [
+                m for m in all_models
+                if s in m["model_id"].lower()
+                or s in (m.get("provider") or "").lower()
+                or s in (m.get("family") or "").lower()
+                or s in (m.get("display_name") or "").lower()
+            ]
+        else:
+            models = all_models
+
+        if not models:
+            _p(f"  {_y('⚠')}  No models found matching {_b(repr(search))}")
+            _p(f"  {_d('Try: /model gpt   /model claude   /model gemini   /model llama')}")
+            return
+
+        MAX_ROWS = 30
+        shown = models[:MAX_ROWS]
+
+        # ── Display table ─────────────────────────────────────────────────
+        _p()
+        header = f"  {'#':<4} {'Model ID':<44} {'Provider':<12} {'Context':<9} {'$/1M in  out'}"
+        _p(_d(header))
+        _p(_d("  " + "─" * (len(header) - 2)))
+
+        for i, m in enumerate(shown, 1):
+            mid      = m["model_id"]
+            provider = m.get("provider") or ""
+            ctx      = m.get("context_window")
+            ctx_str  = f"{ctx // 1000}K" if ctx else "—"
+            inp      = m.get("input_price_per_1m")
+            out      = m.get("output_price_per_1m")
+            if inp is not None and out is not None:
+                price_str = f"${inp:<6.2f}  ${out:.2f}"
+            else:
+                price_str = "—"
+            marker = f" {_g('←')}" if mid == current else ""
+            num    = _d(f"{i}.")
+            _p(f"  {num:<6} {mid:<44} {_d(provider):<12} {_d(ctx_str):<9} {_d(price_str)}{marker}")
+
+        if len(models) > MAX_ROWS:
+            _p(_d(f"\n  … {len(models) - MAX_ROWS} more — narrow your search (e.g. /model gemini-2)"))
+
+        _p()
+        _p(_d(f"  current: {current}"))
+        _p()
+
+        # ── Prompt for selection ──────────────────────────────────────────
+        try:
+            ps = PromptSession()
+            raw = await ps.prompt_async(
+                ANSI(f"  {_c('Enter number or model name')} {_d('(Enter = cancel)')} {_cb('›')} ")
+            )
+            raw = raw.strip()
+        except (KeyboardInterrupt, EOFError):
+            _p(_d("  cancelled"))
+            return
+
+        if not raw:
+            _p(_d("  cancelled"))
+            return
+
+        # ── Resolve selection ─────────────────────────────────────────────
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(shown):
+                chosen = shown[idx]["model_id"]
+            else:
+                _p(f"  {_y('⚠')}  Invalid number — must be 1–{len(shown)}")
+                return
+        else:
+            chosen = raw  # direct model name typed by user
+
+        # ── Apply ─────────────────────────────────────────────────────────
+        self._config = self._config.model_copy(update={"model": chosen})
+        self._session.client = self._session._make_client(chosen)
+
+        # Show what we switched to (with pricing if available)
+        info = catalog.get_model(chosen)
+        if info:
+            ctx   = info.get("context_window")
+            inp   = info.get("input_price_per_1m")
+            out   = info.get("output_price_per_1m")
+            ctx_s = f"  context: {ctx // 1000}K" if ctx else ""
+            pr_s  = f"  ${inp:.2f}/${out:.2f} per 1M" if (inp is not None and out is not None) else ""
+            _p(f"  {_g('✓')} Model set to: {_b(chosen)}{_d(ctx_s + pr_s)}")
+        else:
+            _p(f"  {_g('✓')} Model set to: {_b(chosen)}")
 
     async def run(self) -> None:  # noqa: C901
         completer = _SlashCompleter()

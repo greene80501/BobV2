@@ -1,4 +1,18 @@
 from __future__ import annotations
+
+# Windows: LiteLLM opens tokenizer JSON files via importlib.resources without
+# specifying encoding='utf-8', causing UnicodeDecodeError on cp1252 systems.
+# Fix: if not already in UTF-8 mode, re-exec immediately with -X utf8.
+# This must run before any import that could trigger litellm's tokenizer load.
+import sys as _sys
+if _sys.platform == "win32" and not _sys.flags.utf8_mode:
+    import os as _os
+    import subprocess as _subprocess
+    _sys.exit(_subprocess.run(
+        [_sys.executable, "-X", "utf8", "-m", "bob"] + _sys.argv[1:],
+        env=_os.environ,
+    ).returncode)
+
 import asyncio
 import os
 import sys

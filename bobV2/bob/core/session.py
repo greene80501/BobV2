@@ -71,27 +71,22 @@ class BobSession:
         from bob.core.context_manager import ContextManager
         self.context_manager = ContextManager()
 
-        # Resolve API key: prefer config.api_key, then fall back to env vars
+        # Resolve API key: prefer config.api_key, then common env vars.
         api_key = (
             config.api_key
             or os.environ.get("OPENAI_API_KEY", "")
+            or os.environ.get("ANTHROPIC_API_KEY", "")
             or os.environ.get("BOB_API_KEY", "")
         )
-        if not api_key:
-            raise RuntimeError(
-                "OpenAI API key is not set.\n\n"
-                "  PowerShell:  $env:OPENAI_API_KEY = 'sk-...'\n"
-                "  cmd.exe:     set OPENAI_API_KEY=sk-...\n"
-                "  bash/zsh:    export OPENAI_API_KEY=sk-...\n\n"
-                "Or add it to ~/.bob/config.toml:\n"
-                "  api_key = 'sk-...'"
-            )
-        from bob.client.openai_client import BobClient
-        self.client = BobClient(
-            api_key=api_key,
-            base_url=config.base_url,
-            model=config.model,
-        )
+        self._api_key = api_key
+        self.client = self._make_client(config.model)
+
+        # Analytics: per-turn token/cost/latency tracking
+        from bob.analytics.db import AnalyticsDB
+        from bob.analytics.tracker import AnalyticsTracker
+        from bob.llm.catalog import get_catalog
+        self._analytics_db = AnalyticsDB(self.bob_home / "analytics.db")
+        self.analytics = AnalyticsTracker(self._analytics_db, get_catalog())
 
         # Tool registry
         from bob.tools.registry import ToolRegistry
@@ -303,12 +298,40 @@ class BobSession:
             self._pending_user_inputs.pop(request_id, None)
 
     # ------------------------------------------------------------------
+    # Client factory — routes by model to Responses API or LiteLLM
+    # ------------------------------------------------------------------
+
+    # Models that only work with OpenAI's Responses API (not Chat Completions).
+    # LiteLLM routes to /v1/chat/completions; these must go through BobClient.
+    _RESPONSES_API_MODELS: frozenset[str] = frozenset({
+        "gpt-5.1-codex-mini",
+        "codex-mini-latest",
+    })
+
+    def _make_client(self, model: str):
+        """Return BobClient for Responses-API-only models, LiteLLMClient for everything else."""
+        bare = model.split("/")[-1]  # strip provider prefix e.g. "openai/gpt-4o" → "gpt-4o"
+        if bare in self._RESPONSES_API_MODELS or model in self._RESPONSES_API_MODELS:
+            from bob.client.openai_client import BobClient
+            kwargs: dict = {"api_key": self._api_key, "model": bare}
+            if self.config.base_url:
+                kwargs["base_url"] = self.config.base_url
+            return BobClient(**kwargs)
+        from bob.llm.client import LiteLLMClient
+        return LiteLLMClient(
+            api_key=self._api_key,
+            model=model,
+            base_url=self.config.base_url if self.config.base_url else None,
+        )
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """Initialize the session and start the agent loop."""
         await self._setup_persistence()
+        await self._analytics_db.setup()
         await self._load_system_prompt()
         self._agent_task = asyncio.create_task(self._agent_loop())
 
@@ -627,7 +650,7 @@ class BobSession:
             if isinstance(op, OverrideTurnContextOp):
                 if op.model:
                     self.config = self.config.model_copy(update={"model": op.model})
-                    self.client.model = op.model
+                    self.client = self._make_client(op.model)
                 if op.sandbox_policy:
                     self.sandbox_policy = op.sandbox_policy
                     from bob.sandbox import get_sandbox_runner
