@@ -213,6 +213,7 @@ async def run_turn(
     iteration = 0
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cached_input_tokens = 0
 
     try:
         while iteration < max_iterations:
@@ -265,6 +266,7 @@ async def run_turn(
                         iter_output_tokens = ev.output_tokens
                         total_input_tokens += ev.input_tokens
                         total_output_tokens += ev.output_tokens
+                        total_cached_input_tokens += ev.cached_input_tokens
 
                     elif isinstance(ev, ClientStreamError):
                         await emit(ErrorEvent(
@@ -595,6 +597,7 @@ async def run_turn(
             turn_id=turn_id,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
+            cached_input_tokens=total_cached_input_tokens,
         ))
 
         if session._recorder:
@@ -603,6 +606,7 @@ async def run_turn(
                 "turn_id": turn_id,
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
+                "cached_input_tokens": total_cached_input_tokens,
             })
 
         # Analytics: record tokens, cost, and latency for this turn

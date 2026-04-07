@@ -259,6 +259,7 @@ class Interface:
         # Token / cost tracking
         self._total_input_tokens  = 0
         self._total_output_tokens = 0
+        self._total_cached_input_tokens = 0
         self._last_turn_tokens: dict = {}
         # Context items prepended to next user turn
         self._pending_context_items: list[str] = []
@@ -660,9 +661,11 @@ class Interface:
                     # Token tracking
                     in_tok  = getattr(msg, "input_tokens",  0) or 0
                     out_tok = getattr(msg, "output_tokens", 0) or 0
+                    cached_tok = getattr(msg, "cached_input_tokens", 0) or 0
                     self._total_input_tokens  += in_tok
                     self._total_output_tokens += out_tok
-                    self._last_turn_tokens = {"input": in_tok, "output": out_tok}
+                    self._total_cached_input_tokens += cached_tok
+                    self._last_turn_tokens = {"input": in_tok, "output": out_tok, "cached": cached_tok}
                     _p()   # one blank line = turn boundary (❯ adds visual separation)
 
                 elif isinstance(msg, TurnInterruptedEvent):
@@ -754,9 +757,11 @@ class Interface:
                     _p()
                 in_tok  = getattr(msg, "input_tokens",  0) or 0
                 out_tok = getattr(msg, "output_tokens", 0) or 0
+                cached_tok = getattr(msg, "cached_input_tokens", 0) or 0
                 self._total_input_tokens  += in_tok
                 self._total_output_tokens += out_tok
-                self._last_turn_tokens = {"input": in_tok, "output": out_tok}
+                self._total_cached_input_tokens += cached_tok
+                self._last_turn_tokens = {"input": in_tok, "output": out_tok, "cached": cached_tok}
                 break
             elif isinstance(msg, (TurnInterruptedEvent, ErrorEvent, SessionEndedEvent)):
                 break
@@ -973,11 +978,17 @@ class Interface:
                     break
             cost_in  = self._total_input_tokens  / 1000 * rate_in
             cost_out = self._total_output_tokens / 1000 * rate_out
-            total_cost = cost_in + cost_out
+            # Cached tokens cost ~10% of normal input rate
+            cost_cached = self._total_cached_input_tokens / 1000 * rate_in * 0.1
+            total_cost = cost_in + cost_out + cost_cached
+            savings = self._total_cached_input_tokens / 1000 * rate_in * 0.9
             _p()
             _p(f"  {_d('input tokens')}   {self._total_input_tokens:>10,}   ${cost_in:.4f}")
+            _p(f"  {_d('cached tokens')}  {self._total_cached_input_tokens:>10,}   ${cost_cached:.4f}")
             _p(f"  {_d('output tokens')}  {self._total_output_tokens:>10,}   ${cost_out:.4f}")
             _p(f"  {_d('total estimate')} {'':>10}   ${total_cost:.4f}")
+            if savings > 0:
+                _p(f"  {_g('cache savings')}   {'':>10}   ${savings:.4f}")
             if rate_in == 0:
                 _p(f"  {_d('(rates unknown for this model)')}")
             _p()
@@ -989,6 +1000,9 @@ class Interface:
             else:
                 _p()
                 _p(f"  {_d('last turn input')}   {t.get('input', 0):>8,}")
+                cached = t.get('cached', 0)
+                if cached > 0:
+                    _p(f"  {_g('last turn cached')}  {cached:>8,}")
                 _p(f"  {_d('last turn output')}  {t.get('output', 0):>8,}")
                 _p()
 
