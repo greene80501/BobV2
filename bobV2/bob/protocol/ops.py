@@ -111,6 +111,18 @@ class PlanApprovalOp(BaseModel):
     feedback: str = ""  # Optional feedback if rejected
 
 
+
+class NetworkApprovalOp(BaseModel):
+    """User's response to a network approval request."""
+    type: Literal["network_approval"] = "network_approval"
+    url: str
+    domain: str
+    approved: bool
+    approve_always: bool = False  # Approve this domain for the entire session
+
+
+
+
     request_id: str
     granted: bool
     # Permissions that were actually granted (subset of requested)
@@ -372,6 +384,7 @@ Op = Annotated[
         CleanBackgroundTerminalsOp,
         ExecApprovalOp,
         PatchApprovalOp,
+        NetworkApprovalOp,
         ResolveElicitationOp,
         UserInputAnswerOp,
         RequestPermissionsResponseOp,

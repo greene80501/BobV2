@@ -54,6 +54,7 @@ class PluginsManager:
             if info is not None:
                 plugins.append(info)
 
+
         return plugins
 
     def get_plugin(self, name: str) -> Optional[PluginInfo]:

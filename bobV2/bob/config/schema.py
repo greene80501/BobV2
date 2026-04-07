@@ -82,6 +82,8 @@ class BobConfig(BaseModel):
     model: str = "gpt-5.1-codex-mini"
     api_key: Optional[str] = None
     base_url: str = "https://api.openai.com/v1"
+    # Enable prompt caching (Anthropic cache_control headers)
+    prompt_caching: bool = True
 
     # ------------------------------------------------------------------
     # Reasoning
@@ -113,6 +115,8 @@ class BobConfig(BaseModel):
     writable_roots: list[Path] = Field(default_factory=list)
     network_access: bool = False
     windows_sandbox_level: WindowsSandboxLevel = WindowsSandboxLevel.DISABLED
+    # HTTP proxy URL for all outbound requests
+    network_proxy: str = ""
 
     # ------------------------------------------------------------------
     # Collaboration / multi-agent
@@ -134,6 +138,8 @@ class BobConfig(BaseModel):
     # MCP servers
     # ------------------------------------------------------------------
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
+    # Per-server authentication tokens for MCP
+    mcp_auth_tokens: dict[str, str] = Field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Hooks
@@ -157,6 +163,8 @@ class BobConfig(BaseModel):
     max_context_turns: int = 50
     # Token threshold at which auto-compact kicks in (0 = disabled)
     auto_compact_threshold_tokens: int = 0
+    # Maximum context tokens to use (0 = use model default)
+    max_context_tokens: int = 0
 
     # ------------------------------------------------------------------
     # Service tier / billing
@@ -168,6 +176,8 @@ class BobConfig(BaseModel):
     # ------------------------------------------------------------------
     # Disable colour output (useful for piped/scripted usage)
     no_color: bool = False
+    # Color theme (dark, light, no-color)
+    theme: str = "dark"
     # Suppress the welcome banner
     quiet: bool = False
     # Show token usage after each turn
@@ -176,12 +186,16 @@ class BobConfig(BaseModel):
     show_reasoning: bool = False
     # Show cost estimate after each turn
     show_cost: bool = False
+    # Stream responses in real-time (False = buffer full response)
+    stream_responses: bool = True
 
     # ------------------------------------------------------------------
     # File-change / diff
     # ------------------------------------------------------------------
     # Maximum lines of diff shown in the patch approval prompt
     patch_preview_lines: int = 20
+    # Co-authored-by line appended to AI commits
+    git_commit_attribution: str = ""
 
     # ------------------------------------------------------------------
     # Shell execution
@@ -227,5 +241,7 @@ class BobConfig(BaseModel):
     enable_background_terminals: bool = True
     # Enable guardian sub-agent for approval decisions
     enable_guardian: bool = False
+    # Named feature toggles for experimental features
+    feature_flags: dict[str, bool] = Field(default_factory=dict)
     # Extra arbitrary key/value pairs forwarded to plugins / tools
     extra: dict[str, Any] = Field(default_factory=dict)

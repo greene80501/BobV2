@@ -268,6 +268,17 @@ class PlanRejectedEvent(BaseModel):
 
 
     action: str  # ElicitationAction value
+
+
+class NetworkApprovalRequestedEvent(BaseModel):
+    """Emitted when a tool attempts network access to an unapproved domain."""
+    type: Literal["network_approval_requested"] = "network_approval_requested"
+    url: str
+    domain: str
+    tool_name: str
+
+
+
     data: Optional[dict[str, Any]] = None
 
 
@@ -634,6 +645,8 @@ EventMsg = Annotated[
         PatchApprovalRequestedEvent,
         PatchApprovalResolvedEvent,
         FilesChangedEvent,
+        # Network
+        NetworkApprovalRequestedEvent,
         # Plan
         PlanUpdatedEvent,
         PlanStepStatusEvent,

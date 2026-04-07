@@ -138,6 +138,23 @@ class _SlashCompleter(Completer):
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+        
+        # Handle @filename autocomplete
+        if "@" in text:
+            at_pos = text.rfind("@")
+            if at_pos >= 0:
+                prefix = text[at_pos+1:]
+                yield from self._complete_filename(prefix)
+                return
+        
+        # Handle #tool autocomplete
+        if "#" in text:
+            hash_pos = text.rfind("#")
+            if hash_pos >= 0:
+                prefix = text[hash_pos+1:]
+                yield from self._complete_tool(prefix)
+                return
+        
         if not text.startswith("/"):
             return
 
@@ -231,6 +248,91 @@ class _SlashCompleter(Completer):
                 )
         except Exception:
             pass
+    
+    def _complete_filename(self, prefix: str):
+        """Yield filename completions for @filename syntax."""
+        from pathlib import Path
+        import os
+        
+        try:
+            # Get current working directory
+            cwd = Path.cwd()
+            
+            # If prefix contains path separator, split into dir and file parts
+            if "/" in prefix or "\\" in prefix:
+                path_obj = Path(prefix)
+                search_dir = cwd / path_obj.parent if not path_obj.is_absolute() else path_obj.parent
+                file_prefix = path_obj.name
+            else:
+                search_dir = cwd
+                file_prefix = prefix
+            
+            if not search_dir.exists():
+                return
+            
+            # List files and directories matching prefix
+            for item in sorted(search_dir.iterdir()):
+                name = item.name
+                if name.startswith(file_prefix) or not file_prefix:
+                    # Skip hidden files unless prefix starts with .
+                    if name.startswith(".") and not file_prefix.startswith("."):
+                        continue
+                    
+                    display_name = name + ("/" if item.is_dir() else "")
+                    rel_path = str(item.relative_to(cwd)) if item.is_relative_to(cwd) else str(item)
+                    
+                    yield Completion(
+                        rel_path,
+                        start_position=-len(prefix),
+                        display=display_name,
+                        display_meta="dir" if item.is_dir() else "file"
+                    )
+        except Exception:
+            pass
+    
+    def _complete_tool(self, prefix: str):
+        """Yield tool name completions for #tool syntax."""
+        try:
+            # Get available tools from session
+            from bob.tools.registry import get_tool_registry
+            registry = get_tool_registry()
+            
+            tool_names = registry.list_tool_names()
+            
+            for tool_name in sorted(tool_names):
+                if tool_name.startswith(prefix) or not prefix:
+                    # Get tool description if available
+                    try:
+                        tool = registry.get_tool(tool_name)
+                        desc = getattr(tool, 'description', '') or ''
+                        # Truncate long descriptions
+                        if len(desc) > 60:
+                            desc = desc[:57] + "..."
+                    except Exception:
+                        desc = ""
+                    
+                    yield Completion(
+                        tool_name,
+                        start_position=-len(prefix),
+                        display=tool_name,
+                        display_meta=desc
+                    )
+        except Exception:
+            # Fallback to common tool names if registry not available
+            common_tools = [
+                "read_file", "write_to_file", "list_files", "search_files",
+                "execute_command", "apply_diff", "web_search", "web_fetch"
+            ]
+            for tool_name in common_tools:
+                if tool_name.startswith(prefix) or not prefix:
+                    yield Completion(
+                        tool_name,
+                        start_position=-len(prefix),
+                        display=tool_name
+                    )
+
+
+            pass
 
 
 # ── Spinner ───────────────────────────────────────────────────────────────────
@@ -278,6 +380,13 @@ class Interface:
         self._vi_mode_changed: bool = False
         # Extended thinking
         self._next_turn_thinking_budget: Optional[int] = None
+        # Code block tracking for syntax highlighting
+        self._in_code_block = False
+        self._code_block_lang: Optional[str] = None
+        self._code_block_content = ""
+        # Word-wrap buffer for streaming text
+        self._wrap_buffer = ""
+        self._wrap_column = 0
 
     # ── Dynamic prompt ────────────────────────────────────────────────────────
 
@@ -385,15 +494,49 @@ class Interface:
             ""
         ]
 
-        # Right Column: Tips & Basic Commands
+        # Right Column: Recent Activity & Commands
         right_rows = [
-            f"  {BOLD}Tips & Basic Commands{RST}",
-            f"  {DIM}Bob is an AI assistant that can write code and run commands.{RST}",
-            f"  {DIM}• /help   - View all available commands{RST}",
-            f"  {DIM}• /init   - Initialize configuration and AGENTS.md{RST}",
-            f"  {DIM}• /skills - Manage and teach bob new capabilities{RST}",
-            f"  {DIM}• /exit   - Shut down correctly safely{RST}"
+            f"  {BOLD}Recent Activity{RST}",
         ]
+        
+        # Query recent sessions from analytics DB
+        try:
+            from bob.analytics.db import get_analytics_db
+            db = get_analytics_db()
+            recent_sessions = db.get_recent_sessions(limit=3)
+            
+            if recent_sessions:
+                for session in recent_sessions:
+                    session_id = session.get('session_id', 'unknown')[:8]
+                    timestamp = session.get('created_at', '')
+                    # Format timestamp nicely
+                    if timestamp:
+                        from datetime import datetime
+                        try:
+                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            time_str = dt.strftime('%b %d, %H:%M')
+                        except Exception:
+                            time_str = timestamp[:16]
+                    else:
+                        time_str = 'unknown'
+                    
+                    thread_name = session.get('thread_name', 'Untitled')
+                    if len(thread_name) > 25:
+                        thread_name = thread_name[:22] + "..."
+                    
+                    right_rows.append(f"  {DIM}• {session_id} - {thread_name} ({time_str}){RST}")
+            else:
+                right_rows.append(f"  {DIM}No recent sessions{RST}")
+        except Exception:
+            right_rows.append(f"  {DIM}No recent activity{RST}")
+        
+        right_rows.extend([
+            "",
+            f"  {BOLD}Quick Commands{RST}",
+            f"  {DIM}• /help   - View all commands{RST}",
+            f"  {DIM}• /resume - Continue last session{RST}",
+            f"  {DIM}• /new    - Start fresh session{RST}",
+        ])
 
         # Divvy up the columns dynamically based on actual content lengths!
         LEFT_W = max([vlen(l) for l in left_rows])
@@ -546,6 +689,60 @@ class Interface:
 
     # ── Event consumer ────────────────────────────────────────────────────────
 
+    def _wrap_streaming_text(self, delta: str) -> str:
+        """Word-wrap streaming text to terminal width.
+        
+        Maintains state across deltas to handle word boundaries correctly.
+        Returns the wrapped text ready for printing.
+        """
+        import shutil
+        
+        term_width = shutil.get_terminal_size((120, 24)).columns
+        # Leave margin for "• " prefix and some padding
+        wrap_width = term_width - 4
+        
+        result = []
+        self._wrap_buffer += delta
+        
+        # Process complete words
+        while True:
+            # Check if we have a complete word (space or newline)
+            space_idx = self._wrap_buffer.find(' ')
+            newline_idx = self._wrap_buffer.find('\n')
+            
+            # Find the nearest delimiter
+            if space_idx == -1 and newline_idx == -1:
+                # No complete word yet, keep buffering
+                break
+            
+            if newline_idx != -1 and (space_idx == -1 or newline_idx < space_idx):
+                # Newline comes first
+                word = self._wrap_buffer[:newline_idx]
+                self._wrap_buffer = self._wrap_buffer[newline_idx + 1:]
+                
+                if self._wrap_column + len(word) > wrap_width:
+                    result.append('\n')
+                    self._wrap_column = 0
+                
+                result.append(word)
+                result.append('\n')
+                self._wrap_column = 0
+            else:
+                # Space comes first
+                word = self._wrap_buffer[:space_idx + 1]  # Include the space
+                self._wrap_buffer = self._wrap_buffer[space_idx + 1:]
+                
+                if self._wrap_column + len(word) > wrap_width:
+                    result.append('\n')
+                    self._wrap_column = 0
+                
+                result.append(word)
+                self._wrap_column += len(word)
+        
+        return ''.join(result)
+
+
+
     async def _consume_events(self) -> None:  # noqa: C901
         from bob.protocol.events import (
             BackgroundTerminalOutputEvent,
@@ -562,6 +759,8 @@ class Interface:
             ReasoningDeltaEvent,
             SessionEndedEvent,
             TextDeltaEvent,
+            ToolCallStartedEvent,
+            ToolCallCompletedEvent,
             TurnEndedEvent,
             TurnInterruptedEvent,
             TurnStartedEvent,
@@ -599,10 +798,82 @@ class Interface:
                             _p()
                         self._after_tool = False
                         _p("• ", end="")
-                    # Print delta immediately for real-time streaming
-                    _p(msg.delta, end="")
-                    # Also accumulate for markdown rendering at turn end
-                    self._current_buf += msg.delta
+                    
+                    # Handle code block syntax highlighting
+                    delta = msg.delta
+                    self._current_buf += delta
+                    
+                    # Word-wrap streaming text (skip if in code block)
+                    if not self._in_code_block:
+                        delta = self._wrap_streaming_text(delta)
+                    
+                    # Check for code block markers
+                    if "```" in delta:
+                        lines = delta.split("\n")
+                        for line in lines:
+                            if line.strip().startswith("```"):
+                                if not self._in_code_block:
+                                    # Starting a code block
+                                    self._in_code_block = True
+                                    # Extract language (e.g., ```python)
+                                    lang = line.strip()[3:].strip()
+                                    self._code_block_lang = lang if lang else "text"
+                                    self._code_block_content = ""
+                                    _p(line)  # Print the opening marker
+                                else:
+                                    # Ending a code block - render with syntax highlighting
+                                    self._in_code_block = False
+                                    if self._code_block_content:
+                                        from rich.console import Console
+                                        from rich.syntax import Syntax
+                                        import io
+                                        
+                                        string_io = io.StringIO()
+                                        console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns)
+                                        
+                                        syntax = Syntax(
+                                            self._code_block_content,
+                                            self._code_block_lang or "text",
+                                            theme="monokai",
+                                            line_numbers=False,
+                                            word_wrap=True
+                                        )
+                                        console.print(syntax)
+                                        
+                                        output = string_io.getvalue()
+                                        for out_line in output.splitlines():
+                                            _p(out_line)
+                                    
+                                    _p(line)  # Print the closing marker
+                                    self._code_block_content = ""
+                                    self._code_block_lang = None
+                            elif self._in_code_block:
+                                # Accumulate code block content
+                                self._code_block_content += line + "\n"
+                            else:
+                                # Regular text outside code blocks
+                                _p(line, end="")
+                    elif self._in_code_block:
+                        # Inside code block, accumulate
+                        self._code_block_content += delta
+                    else:
+                        # Regular streaming text
+                        _p(delta, end="")
+
+                # ── Tool call lifecycle ───────────────────────────────────────
+
+                elif isinstance(msg, ToolCallStartedEvent):
+                    # Update spinner to show which tool is running
+                    tool_name = msg.tool_name
+                    # Format tool name nicely (e.g., read_file -> "read file")
+                    display_name = tool_name.replace("_", " ").title()
+                    self._spinner_label = f"Running {display_name}…"
+                    if not self._spinner_active:
+                        await self._start_spinner()
+
+                elif isinstance(msg, ToolCallCompletedEvent):
+                    # Reset spinner label back to default
+                    self._spinner_label = "Thinking…"
 
                 # ── Extended thinking ─────────────────────────────────────────
 
@@ -843,7 +1114,35 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
-                    _p(f"  {_r('✗')} {msg.message}")
+                    
+                    # Format error message with rich highlighting for file:line patterns
+                    error_msg = msg.message
+                    
+                    # Check if error contains traceback or file:line references
+                    if any(pattern in error_msg for pattern in [" File ", "line ", ".py:", ".ts:", ".js:"]):
+                        from rich.console import Console
+                        from rich.syntax import Syntax
+                        import io
+                        
+                        # Render with rich for syntax highlighting
+                        string_io = io.StringIO()
+                        console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns)
+                        
+                        # Try to highlight file paths and line numbers
+                        import re
+                        # Pattern: /path/to/file.py:123 or file.py:123
+                        highlighted = re.sub(
+                            r'([/\w.-]+\.(py|ts|js|jsx|tsx|rs|go|java|cpp|c|h)):(\d+)',
+                            r'[cyan]\1[/cyan]:[yellow]\3[/yellow]',
+                            error_msg
+                        )
+                        console.print(f"[red]✗[/red] {highlighted}")
+                        
+                        output = string_io.getvalue()
+                        for line in output.splitlines():
+                            _p(f"  {line}")
+                    else:
+                        _p(f"  {_r('✗')} {error_msg}")
                     _p()
 
                 elif isinstance(msg, WarningEvent):
@@ -1187,6 +1486,10 @@ class Interface:
         # ── Phase 1: help, model, effort, cost, usage ─────────────────────────
 
         elif cmd == SlashCommand.HELP:
+            from rich.console import Console
+            from rich.table import Table
+            import io
+            
             _p()
             groups = [
                 ("Navigation",  [SlashCommand.NEW, SlashCommand.RESUME, SlashCommand.FORK,
@@ -1203,11 +1506,26 @@ class Interface:
                 ("System",      [SlashCommand.DOCTOR, SlashCommand.INIT, SlashCommand.FEEDBACK,
                                   SlashCommand.QUIT]),
             ]
+            
             for group, cmds in groups:
-                _p(f"  {_b(group)}")
+                table = Table(show_header=False, box=None, padding=(0, 2))
+                table.add_column("Command", style="cyan", no_wrap=True)
+                table.add_column("Description", style="dim")
+                
                 for c in cmds:
                     desc = COMMAND_DESCRIPTIONS.get(c, "")
-                    _p(f"    {_c('/' + c.value):<30}  {_d(desc)}")
+                    table.add_row(f"/{c.value}", desc)
+                
+                # Render table to string
+                string_io = io.StringIO()
+                console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns)
+                console.print(f"[bold]{group}[/bold]")
+                console.print(table)
+                
+                # Print the rendered output
+                output = string_io.getvalue()
+                for line in output.splitlines():
+                    _p(f"  {line}")
                 _p()
 
         elif cmd == SlashCommand.MODEL:
@@ -1591,6 +1909,249 @@ class Interface:
                     _p(f"  {_d(f'thinking budget set to {budget:,} tokens for next turn')}")
             except ValueError:
                 _p(f"  {_y('⚠')} usage: /think [budget_tokens]  (default: 5000)")
+
+        elif cmd == SlashCommand.CONFIG:
+            _p()
+            _p(f"  {_b('Configuration:')}")
+            _p()
+            config_items = [
+                ("model", self._config.model),
+                ("reasoning_effort", self._config.reasoning_effort.value),
+                ("output_style", self._config.output_style.value),
+                ("sandbox_mode", self._config.sandbox_mode.value),
+                ("ask_for_approval", self._config.ask_for_approval.value),
+                ("network_access", str(self._config.network_access)),
+                ("enable_memories", str(self._config.enable_memories)),
+                ("enable_skills", str(self._config.enable_skills)),
+                ("show_reasoning", str(self._config.show_reasoning)),
+            ]
+            for key, val in config_items:
+                _p(f"  {_d(f'{key:<20}')}  {val}")
+            _p()
+            _p(f"  {_d('Config file: ~/.bob/config.toml')}")
+            _p(f"  {_d('Edit with: /config edit')}")
+            _p()
+
+        elif cmd == SlashCommand.STATS:
+            _p()
+            _p(f"  {_b('Session Statistics:')}")
+            _p()
+            _p(f"  {_d('Total input tokens')}   {self._total_input_tokens:>10,}")
+            if self._total_cached_input_tokens > 0:
+                _p(f"  {_g('Cached tokens')}       {self._total_cached_input_tokens:>10,}")
+            _p(f"  {_d('Total output tokens')}  {self._total_output_tokens:>10,}")
+            _p(f"  {_d('Total tokens')}         {self._total_input_tokens + self._total_output_tokens:>10,}")
+            _p()
+            # Calculate cost if possible
+            if hasattr(self._session, 'analytics') and self._session.analytics:
+                cost = self._session.analytics.session_cost_usd
+                if cost > 0:
+                    _p(f"  {_d('Estimated cost')}       ${cost:.4f}")
+                    _p()
+
+        elif cmd == SlashCommand.SESSION:
+            _p()
+            _p(f"  {_b('Session Information:')}")
+            _p()
+            _p(f"  {_d('Session ID')}     {self._session.session_id}")
+            _p(f"  {_d('Model')}          {self._config.model}")
+            _p(f"  {_d('Working dir')}    {Path.cwd()}")
+            _p(f"  {_d('Sandbox mode')}   {self._config.sandbox_mode.value}")
+            _p(f"  {_d('Total tokens')}   {self._total_input_tokens + self._total_output_tokens:,}")
+            _p()
+
+        elif cmd == SlashCommand.MEMORY:
+            memory_path = Path.home() / ".bob" / "memory.md"
+            if not args.strip():
+                # Show memory contents
+                if memory_path.exists():
+                    content = memory_path.read_text(encoding="utf-8")
+                    _p()
+                    _p(f"  {_b('Memory Contents:')}")
+                    _p()
+                    for line in content.splitlines()[:50]:  # Show first 50 lines
+                        _p(f"  {line}")
+                    _p()
+                else:
+                    _p(f"  {_d('No memory file found')}")
+            elif args.strip() == "edit":
+                # Open in editor
+                editor = os.environ.get("EDITOR", "nano")
+                try:
+                    memory_path.parent.mkdir(parents=True, exist_ok=True)
+                    subprocess.run([editor, str(memory_path)])
+                    _p(f"  {_g('✓')} Memory file edited")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} Failed to open editor: {exc}")
+            elif args.strip() == "clear":
+                # Clear memory
+                try:
+                    if memory_path.exists():
+                        memory_path.unlink()
+                    _p(f"  {_g('✓')} Memory cleared")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} Failed to clear memory: {exc}")
+            else:
+                _p(f"  {_y('⚠')} usage: /memory [edit|clear]")
+
+        elif cmd == SlashCommand.SHARE:
+            # Export as self-contained HTML
+            import time as _time
+            dest = args.strip()
+            if not dest:
+                ts = int(_time.time())
+                dest = str(Path.home() / f"bob-session-{ts}.html")
+            try:
+                items = self._session.context_manager.raw_items()
+                html_parts = [
+                    "<!DOCTYPE html>",
+                    "<html><head>",
+                    "<meta charset='utf-8'>",
+                    "<title>Bob Session</title>",
+                    "<style>",
+                    "body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }",
+                    ".user { background: #f0f0f0; padding: 15px; margin: 10px 0; border-radius: 5px; }",
+                    ".assistant { background: #e8f4f8; padding: 15px; margin: 10px 0; border-radius: 5px; }",
+                    "pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 3px; overflow-x: auto; }",
+                    "</style>",
+                    "</head><body>",
+                    "<h1>Bob Session Export</h1>",
+                ]
+                
+                for item in items:
+                    role = item.get("role", "")
+                    content = item.get("content", "")
+                    if isinstance(content, list):
+                        text = "".join(
+                            c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    else:
+                        text = str(content)
+                    
+                    # Escape HTML
+                    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    
+                    if role == "user":
+                        html_parts.append(f"<div class='user'><strong>User:</strong><br>{text}</div>")
+                    elif role == "assistant":
+                        html_parts.append(f"<div class='assistant'><strong>Bob:</strong><br>{text}</div>")
+                
+                html_parts.append("</body></html>")
+                
+                Path(dest).write_text("\n".join(html_parts), encoding="utf-8")
+                _p(f"  {_g('✓')} Exported to: {dest}")
+                
+                # Try to open in browser
+                try:
+                    import webbrowser
+                    webbrowser.open(f"file://{Path(dest).absolute()}")
+                    _p(f"  {_d('Opened in browser')}")
+                except Exception:
+                    pass
+            except Exception as exc:
+                _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.ISSUE:
+            # Create GitHub issue
+            title = args.strip()
+            if not title:
+                _p(f"  {_y('⚠')} usage: /issue <title>")
+            else:
+                try:
+                    # Check if gh CLI is available
+                    if not shutil.which("gh"):
+                        _p(f"  {_r('✗')} GitHub CLI (gh) not found. Install from https://cli.github.com/")
+                        return False
+                    
+                    # Get summary of current session
+                    _p(f"  {_d('Generating issue body from session context…')}")
+                    body = await self._quick_model_turn(
+                        f"Create a concise GitHub issue body for: {title}\n\n"
+                        "Include: problem description, steps to reproduce (if applicable), "
+                        "and any relevant context from our conversation. "
+                        "Format as markdown. Be brief but complete."
+                    )
+                    
+                    # Create issue
+                    result = subprocess.run(
+                        ["gh", "issue", "create", "--title", title, "--body", body],
+                        capture_output=True, text=True, cwd=Path.cwd(), timeout=30,
+                    )
+                    
+                    if result.returncode == 0:
+                        # Extract URL from output
+                        url = result.stdout.strip().split()[-1] if result.stdout else ""
+                        _p(f"  {_g('✓')} Issue created: {url}")
+                    else:
+                        _p(f"  {_r('✗')} Failed to create issue: {result.stderr.strip()}")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.PR_COMMENTS:
+            # Fetch PR review comments
+            pr_num = args.strip()
+            if not pr_num:
+                _p(f"  {_y('⚠')} usage: /pr_comments <pr_number>")
+            else:
+                try:
+                    # Check if gh CLI is available
+                    if not shutil.which("gh"):
+                        _p(f"  {_r('✗')} GitHub CLI (gh) not found. Install from https://cli.github.com/")
+                        return False
+                    
+                    _p(f"  {_d(f'Fetching PR #{pr_num} comments…')}")
+                    result = subprocess.run(
+                        ["gh", "pr", "view", pr_num, "--json", "comments,reviews"],
+                        capture_output=True, text=True, cwd=Path.cwd(), timeout=15,
+                    )
+                    
+                    if result.returncode == 0:
+                        import json
+                        data = json.loads(result.stdout)
+                        comments = data.get("comments", [])
+                        reviews = data.get("reviews", [])
+                        
+                        # Format as context
+                        context_parts = [f"# PR #{pr_num} Comments\n"]
+                        
+                        for comment in comments:
+                            author = comment.get("author", {}).get("login", "unknown")
+                            body = comment.get("body", "")
+                            context_parts.append(f"## Comment by {author}\n{body}\n")
+                        
+                        for review in reviews:
+                            author = review.get("author", {}).get("login", "unknown")
+                            body = review.get("body", "")
+                            state = review.get("state", "")
+                            context_parts.append(f"## Review by {author} ({state})\n{body}\n")
+                        
+                        context_text = "\n".join(context_parts)
+                        self._pending_context_items.append(context_text)
+                        
+                        _p(f"  {_g('✓')} Added {len(comments)} comments and {len(reviews)} reviews to context")
+                    else:
+                        _p(f"  {_r('✗')} Failed to fetch PR: {result.stderr.strip()}")
+                except Exception as exc:
+                    _p(f"  {_r('✗')} {exc}")
+
+        elif cmd == SlashCommand.THEME:
+            # Theme switching (basic implementation)
+            theme = args.strip().lower()
+            if not theme:
+                _p(f"  {_d('Current theme: dark (default)')}")
+                _p(f"  {_d('Available: dark, light, no-color')}")
+            elif theme in ("dark", "light", "no-color"):
+                if theme == "no-color":
+                    self._config.no_color = True
+                    _p(f"  {_d('Color output disabled')}")
+                else:
+                    self._config.no_color = False
+                    _p(f"  {_d(f'Theme set to: {theme}')}")
+                    _p(f"  {_y('⚠')} Full theme support not yet implemented")
+            else:
+                _p(f"  {_r('✗')} Invalid theme: {theme}")
+                _p(f"  {_d('Available: dark, light, no-color')}")
 
         else:
             _p(f"  {_y('⚠')} /{cmd.value} not yet implemented")

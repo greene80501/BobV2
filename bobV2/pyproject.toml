@@ -17,6 +17,8 @@ dependencies = [
     "rapidfuzz>=3.0.0",
     "pyperclip>=1.8.0",
     "watchfiles>=0.21.0",
+    "requests>=2.32.0",
+    "beautifulsoup4>=4.12.2",
 ]
 
 [project.optional-dependencies]
