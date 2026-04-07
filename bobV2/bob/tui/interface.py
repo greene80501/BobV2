@@ -52,10 +52,12 @@ _con = Console(highlight=False, soft_wrap=True)
 _R   = "\033[0m"    # reset
 _DIM = "\033[2m"    # dim
 _BLD = "\033[1m"    # bold
-_RED = "\033[31m"   # red
-_GRN = "\033[32m"   # green
-_YLW = "\033[33m"   # yellow
-_CYN = "\033[36m"   # cyan
+_RED = ""   # red
+_GRN = ""   # green
+_YLW = ""   # yellow
+_CYN = ""   # cyan
+_PRP = "" # purple (#a46eff)
+_BLU = ""   # blue (#0f62fe)
 
 
 def _d(s: str) -> str:   return f"{_DIM}{s}{_R}"
@@ -63,8 +65,8 @@ def _b(s: str) -> str:   return f"{_BLD}{s}{_R}"
 def _r(s: str) -> str:   return f"{_RED}{s}{_R}"
 def _g(s: str) -> str:   return f"{_GRN}{s}{_R}"
 def _y(s: str) -> str:   return f"{_YLW}{s}{_R}"
-def _c(s: str) -> str:   return f"{_CYN}{s}{_R}"
-def _cb(s: str) -> str:  return f"{_CYN}{_BLD}{s}{_R}"
+def _c(s: str) -> str:   return f"{_PRP}{s}{_R}"
+def _cb(s: str) -> str:  return f"{_BLU}{_BLD}{s}{_R}"
 
 
 def _truncate_cmd(s: str, max_len: int = 120) -> str:
@@ -278,108 +280,126 @@ class Interface:
     # ── Header — Claude Code-style welcome panel ──────────────────────────────
 
     def _print_header(self) -> None:
-        model   = self._config.model
-        sandbox = self._config.sandbox_mode.value
-        cwd     = Path.cwd()
-
-        # Shorten cwd with ~ like Claude Code does
-        home = Path.home()
+        """Print the welcome header directly to sys.__stdout__ before patch_stdout."""
+        import copy
+        bob_version = "0.1.0"
         try:
-            rel = cwd.relative_to(home)
-            sep = "\\" if sys.platform == "win32" else "/"
-            cwd_str = "~" + sep + str(rel) if str(rel) != "." else "~"
-        except ValueError:
-            cwd_str = str(cwd)
-
-        # Bob version
-        try:
-            from importlib.metadata import version as _pkg_ver
-            bob_version = _pkg_ver("bob")
+            from bob import __version__
+            bob_version = __version__
         except Exception:
             bob_version = "0.1.0"
 
-        # Terminal width
         term_w = shutil.get_terminal_size((120, 24)).columns
+        inner_w = term_w - 4 # excluding the very outer frame chars (│  │)
 
-        # Column layout: │ sp [LEFT] sp │ sp [RIGHT] sp │
-        #  char count:   1  1   L    1  1  1    R    1  1  = L + R + 7
-        LEFT  = 52
-        RIGHT = max(20, term_w - LEFT - 7)
+        # Divvy up the columns.
+        # Mascot block requires ~30 inner chars minimum, 50 is safe
+        CENTER_W = 50
+        LEFT_W = 42 # sufficient for System info width
+        RIGHT_W = inner_w - LEFT_W - CENTER_W - 6 # accounting for two inner " │ " dividers 
 
-        # ANSI helpers (raw — written via sys.__stdout__ before patch_stdout)
+        # ANSI helpers
         RST   = "\033[0m"
         DIM   = "\033[2m"
         BOLD  = "\033[1m"
-        BRAND = "\033[38;2;215;119;87m"  # exact Anthropic brand orange rgb(215,119,87)
+        BRAND = "" # monochrome
 
         def vlen(s: str) -> int:
-            """Visible length — strips ANSI escape codes."""
+            import re
             return len(re.sub(r"\033\[[0-9;]*m", "", s))
 
-        def center(s: str, w: int = LEFT) -> str:
-            """Center an ANSI-aware string in a field of width w."""
+        def center(s: str, w: int) -> str:
             v = vlen(s)
-            if v >= w:
-                return s
+            if v >= w: return s
             pl = (w - v) // 2
             pr = w - v - pl
             return " " * pl + s + " " * pr
 
         def rpad(s: str, w: int) -> str:
-            """Right-pad an ANSI-aware string to visible width w."""
             v = vlen(s)
             return s if v >= w else s + " " * (w - v)
 
-        # Mascot (Unicode block chars, Claude Code Clawd-style)
+        # Mascot (Unicode block chars, exact copy of bobart2.md, custom 10-line size)
         mascot = [
-            f"{BRAND}▐▛███▜▌{RST}",     # 7 visible chars
-            f"{BRAND}▝▜█████▛▘{RST}",   # 9 visible chars
-            f"{BRAND}  ▘▘ ▝▝  {RST}",   # 9 visible chars
+            f"{BRAND}⠀⠀⢀⣠⣴⣿⣿⣿⣷⣦⣀⠀⠀⠀{RST}",
+            f"{BRAND}⠀⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀{RST}",
+            f"{BRAND}⢀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣇⡀{RST}",
+            f"{BRAND}⣻⣿⠿⢿⣿⠿⠿⠿⢿⣿⠿⢷⣾⡃{RST}",
+            f"{BRAND}⣿⣿⠀⢿⣿⡇⠀⠐⣿⣿⠆⢸⣿⡇{RST}",
+            f"{BRAND}⠉⢻⣄⣀⣀⣒⣶⣖⣂⣀⣀⣼⠋⠁{RST}",
+            f"{BRAND}⠀⢠⡞⢿⡟⠛⣛⡛⠛⣿⡟⣶⠀⠀{RST}",
+            f"{BRAND}⠀⣸⣧⣼⣷⡺⠿⠽⣢⣿⣧⣼⡀⠀{RST}",
+            f"{BRAND}⢰⣯⣤⣬⣯⡙⠛⠛⣹⣯⣤⣬⣷⠀{RST}",
+            f"{BRAND}⠀⠀⣾⣿⣿⣿⡆⣾⣿⣿⣿⡆⠀⠀{RST}",
         ]
 
-        # Left column (52 visible chars wide)
+        import os
+        import pathlib
+        model = self._config.model or "unknown"
+        sandbox = self._config.sandbox_mode.value if self._config.sandbox_mode else "none"
+        cwd_str = str(self._config.exec_cwd or os.getcwd())
+        
+        # Abbreviate home
+        try:
+            home = str(pathlib.Path.home())
+            if cwd_str.startswith(home):
+                cwd_str = "~" + cwd_str[len(home):]
+            if len(cwd_str) > 23:
+                cwd_str = "..." + cwd_str[-20:]
+        except Exception:
+            pass
+
+        # Left Column: System Info
         left_rows = [
-            " " * LEFT,
-            center(f"{BRAND}Welcome to bob!{RST}"),
-            " " * LEFT,
-            center(mascot[0]),
-            center(mascot[1]),
-            center(mascot[2]),
-            " " * LEFT,
-            "  " + rpad(f"{DIM}{model} · {sandbox}{RST}", LEFT - 2),
-            "  " + rpad(f"{DIM}{cwd_str}{RST}",           LEFT - 2),
-            " " * LEFT,
+            "",
+            f"  {BOLD}System Info{RST}",
+            f"  {DIM}Model:    {model}{RST}",
+            f"  {DIM}Workspace: {sandbox}{RST}",
+            f"  {DIM}System:    Bob v2{RST}",
+            f"  {DIM}Directory: {cwd_str}{RST}",
+            ""
         ]
 
-        # Right column
+        # Right Column: Tips & Basic Commands
         right_rows = [
-            f"{BOLD}Tips for getting started{RST}",
-            f"{DIM}Run /init to create an AGENTS.md file{RST}",
-            f"{DIM}{'─' * min(RIGHT - 2, 55)}{RST}",
-            f"{BOLD}Recent activity{RST}",
-            f"{DIM}No recent activity{RST}",
-            "",
-            "",
-            "",
-            "",
-            "",
+            f"  {BOLD}Tips & Basic Commands{RST}",
+            f"  {DIM}Bob is an AI assistant that can write code and run commands.{RST}",
+            f"  {DIM}• /help   - View all available commands{RST}",
+            f"  {DIM}• /init   - Initialize configuration and AGENTS.md{RST}",
+            f"  {DIM}• /skills - Manage and teach bob new capabilities{RST}",
+            f"  {DIM}• /exit   - Shut down correctly safely{RST}"
         ]
 
-        # Pad to equal row count
-        n = max(len(left_rows), len(right_rows))
-        while len(left_rows)  < n: left_rows.append(" " * LEFT)
+        # Divvy up the columns dynamically based on actual content lengths!
+        LEFT_W = max([vlen(l) for l in left_rows])
+        RIGHT_W = max([vlen(r) for r in right_rows])
+        CENTER_W = inner_w - LEFT_W - RIGHT_W - 6 # accounting for two inner "   " dividers 
+
+        # Center Column: Mascot and Welcome
+        center_rows = [
+            center(f"{BRAND}Welcome to bob!{RST}", CENTER_W),
+            "",
+        ] + [center(row, CENTER_W) for row in mascot]
+
+        # Ensure same number of rows
+        n = max(len(left_rows), len(center_rows), len(right_rows))
+        while len(left_rows) < n: left_rows.append("")
+        while len(center_rows) < n: center_rows.append("")
         while len(right_rows) < n: right_rows.append("")
 
-        # Build box
         title  = f"bob v{bob_version}"
         ndash  = max(0, term_w - 5 - len(title) - 2)
         top    = f"╭─── {title} {'─' * ndash}╮"
         bot    = "╰" + "─" * (term_w - 2) + "╯"
 
+        import sys
         out = sys.__stdout__
         out.write("\n" + top + "\n")
-        for l, r in zip(left_rows, right_rows):
-            out.write(f"│ {rpad(l, LEFT)} │ {rpad(r, RIGHT)} │\n")
+        
+        for l, c, r in zip(left_rows, center_rows, right_rows):
+            # 3 Columns with gentle spacing, dropping interior borders entirely to look floating
+            out.write(f"│ {rpad(l, LEFT_W)}   {center(c, CENTER_W)}   {rpad(r, RIGHT_W)} │\n")
+            
         out.write(bot + "\n\n")
         out.flush()
 
@@ -413,7 +433,7 @@ class Interface:
         try:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
-                out.write(f"\r  \033[36m{frame}\033[0m \033[2m{label}\033[0m")
+                out.write(f"\r  {frame} \033[2m{label}\033[0m")
                 out.flush()
                 i += 1
                 await asyncio.sleep(0.08)
@@ -531,7 +551,7 @@ class Interface:
                         if self._after_tool:
                             _p()
                         self._after_tool = False
-                        _p(f"\033[38;2;215;119;87m•\033[0m ", end="")
+                        _p("• ", end="")
                     _p(msg.delta, end="")
                     self._current_buf += msg.delta
 
@@ -749,7 +769,7 @@ class Interface:
             if isinstance(msg, TextDeltaEvent):
                 await self._stop_spinner()
                 if not result_parts:
-                    _p(f"\033[38;2;215;119;87m•\033[0m ", end="")
+                    _p("• ", end="")
                 _p(msg.delta, end="")
                 result_parts.append(msg.delta)
             elif isinstance(msg, TurnEndedEvent):
