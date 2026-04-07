@@ -61,6 +61,7 @@ class CompletedEvent:
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    cached_input_tokens: int = 0
 
 
 @dataclass
@@ -74,7 +75,7 @@ class StreamErrorEvent:
 # History format conversion: Responses API → Chat Completions
 # ---------------------------------------------------------------------------
 
-def _to_chat_messages(instructions: str, items: list[dict]) -> list[dict]:
+def _to_chat_messages(instructions: str, items: list[dict], model: str = "", enable_caching: bool = True) -> list[dict]:
     """Convert Bob's Responses-API history items to Chat Completions messages.
 
     Bob stores history in OpenAI Responses API shape:
@@ -91,7 +92,21 @@ def _to_chat_messages(instructions: str, items: list[dict]) -> list[dict]:
     """
     messages: list[dict] = []
     if instructions:
-        messages.append({"role": "system", "content": instructions})
+        # Add cache_control for Anthropic models to reduce costs 70-90%
+        is_anthropic = "claude" in model.lower()
+        if is_anthropic and enable_caching:
+            messages.append({
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": instructions,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+            })
+        else:
+            messages.append({"role": "system", "content": instructions})
 
     i = 0
     while i < len(items):
@@ -343,7 +358,9 @@ class LiteLLMClient:
             )
             raise StopAsyncIteration from exc
 
-        messages = _to_chat_messages(instructions, input)
+        # Enable prompt caching for Anthropic models (70-90% cost reduction)
+        enable_caching = extra_params.get("prompt_caching", True)
+        messages = _to_chat_messages(instructions, input, model=self.model, enable_caching=enable_caching)
 
         kwargs: dict[str, Any] = {
             "model": self.model,

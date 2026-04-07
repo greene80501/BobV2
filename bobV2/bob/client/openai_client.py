@@ -230,18 +230,10 @@ class BobClient:
             **extra_params,
         }
         
-        # Enable prompt caching for system instructions and tools
-        if self.enable_prompt_caching:
-            # Mark instructions as cacheable (system prompt rarely changes)
-            build_kwargs["instructions_cache_control"] = {"type": "ephemeral"}
-            
-            # Mark tools as cacheable (tool definitions are stable)
-            if tools:
-                build_kwargs["tools"] = tools
-                build_kwargs["tools_cache_control"] = {"type": "ephemeral"}
-        else:
-            if tools:
-                build_kwargs["tools"] = tools
+        # Note: OpenAI Responses API does not support cache control parameters
+        # Prompt caching is only available in Anthropic's API via LiteLLMClient
+        if tools:
+            build_kwargs["tools"] = tools
                 
         if max_output_tokens is not None:
             build_kwargs["max_output_tokens"] = max_output_tokens
