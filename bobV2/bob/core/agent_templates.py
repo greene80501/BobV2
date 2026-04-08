@@ -41,6 +41,20 @@ AGENT_TEMPLATES: dict[str, AgentTemplate] = {
         ),
         allowed_tools=set(),  # all tools
     ),
+    "review": AgentTemplate(
+        system_prompt_suffix=(
+            "You are a code review agent. "
+            "Read diffs and source files, then produce a structured review. "
+            "Flag bugs, security issues, style violations, and missing tests. "
+            "Format findings as a numbered list with severity (critical/major/minor) "
+            "and file:line references. Do NOT write or modify any files."
+        ),
+        allowed_tools={
+            "read_file", "glob_files", "grep_files", "list_dir",
+            # git read-only commands only — enforced by system prompt above
+            "shell",
+        },
+    ),
 }
 
 

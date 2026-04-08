@@ -73,6 +73,82 @@ def _cg(s: str) -> str:  return f"{_GRN}{s}{_R}"
 def _bold(s: str) -> str: return f"{_BLD}{s}{_R}"
 
 
+# ── Markdown → ANSI renderer ──────────────────────────────────────────────────
+
+# ANSI extras not in the palette above
+_ITA  = "\033[3m"   # italic
+_UND  = "\033[4m"   # underline
+_STR  = "\033[9m"   # strikethrough
+_CODE_BG = "\033[48;5;236m"   # dark-grey background for inline code
+_CODE_FG = "\033[96m"          # bright-cyan text for inline code
+_H1_FG   = "\033[97m"          # bright white
+_H2_FG   = "\033[97m"          # bright white
+_H3_FG   = "\033[36m"          # cyan
+
+
+def _inline_md(text: str) -> str:
+    """Apply inline ANSI markdown (bold, italic, code, strikethrough) to *text*."""
+    # bold+italic  ***text***
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: f"{_BLD}{_ITA}{m.group(1)}{_R}", text)
+    # bold  **text**
+    text = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{_BLD}{m.group(1)}{_R}", text)
+    # italic  *text*  (not preceded/followed by another *)
+    text = re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', lambda m: f"{_ITA}{m.group(1)}{_R}", text)
+    # italic  _text_  (not preceded/followed by another _)
+    text = re.sub(r'(?<!_)_([^_\n]+?)_(?!_)', lambda m: f"{_ITA}{m.group(1)}{_R}", text)
+    # inline code  `text`
+    text = re.sub(r'`([^`\n]+?)`', lambda m: f"{_CODE_BG}{_CODE_FG}{m.group(1)}{_R}", text)
+    # strikethrough  ~~text~~
+    text = re.sub(r'~~(.+?)~~', lambda m: f"{_STR}{m.group(1)}{_R}", text)
+    return text
+
+
+def _render_md_line(line: str) -> str:
+    """Render a single complete line with full markdown formatting."""
+    # H1  # Heading
+    if re.match(r'^# ', line):
+        return f"{_BLD}{_H1_FG}{_UND}{_inline_md(line[2:])}{_R}"
+    # H2  ## Heading
+    if re.match(r'^## ', line):
+        return f"{_BLD}{_H2_FG}{_inline_md(line[3:])}{_R}"
+    # H3  ### Heading
+    if re.match(r'^### ', line):
+        return f"{_BLD}{_H3_FG}{_inline_md(line[4:])}{_R}"
+    # H4+ (treat as bold)
+    if re.match(r'^#{4,} ', line):
+        content = re.sub(r'^#{4,} ', '', line)
+        return f"{_BLD}{_inline_md(content)}{_R}"
+    # Horizontal rule  ---  ***  ___
+    if re.match(r'^[-*_]{3,}\s*$', line):
+        w = shutil.get_terminal_size((80, 24)).columns - 4
+        return f"{_DIM}{'─' * w}{_R}"
+    # Blockquote  > text
+    if line.startswith('> '):
+        return f"{_DIM}│ {_inline_md(line[2:])}{_R}"
+    # Unordered bullet  - / * / +
+    m = re.match(r'^(\s*)([-*+]) (.+)$', line)
+    if m:
+        indent, _, content = m.groups()
+        return f"{indent}{_DIM}•{_R} {_inline_md(content)}"
+    # Ordered list  1. text
+    m = re.match(r'^(\s*)(\d+)\. (.+)$', line)
+    if m:
+        indent, num, content = m.groups()
+        return f"{indent}{_DIM}{num}.{_R} {_inline_md(content)}"
+    # Regular line — inline transforms only
+    return _inline_md(line)
+
+
+def _md_render_chunk(text: str) -> str:
+    """Render a streaming chunk: apply full markdown to complete lines,
+    inline-only to the partial last line (no trailing newline)."""
+    if '\n' not in text:
+        return _inline_md(text)
+    parts = text.split('\n')
+    out = [_render_md_line(ln) for ln in parts[:-1]]
+    out.append(_inline_md(parts[-1]))   # partial line — inline only
+    return '\n'.join(out)
+
 
 def _truncate_cmd(s: str, max_len: int = 120) -> str:
     s = s.strip()
@@ -86,6 +162,57 @@ def _p(s: str = "", end: str = "\n") -> None:
     print_formatted_text(ANSI(s + end), end="")
 
 
+def _render_error(message: str, tool_name: str | None = None) -> None:
+    """Print an error with file:line highlighting and optional traceback rendering."""
+    import re as _re
+    import io as _io
+
+    prefix = f"  {_r('✗')}"
+    if tool_name:
+        prefix += f" {_d(f'[{tool_name}]')}"
+
+    # Detect Python traceback: starts with "Traceback (most recent call last):"
+    is_traceback = "Traceback (most recent call last)" in message
+    # Detect file:line patterns
+    has_file_ref = bool(_re.search(
+        r'(?:[/\\][\w./-]+|[\w.-]+)\.(py|ts|js|jsx|tsx|rs|go|java|cpp|c|h):(\d+)',
+        message
+    ))
+
+    if is_traceback:
+        # Use Rich to render a highlighted traceback
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            import shutil as _sh
+            sio = _io.StringIO()
+            console = Console(file=sio, force_terminal=True,
+                              width=_sh.get_terminal_size((120, 24)).columns - 4)
+            console.print(Panel(
+                message, title="[red]Error[/red]",
+                border_style="red", padding=(0, 1)
+            ))
+            for line in sio.getvalue().splitlines():
+                _p(f"  {line}")
+            return
+        except Exception:
+            pass  # fall through to plain rendering
+
+    if has_file_ref:
+        # Highlight file:line references inline
+        def _hl(m):
+            path, ext, lineno = m.group(1), m.group(2), m.group(3)
+            return f"\033[36m{path}.{ext}\033[0m:{_y(lineno)}"
+        highlighted = _re.sub(
+            r'((?:[/\\][\w./-]+|[\w.-]+)\.(py|ts|js|jsx|tsx|rs|go|java|cpp|c|h)):(\d+)',
+            _hl,
+            message,
+        )
+        _p(f"{prefix} {highlighted}")
+    else:
+        _p(f"{prefix} {message}")
+
+
 # ── Approval prompt string (shared between event consumer and main loop) ───────
 
 _APPROVAL_PROMPT = ANSI(
@@ -95,6 +222,34 @@ _APPROVAL_PROMPT = ANSI(
     f"{_d('[s]')} skip  "
     f"› "
 )
+
+
+_IMAGE_EXTS = frozenset([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".svg"])
+
+
+def _parse_at_images(text: str) -> tuple[str, list]:
+    """Extract @path/to/image.ext tokens from *text*.
+
+    Returns (cleaned_text, [Path, ...]) where image paths have been removed
+    from the text and collected separately.
+    """
+    import re
+    from pathlib import Path as _P
+    image_paths: list = []
+    # Match @<non-whitespace> tokens
+    pattern = re.compile(r"@(\S+)")
+
+    def _replace(m):
+        raw = m.group(1).rstrip(".,;:!?")  # strip trailing punctuation
+        p = _P(raw)
+        if p.suffix.lower() in _IMAGE_EXTS:
+            if p.exists():
+                image_paths.append(p.resolve())
+                return ""  # remove from text
+        return m.group(0)  # leave non-image @mentions unchanged
+
+    cleaned = pattern.sub(_replace, text).strip()
+    return cleaned, image_paths
 
 
 # ── Output collapsing ─────────────────────────────────────────────────────────
@@ -280,12 +435,19 @@ class _SlashCompleter(Completer):
                     
                     display_name = name + ("/" if item.is_dir() else "")
                     rel_path = str(item.relative_to(cwd)) if item.is_relative_to(cwd) else str(item)
-                    
+                    from pathlib import Path as _P
+                    ext = _P(name).suffix.lower()
+                    if item.is_dir():
+                        meta = "dir"
+                    elif ext in _IMAGE_EXTS:
+                        meta = "image"
+                    else:
+                        meta = "file"
                     yield Completion(
                         rel_path,
                         start_position=-len(prefix),
                         display=display_name,
-                        display_meta="dir" if item.is_dir() else "file"
+                        display_meta=meta,
                     )
         except Exception:
             pass
@@ -387,6 +549,9 @@ class Interface:
         # Word-wrap buffer for streaming text
         self._wrap_buffer = ""
         self._wrap_column = 0
+        # Frame-rate limiting: batch text deltas arriving within 16ms (≈60 fps)
+        self._stream_flush_buf: str = ""
+        self._stream_last_flush: float = 0.0
 
     # ── Dynamic prompt ────────────────────────────────────────────────────────
 
@@ -752,6 +917,7 @@ class Interface:
             ExecOutputEvent,
             ExecStartedEvent,
             InfoEvent,
+            NetworkApprovalRequestedEvent,
             PatchApprovalRequestedEvent,
             PlanApprovalRequestedEvent,
             PlanApprovedEvent,
@@ -851,33 +1017,57 @@ class Interface:
                                 # Accumulate code block content
                                 self._code_block_content += line + "\n"
                             else:
-                                # Regular text outside code blocks
-                                _p(line, end="")
+                                # Regular text outside code blocks — buffered
+                                self._stream_flush_buf += line
                     elif self._in_code_block:
                         # Inside code block, accumulate
                         self._code_block_content += delta
                     else:
-                        # Regular streaming text
-                        _p(delta, end="")
+                        # Regular streaming text — buffered for frame-rate limiting
+                        self._stream_flush_buf += delta
+
+                    # Flush buffer if ≥16ms have elapsed since last render (≈60fps)
+                    import time as _time
+                    _now = _time.monotonic()
+                    if self._stream_flush_buf and (_now - self._stream_last_flush) >= 0.016:
+                        _p(_md_render_chunk(self._stream_flush_buf), end="")
+                        self._stream_flush_buf = ""
+                        self._stream_last_flush = _now
+                        await asyncio.sleep(0)  # yield to event loop between batches
 
                 # ── Tool call lifecycle ───────────────────────────────────────
 
                 elif isinstance(msg, ToolCallStartedEvent):
+                    # Flush any buffered streaming text before tool output
+                    if self._stream_flush_buf:
+                        _p(_md_render_chunk(self._stream_flush_buf), end="")
+                        self._stream_flush_buf = ""
                     # Update spinner to show which tool is running
                     tool_name = msg.tool_name
                     # Format tool name nicely (e.g., read_file -> "read file")
                     display_name = tool_name.replace("_", " ").title()
-                    self._spinner_label = f"Running {display_name}…"
+                    _NET_TOOLS = {"web_search", "web_fetch"}
+                    if tool_name in _NET_TOOLS:
+                        verb = "Searching…" if tool_name == "web_search" else "Fetching…"
+                        self._spinner_label = f"🌐 {verb}"
+                    else:
+                        self._spinner_label = f"Running {display_name}…"
                     if not self._spinner_active:
                         await self._start_spinner()
 
                 elif isinstance(msg, ToolCallCompletedEvent):
                     # Reset spinner label back to default
                     self._spinner_label = "Thinking…"
+                    # Surface tool errors with file:line highlighting
+                    if getattr(msg, 'error', None):
+                        _render_error(msg.error, tool_name=getattr(msg, 'tool_name', None))
 
                 # ── Extended thinking ─────────────────────────────────────────
 
                 elif isinstance(msg, ReasoningDeltaEvent):
+                    if self._stream_flush_buf:
+                        _p(_md_render_chunk(self._stream_flush_buf), end="")
+                        self._stream_flush_buf = ""
                     if not hasattr(self, '_reasoning_started') or not self._reasoning_started:
                         await self._stop_spinner()
                         self._reasoning_started = True
@@ -973,6 +1163,42 @@ class Interface:
                         ExecApprovalOp(tool_call_id=msg.tool_call_id, decision=decision)
                     )
 
+                # ── Approval — network ───────────────────────────────────────
+
+                elif isinstance(msg, NetworkApprovalRequestedEvent):
+                    await self._stop_spinner()
+                    if not self._task_running:
+                        self._task_running = True
+                    _p()
+                    _p(f"  {_y('🌐')} {_bold('Network access requested')}")
+                    _p(f"     {_d('tool:')}   {msg.tool_name or 'web'}")
+                    _p(f"     {_d('domain:')} {msg.domain}")
+                    _p(f"     {_d('url:')}    {msg.url[:80]}")
+                    _p()
+                    _p(f"  {_d('[y]')} allow once  {_d('[a]')} allow always (this session)  {_d('[n]')} deny › ", end="")
+                    ps_net = PromptSession()
+                    try:
+                        answer = (await ps_net.prompt_async("")).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        answer = "n"
+                    approved = answer in ("y", "yes", "a", "always")
+                    approve_always = answer in ("a", "always")
+                    if approve_always:
+                        _p(f"  {_d(f'✓ {msg.domain} approved for this session')}")
+                    elif approved:
+                        _p(f"  {_d(f'✓ {msg.domain} allowed once')}")
+                    else:
+                        _p(f"  {_r(f'✗ {msg.domain} denied')}")
+                    from bob.protocol.ops import NetworkApprovalOp
+                    await self._session.submit(NetworkApprovalOp(
+                        url=msg.url,
+                        domain=msg.domain,
+                        approved=approved,
+                        approve_always=approve_always,
+                        request_id=msg.request_id,
+                        granted=approved,
+                    ))
+
                 # ── Approval — patch ──────────────────────────────────────────
 
                 elif isinstance(msg, PatchApprovalRequestedEvent):
@@ -1014,6 +1240,10 @@ class Interface:
                 # ── Turn end ──────────────────────────────────────────────────
 
                 elif isinstance(msg, TurnEndedEvent):
+                    # Flush any remaining buffered stream text — full line render
+                    if self._stream_flush_buf:
+                        _p(_render_md_line(self._stream_flush_buf), end="")
+                        self._stream_flush_buf = ""
                     await self._stop_spinner()
                     
                     # Display reasoning block if we have thinking content
@@ -1092,7 +1322,31 @@ class Interface:
                                 _p(f"  {_d(status)}")
                         except Exception:
                             pass
-                    
+
+                    # Run post_turn hooks and surface their stdout as a status line
+                    if self._config.hooks:
+                        try:
+                            from bob.hooks.runner import HookRunner, HookConfig as RunnerHookConfig
+                            from bob.protocol.config_types import HookEventName
+                            runner_hooks = []
+                            for h in self._config.hooks:
+                                if getattr(h, 'event', '') == HookEventName.POST_TURN:
+                                    cmd = h.command.split() if isinstance(h.command, str) else [h.command]
+                                    runner_hooks.append(RunnerHookConfig(
+                                        event=HookEventName.POST_TURN,
+                                        command=cmd,
+                                        mode="sync",
+                                        timeout_seconds=getattr(h, 'timeout_seconds', 10),
+                                    ))
+                            if runner_hooks:
+                                hook_runner = HookRunner(runner_hooks)
+                                results = await hook_runner.run_hooks(HookEventName.POST_TURN)
+                                for r in results:
+                                    if r.stdout.strip():
+                                        _p(f"  {_d(r.stdout.strip())}")
+                        except Exception:
+                            pass
+
                     _p()   # one blank line = turn boundary (❯ adds visual separation)
 
                 elif isinstance(msg, TurnInterruptedEvent):
@@ -1114,35 +1368,7 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
-                    
-                    # Format error message with rich highlighting for file:line patterns
-                    error_msg = msg.message
-                    
-                    # Check if error contains traceback or file:line references
-                    if any(pattern in error_msg for pattern in [" File ", "line ", ".py:", ".ts:", ".js:"]):
-                        from rich.console import Console
-                        from rich.syntax import Syntax
-                        import io
-                        
-                        # Render with rich for syntax highlighting
-                        string_io = io.StringIO()
-                        console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns)
-                        
-                        # Try to highlight file paths and line numbers
-                        import re
-                        # Pattern: /path/to/file.py:123 or file.py:123
-                        highlighted = re.sub(
-                            r'([/\w.-]+\.(py|ts|js|jsx|tsx|rs|go|java|cpp|c|h)):(\d+)',
-                            r'[cyan]\1[/cyan]:[yellow]\3[/yellow]',
-                            error_msg
-                        )
-                        console.print(f"[red]✗[/red] {highlighted}")
-                        
-                        output = string_io.getvalue()
-                        for line in output.splitlines():
-                            _p(f"  {line}")
-                    else:
-                        _p(f"  {_r('✗')} {error_msg}")
+                    _render_error(msg.message)
                     _p()
 
                 elif isinstance(msg, WarningEvent):
@@ -2469,9 +2695,14 @@ class Interface:
                             self._next_turn_thinking_budget = None  # Reset after use
                         
                         self._task_running = True   # optimistic: prevents stray › before TurnStartedEvent
-                        await self._session.submit(
-                            UserTurnOp(items=[TextUserInput(type="text", text=full_text)])
-                        )
+                        # Parse @image.png tokens out of the text
+                        from bob.protocol.items import ImageUserInput as _ImgInput
+                        cleaned_text, image_paths = _parse_at_images(full_text)
+                        items: list = [TextUserInput(type="text", text=cleaned_text or full_text)]
+                        for img_path in image_paths:
+                            items.append(_ImgInput(type="image", path=img_path))
+                            _p(f"  {_d(f'📎 attached: {img_path.name}')}")
+                        await self._session.submit(UserTurnOp(items=items))
                         
                         # Reset thinking budget after turn
                         if self._config.thinking_budget_tokens > 0:

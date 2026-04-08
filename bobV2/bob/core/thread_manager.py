@@ -30,6 +30,19 @@ _COLOR_PALETTE = [
 _RST = "\033[0m"
 
 
+async def _save_memory_snapshot(agent_name: str, task: str, result: str) -> None:
+    """Summarise *result* and persist it as a memory snapshot (fire-and-forget)."""
+    try:
+        from bob.core.agent_memory import save_snapshot
+        # Build a concise summary: first 2000 chars of result, trimmed to sentences.
+        summary = result.strip()[:2000]
+        if len(result) > 2000:
+            summary += "\n… [truncated]"
+        save_snapshot(agent_name, task, summary)
+    except Exception:
+        pass  # Memory snapshots are best-effort
+
+
 @dataclass
 class AgentRecord:
     id: str
@@ -39,6 +52,7 @@ class AgentRecord:
     result: Optional[str]
     color: str
     task_ref: Optional[asyncio.Task]
+    name: Optional[str] = None
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -58,10 +72,17 @@ class ThreadManager:
         model: Optional[str] = None,
         cwd: Optional[str] = None,
         template: Optional[str] = None,
+        name: Optional[str] = None,
     ) -> str:
-        """Spawn a sub-agent and return its ID."""
+        """Spawn a sub-agent and return its ID.
+
+        *name* is an optional stable identifier (e.g. "explorer", "reviewer").
+        If provided, the agent's prior memory snapshot is injected into its
+        context and a new snapshot is saved when it completes.
+        """
         from bob.core.session import BobSession
         from bob.core.agent_templates import get_template
+        from bob.core.agent_memory import load_snapshot
 
         # Build config for sub-agent
         config = self.parent_session.config.model_copy(deep=True)
@@ -90,6 +111,7 @@ class ThreadManager:
             result=None,
             color=color,
             task_ref=None,
+            name=name,
         )
         self._agents[agent_id] = record
 
@@ -98,15 +120,24 @@ class ThreadManager:
             # Whittle the sub-agent registry down to allowed tools
             allowed = tmpl.allowed_tools
             all_names = list(session.tool_registry._tools.keys())
-            for name in all_names:
-                if name not in allowed:
-                    session.tool_registry.unregister(name)
+            for tname in all_names:
+                if tname not in allowed:
+                    session.tool_registry.unregister(tname)
 
         # Inject system prompt suffix if template specifies one
         if tmpl and tmpl.system_prompt_suffix:
             session._system_prompt = (
                 (session._system_prompt or "") + "\n\n" + tmpl.system_prompt_suffix
             )
+
+        # Inject prior memory snapshot for named agents
+        if name:
+            prior = load_snapshot(name)
+            if prior:
+                session._system_prompt = (
+                    (session._system_prompt or "")
+                    + f"\n\n## Memory from prior session\n{prior}"
+                )
 
         task_obj = asyncio.create_task(self._agent_worker(agent_id, task))
         record.task_ref = task_obj
@@ -227,6 +258,11 @@ class ThreadManager:
                     record.result = "".join(text_buf)
                     record.status = "completed"
                     _fwd(f"[done — {msg.output_tokens} tokens]")
+                    # Extract and persist memory snapshot for named agents
+                    if record.name and record.result:
+                        asyncio.ensure_future(
+                            _save_memory_snapshot(record.name, record.task, record.result)
+                        )
                     break
                 elif isinstance(msg, (SessionEndedEvent, TurnInterruptedEvent)):
                     record.result = "".join(text_buf) or None

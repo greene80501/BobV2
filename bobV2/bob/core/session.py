@@ -53,6 +53,9 @@ class BobSession:
         self._agent_task: Optional[asyncio.Task] = None
         self._current_turn_cancel: Optional[asyncio.Event] = None
         self._pending_approvals: dict[str, asyncio.Future] = {}
+        # Domains approved for web access this session (key = request_id → Future)
+        self._pending_network_approvals: dict[str, asyncio.Future] = {}
+        self._session_approved_domains: set[str] = set()
 
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
@@ -280,11 +283,24 @@ class BobSession:
             "exit_plan_mode", EXIT_PLAN_MODE_DESCRIPTION, EXIT_PLAN_MODE_SCHEMA,
             exit_plan_mode_handler
         )
+        from bob.protocol.config_types import WebSearchMode
+        if self.config.web_search_mode != WebSearchMode.DISABLED:
+            self.tool_registry.register(
+                "web_search", WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA, web_search_handler
+            )
         self.tool_registry.register(
             "web_fetch", WEB_FETCH_DESCRIPTION, WEB_FETCH_SCHEMA, web_fetch_handler
         )
+        # Cron / schedule tools
+        from bob.tools.cron_tools import (
+            schedule_cron_handler, SCHEDULE_CRON_DESCRIPTION, SCHEDULE_CRON_SCHEMA,
+            remote_trigger_handler, REMOTE_TRIGGER_DESCRIPTION, REMOTE_TRIGGER_SCHEMA,
+        )
         self.tool_registry.register(
-            "web_search", WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA, web_search_handler
+            "schedule_cron", SCHEDULE_CRON_DESCRIPTION, SCHEDULE_CRON_SCHEMA, schedule_cron_handler
+        )
+        self.tool_registry.register(
+            "remote_trigger", REMOTE_TRIGGER_DESCRIPTION, REMOTE_TRIGGER_SCHEMA, remote_trigger_handler
         )
         # Phase 5 — advanced
         self.tool_registry.register(
@@ -449,6 +465,9 @@ class BobSession:
         await self._analytics_db.setup()
         await self._load_system_prompt()
         self._agent_task = asyncio.create_task(self._agent_loop())
+        # Fire-and-forget keepalive to warm the TCP/TLS connection before the
+        # user submits their first message.
+        asyncio.create_task(self._prewarm_connection())
 
         from bob.protocol.events import SessionStartedEvent
         from bob.protocol.config_types import SessionSource
@@ -463,6 +482,23 @@ class BobSession:
                 cwd=str(self.cwd),
             )
         ))
+
+    async def _prewarm_connection(self) -> None:
+        """Send a minimal request to warm the TCP+TLS connection before the user types."""
+        try:
+            base_url = self.config.base_url.rstrip("/")
+            import urllib.request
+            req = urllib.request.Request(
+                f"{base_url}/models",
+                headers={
+                    "Authorization": f"Bearer {self.config.api_key or ''}",
+                    "Content-Type": "application/json",
+                },
+            )
+            # Use a very short timeout — we don't care about the result
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass  # Best-effort; never block the session
 
     async def _setup_persistence(self) -> None:
         if self.ephemeral:
@@ -663,6 +699,36 @@ class BobSession:
         finally:
             self._pending_approvals.pop(call_id, None)
 
+    async def get_network_approval(self, request_id: str, url: str, domain: str, tool_name: str = "") -> bool:
+        """Return True if the user approves network access to *domain*.
+
+        Skips the prompt if *domain* was already session-approved.
+        """
+        if domain in self._session_approved_domains:
+            return True
+        if self.config.network_access:
+            return True  # Global network access enabled
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        self._pending_network_approvals[request_id] = fut
+        from bob.protocol.events import Event, NetworkApprovalRequestedEvent
+        await self._emit(Event(
+            id="network",
+            msg=NetworkApprovalRequestedEvent(
+                url=url,
+                domain=domain,
+                tool_name=tool_name,
+                request_id=request_id,
+            )
+        ))
+        try:
+            result = await fut
+            if result.get("approve_always"):
+                self._session_approved_domains.add(domain)
+            return result.get("approved", False)
+        finally:
+            self._pending_network_approvals.pop(request_id, None)
+
     # ------------------------------------------------------------------
     # Agent loop
     # ------------------------------------------------------------------
@@ -672,6 +738,7 @@ class BobSession:
         from bob.core.turn import run_turn
         from bob.protocol.ops import (
             UserTurnOp, InterruptOp, ExecApprovalOp, PatchApprovalOp,
+            NetworkApprovalOp,
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
@@ -730,6 +797,15 @@ class BobSession:
                 fut = self._pending_approvals.get(op.tool_call_id)
                 if fut and not fut.done():
                     fut.set_result(op.decision)
+                continue
+
+            if isinstance(op, NetworkApprovalOp):
+                fut = self._pending_network_approvals.get(op.request_id)
+                if fut and not fut.done():
+                    fut.set_result({
+                        "approved": op.approved,
+                        "approve_always": op.approve_always,
+                    })
                 continue
 
             # ----------------------------------------------------------------
@@ -959,6 +1035,16 @@ class BobSession:
                             fut = self._pending_approvals.get(inner_op.tool_call_id)
                             if fut and not fut.done():
                                 fut.set_result(inner_op.decision)
+
+                        elif isinstance(inner_op, NetworkApprovalOp):
+                            fut = self._pending_network_approvals.get(inner_op.request_id)
+                            if fut and not fut.done():
+                                fut.set_result({
+                                    "approved": inner_op.approved,
+                                    "approve_always": inner_op.approve_always,
+                                })
+                            if inner_op.approve_always:
+                                self._session_approved_domains.add(inner_op.domain)
 
                         elif isinstance(inner_op, InterruptOp):
                             cancel_ev.set()

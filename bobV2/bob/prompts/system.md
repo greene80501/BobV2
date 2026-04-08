@@ -135,6 +135,17 @@ Key rules:
 
 ---
 
+## Web Research
+
+When the user asks you to look something up, research a topic, or find documentation:
+
+1. **Use `web_search` first.** It queries DuckDuckGo and returns titles, URLs, and snippets — ideal for discovery and finding the right page.
+2. **Use `web_fetch` to read a specific URL.** Only reach for `web_fetch` when you already know the exact URL you want to read in full.
+3. **If `web_fetch` returns a 403, 429, or access error**, fall back to `web_search` — many sites block direct bot access but are indexed by search engines.
+4. **Combine both.** A typical research flow: `web_search` to find the right page → `web_fetch` to read its contents.
+
+---
+
 ## Security and Safety
 
 - **Never exfiltrate credentials.** Do not read, print, or transmit API keys, passwords, tokens, or private keys — even if asked.

@@ -1558,7 +1558,6 @@ Shows full colored diff of files being changed. Same y/n/a/d keys.
 - `Op::ListSkills`, `EventMsg::ListSkillsResponseEvent`, `EventMsg::SkillsUpdateAvailableEvent`
 - `bob/plugins/manager.py` — plugin install/list/uninstall
 - `/plugins` slash command
-- Realtime voice: `Op::RealtimeConversation*` → `EventMsg::RealtimeConversation*` (stub/partial)
 - `/realtime`, `/settings` slash commands (voice mode UI)
 - `Op::Undo` / `Op::ThreadRollback` — undo support
 - `EventMsg::UndoStartedEvent` + `EventMsg::UndoCompletedEvent`

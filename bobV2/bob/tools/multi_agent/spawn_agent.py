@@ -25,8 +25,16 @@ SPAWN_AGENT_SCHEMA = {
         },
         "template": {
             "type": "string",
-            "description": "Agent template to use: explore, plan, verify, or write (optional).",
-            "enum": ["explore", "plan", "verify", "write"],
+            "description": "Agent template to use: explore, plan, verify, write, or review (optional).",
+            "enum": ["explore", "plan", "verify", "write", "review"],
+        },
+        "name": {
+            "type": "string",
+            "description": (
+                "Stable name for this agent role (e.g. 'explorer', 'reviewer'). "
+                "When provided, the agent's findings are saved and injected into "
+                "future spawns with the same name, giving it persistent memory."
+            ),
         },
     },
     "required": ["task"],
@@ -51,10 +59,12 @@ async def spawn_agent_handler(tool_input: dict, context: Any) -> str:
     model: str | None = tool_input.get("model")
     cwd: str | None = tool_input.get("cwd")
     template: str | None = tool_input.get("template")
+    name: str | None = tool_input.get("name")
 
     try:
-        agent_id = await thread_manager.spawn(task=task, model=model, cwd=cwd, template=template)
+        agent_id = await thread_manager.spawn(task=task, model=model, cwd=cwd, template=template, name=name)
         tmpl_note = f" [template={template}]" if template else ""
-        return f"Sub-agent spawned (id={agent_id}){tmpl_note} for task: {task[:120]}"
+        name_note = f" [name={name}]" if name else ""
+        return f"Sub-agent spawned (id={agent_id}){tmpl_note}{name_note} for task: {task[:120]}"
     except Exception as exc:
         return f"Error spawning sub-agent: {exc}"

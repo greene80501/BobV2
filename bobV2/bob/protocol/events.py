@@ -276,6 +276,7 @@ class NetworkApprovalRequestedEvent(BaseModel):
     url: str
     domain: str
     tool_name: str
+    request_id: str = ""
 
 
 

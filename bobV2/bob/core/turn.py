@@ -59,6 +59,165 @@ TRUSTED_COMMANDS: frozenset[str] = frozenset([
 ])
 
 
+def _canonicalize_command(command: list[str]) -> list[str]:
+    """Strip shell wrapper tokens to get the real command for trust matching.
+
+    Handles:
+    - cmd /c <real>  /  cmd.exe /c <real>
+    - powershell -Command <real>  /  pwsh -Command <real>
+    - bash -c <real>  /  sh -c <real>
+    - Strips leading ./ and resolves obvious path prefixes on the first token.
+    """
+    if not command:
+        return command
+
+    result = list(command)
+
+    # Unwrap cmd /c and PowerShell -Command wrappers (case-insensitive)
+    exe = result[0].lower().rstrip(".exe")
+    if exe in ("cmd", "powershell", "pwsh"):
+        # Find -c / /c / -Command flag and take everything after it
+        for i, tok in enumerate(result[1:], 1):
+            if tok.lower() in ("/c", "-c", "-command"):
+                remainder = result[i + 1:]
+                if remainder:
+                    # remainder may be a single string or already split tokens
+                    if len(remainder) == 1:
+                        import shlex
+                        try:
+                            result = shlex.split(remainder[0])
+                        except ValueError:
+                            result = remainder
+                    else:
+                        result = remainder
+                    exe = result[0].lower().rstrip(".exe")
+                break
+
+    # Unwrap bash/sh -c wrappers
+    if exe in ("bash", "sh", "zsh", "fish") and len(result) >= 3 and result[1] == "-c":
+        import shlex
+        try:
+            result = shlex.split(result[2])
+        except ValueError:
+            result = [result[2]]
+
+    # Strip leading ./ from the command name
+    if result and result[0].startswith("./"):
+        result = [result[0][2:]] + result[1:]
+
+    return result
+
+
+import os as _os
+from pathlib import Path as _Path
+import logging as _logging
+_escalation_logger = _logging.getLogger("bob.security.escalation")
+
+# ---------------------------------------------------------------------------
+# File-diff helpers for turn tracking
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_SKIP = frozenset([
+    "__pycache__", ".git", "node_modules", ".venv", "venv",
+    ".bob", ".mypy_cache", ".ruff_cache", ".pytest_cache",
+])
+
+
+def _snapshot_dir(cwd) -> dict[str, tuple[float, int]]:
+    """Return {relative_path: (mtime, size)} for all regular files in *cwd*.
+
+    Limits to 5 000 files and skips common noise directories to stay fast.
+    """
+    root = _Path(cwd)
+    snapshot: dict[str, tuple[float, int]] = {}
+    try:
+        for dirpath, dirnames, filenames in _os.walk(root):
+            # Prune noise directories in-place
+            dirnames[:] = [d for d in dirnames if d not in _SNAPSHOT_SKIP]
+            for fname in filenames:
+                full = _Path(dirpath) / fname
+                try:
+                    st = full.stat()
+                    rel = str(full.relative_to(root))
+                    snapshot[rel] = (st.st_mtime, st.st_size)
+                except OSError:
+                    pass
+            if len(snapshot) >= 5_000:
+                break
+    except OSError:
+        pass
+    return snapshot
+
+
+def _diff_snapshot(
+    before: dict[str, tuple[float, int]],
+    after:  dict[str, tuple[float, int]],
+) -> list[str]:
+    """Return sorted list of paths that were added, deleted, or modified."""
+    changed: list[str] = []
+    all_keys = set(before) | set(after)
+    for k in all_keys:
+        b = before.get(k)
+        a = after.get(k)
+        if b != a:
+            changed.append(k)
+    return sorted(changed)
+
+# Patterns that indicate a privilege-escalation or sandbox-escape attempt.
+_ESCALATION_TOKENS: frozenset[str] = frozenset([
+    "sudo", "su", "doas",
+    "chroot", "nsenter", "unshare", "pivot_root",
+    "ptrace", "strace", "ltrace",
+    "LD_PRELOAD", "LD_LIBRARY_PATH",
+    "setuid", "setgid", "setcap",
+])
+
+# Dangerous metacharacters in a *trusted* command's arguments
+_DANGEROUS_METACHAR_RE = None
+
+
+def _get_metachar_re():
+    global _DANGEROUS_METACHAR_RE
+    if _DANGEROUS_METACHAR_RE is None:
+        import re
+        _DANGEROUS_METACHAR_RE = re.compile(r"[|;&`$]")
+    return _DANGEROUS_METACHAR_RE
+
+
+def detect_escalation(command: list[str]) -> str | None:
+    """Return a human-readable reason if the command looks like an escalation attempt.
+
+    Returns None if the command is considered safe.
+    """
+    if not command:
+        return None
+    canonical = _canonicalize_command(command)
+    cmd0 = canonical[0] if canonical else ""
+
+    # Direct escalation command
+    if cmd0 in _ESCALATION_TOKENS:
+        _escalation_logger.warning("Escalation attempt blocked: %s", command)
+        return f"'{cmd0}' is a privilege-escalation command"
+
+    # LD_PRELOAD / LD_LIBRARY_PATH as environment prefix (e.g. ["LD_PRELOAD=/evil.so", "ls"])
+    for tok in canonical:
+        for esc in ("LD_PRELOAD=", "LD_LIBRARY_PATH="):
+            if tok.startswith(esc):
+                _escalation_logger.warning("Escalation attempt blocked (env override): %s", command)
+                return f"Environment override '{esc}' is not permitted"
+
+    # Shell metacharacters injected into what looks like a single trusted token
+    # e.g. ["ls", "; rm -rf /"]
+    meta_re = _get_metachar_re()
+    for tok in canonical[1:]:
+        if meta_re.search(tok):
+            _escalation_logger.warning("Possible metachar injection: %s", command)
+            # Don't hard-block — just force approval
+            return f"Shell metacharacter in argument '{tok[:40]}'"
+
+    return None
+
+
 def needs_approval(
     command: list[str],
     policy: AskForApproval,
@@ -75,19 +234,21 @@ def needs_approval(
         # Don't ask upfront; re-run with approval on non-zero exit
         return False
     if policy == AskForApproval.UNLESS_TRUSTED:
-        cmd0 = command[0] if command else ""
-        cmd2 = " ".join(command[:2])
+        # Canonicalize before any trust checks so wrappers can't bypass approval
+        canonical = _canonicalize_command(command)
+        cmd0 = canonical[0] if canonical else ""
+        cmd2 = " ".join(canonical[:2])
         # Check built-in trusted set
         if cmd0 in TRUSTED_COMMANDS or cmd2 in TRUSTED_COMMANDS:
             return False
-        # Check session-approved commands
-        key = " ".join(command[:2])
+        # Check session-approved commands (match on canonical form)
+        key = " ".join(canonical[:2])
         if key in session_approved:
             return False
         # Check configured trusted command patterns
         if trusted_patterns:
             import fnmatch
-            cmd_str = " ".join(command)
+            cmd_str = " ".join(canonical)
             for rule in trusted_patterns:
                 pattern = getattr(rule, "pattern", str(rule))
                 use_regex = getattr(rule, "use_regex", False)
@@ -130,6 +291,9 @@ async def run_turn(
     # Analytics: begin timing this turn
     if hasattr(session, "analytics") and session.analytics is not None:
         session.analytics.start_turn(session.session_id, turn_id, session.config.model)
+
+    # Snapshot file mtimes/sizes so we can detect what changed this turn
+    _file_snapshot_before = _snapshot_dir(session.cwd)
 
     if session._recorder:
         await session._recorder.write({
@@ -226,6 +390,37 @@ async def run_turn(
                 return
 
             current_history = session.context_manager.raw_items()
+
+            # Scrub any orphaned function_calls that have no matching output.
+            # These are left behind when a turn crashes mid-execution; sending
+            # them to the API causes a 400 "No tool output found" error.
+            _seen_outputs: set[str] = {
+                item["call_id"]
+                for item in current_history
+                if item.get("type") == "function_call_output"
+            }
+            _orphaned_ids: set[str] = {
+                item["call_id"]
+                for item in current_history
+                if item.get("type") == "function_call"
+                and item.get("call_id") not in _seen_outputs
+            }
+            if _orphaned_ids:
+                patched: list = []
+                for item in current_history:
+                    patched.append(item)
+                    if (
+                        item.get("type") == "function_call"
+                        and item.get("call_id") in _orphaned_ids
+                    ):
+                        patched.append({
+                            "type": "function_call_output",
+                            "call_id": item["call_id"],
+                            "output": "[Tool execution was interrupted]",
+                        })
+                session.context_manager.replace(patched)
+                current_history = patched
+
             tool_specs = session.tool_registry.get_tool_specs()
             # In plan mode: only expose read-only tools
             if getattr(session, "_plan_mode", False):
@@ -404,6 +599,51 @@ async def run_turn(
                         # All tools were blocked, continue to next iteration
                         continue
             
+            # Network approval for web tools (must happen sequentially before parallel dispatch)
+            _WEB_TOOLS = frozenset({"web_fetch", "web_search"})
+            _denied_call_ids: set[str] = set()
+            for tc in tool_calls:
+                if tc.name not in _WEB_TOOLS:
+                    continue
+                if tc.name == "web_search":
+                    url = f"duckduckgo.com/search?q={tc.input.get('query', '')}"
+                    domain = "duckduckgo.com"
+                else:
+                    url = tc.input.get("url", "")
+                    try:
+                        from urllib.parse import urlparse as _up
+                        domain = _up(url).netloc or url.split("/")[0]
+                    except Exception:
+                        domain = url[:50]
+                import uuid as _uuid
+                req_id = str(_uuid.uuid4())[:12]
+                approved = await session.get_network_approval(req_id, url, domain, tool_name=tc.name)
+                if not approved:
+                    _denied_call_ids.add(tc.id)
+
+            # Block denied web tool calls
+            for tc in [t for t in tool_calls if t.id in _denied_call_ids]:
+                await emit(ToolCallStartedEvent(
+                    type="tool_call_started",
+                    tool_call_id=tc.id,
+                    tool_name=tc.name,
+                    tool_input=tc.input,
+                ))
+                result_text = f"Network access to '{tc.input.get('url', tc.input.get('query', ''))}' was denied by user."
+                await emit(ToolCallCompletedEvent(
+                    type="tool_call_completed",
+                    tool_call_id=tc.id,
+                    tool_name=tc.name,
+                    output=result_text,
+                    duration_ms=0,
+                ))
+                tool_results.append({
+                    "type": "function_call_output",
+                    "call_id": tc.id,
+                    "output": result_text,
+                })
+            tool_calls = [t for t in tool_calls if t.id not in _denied_call_ids]
+
             # Separate tool calls into parallel-safe and sequential groups
             read_only_calls = [tc for tc in tool_calls if tc.name in READ_ONLY_TOOLS]
             write_calls = [tc for tc in tool_calls if tc.name not in READ_ONLY_TOOLS]
@@ -535,12 +775,14 @@ async def run_turn(
                         })
                         continue
 
-                    approval_needed = needs_approval(
+                    escalation_reason = detect_escalation(command)
+                    approval_needed = escalation_reason is not None or needs_approval(
                         command,
                         session.config.ask_for_approval,
                         session_approved_commands,
                         trusted_patterns=session.config.trusted_commands,
                     )
+                    approval_reason = escalation_reason or "Command requires approval per policy"
 
                     if approval_needed:
                         await emit(ExecApprovalRequestedEvent(
@@ -548,7 +790,7 @@ async def run_turn(
                             tool_call_id=call_id,
                             command=command,
                             cwd=str(exec_cwd),
-                            reason="Command requires approval per policy",
+                            reason=approval_reason,
                             alternatives=[],
                         ))
                         decision = await session.get_approval(call_id)
@@ -602,14 +844,39 @@ async def run_turn(
                         ))
 
                     timeout_ms: int = tc.input.get("timeout", 10_000)
-                    exec_result = await execute_command(
-                        command=command,
-                        cwd=exec_cwd,
-                        sandbox=session._sandbox_runner,
-                        cancel_event=cancel_event,
-                        on_output_delta=on_delta,
-                        timeout_ms=timeout_ms,
-                    )
+                    try:
+                        exec_result = await execute_command(
+                            command=command,
+                            cwd=exec_cwd,
+                            sandbox=session._sandbox_runner,
+                            cancel_event=cancel_event,
+                            on_output_delta=on_delta,
+                            timeout_ms=timeout_ms,
+                        )
+                    except Exception as _exec_exc:
+                        # Sandbox block, permission error, or other failure — still
+                        # need a tool result so the context stays valid.
+                        result_text = f"Error: {_exec_exc}"
+                        await emit(ExecCompletedEvent(
+                            type="exec_completed",
+                            tool_call_id=call_id,
+                            exit_code=1,
+                            status=ExecCommandStatus.FAILED,
+                            duration_ms=0,
+                        ))
+                        await emit(ToolCallCompletedEvent(
+                            type="tool_call_completed",
+                            tool_call_id=call_id,
+                            tool_name=tool_name,
+                            output=result_text,
+                            duration_ms=0,
+                        ))
+                        tool_results.append({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": result_text,
+                        })
+                        continue
 
                     status = (
                         ExecCommandStatus.COMPLETED
@@ -676,10 +943,6 @@ async def run_turn(
                         duration_ms=duration_ms,
                     ))
 
-                # Record tool result for history
-                if tool_name not in ("shell", "local_shell", "bash"):
-                    pass  # already emitted ToolCallCompleted above
-
                 tool_results.append({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -716,8 +979,11 @@ async def run_turn(
                 "cached_input_tokens": total_cached_input_tokens,
             })
 
-        # Analytics: record tokens, cost, and latency for this turn
+        # Analytics: record tokens, cost, latency, and changed files for this turn
         if hasattr(session, "analytics") and session.analytics is not None:
+            changed = _diff_snapshot(_file_snapshot_before, _snapshot_dir(session.cwd))
+            if changed:
+                session.analytics.set_changed_files(changed)
             await session.analytics.finish_turn(total_input_tokens, total_output_tokens)
 
     except asyncio.CancelledError:

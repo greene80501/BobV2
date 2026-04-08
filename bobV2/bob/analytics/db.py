@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS turns (
     output_cost_usd REAL,
     total_cost_usd  REAL,
     latency_ms      INTEGER,
+    changed_files   TEXT,
     timestamp       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
@@ -56,7 +57,12 @@ class AnalyticsDB:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.executescript(_SCHEMA)
-                await db.commit()
+                # Migration: add changed_files column to existing DBs
+                try:
+                    await db.execute("ALTER TABLE turns ADD COLUMN changed_files TEXT")
+                    await db.commit()
+                except Exception:
+                    pass  # Column already exists
             self._ready = True
         except Exception as exc:
             logger.warning("Analytics DB setup failed (continuing without analytics): %s", exc)
@@ -80,10 +86,13 @@ class AnalyticsDB:
         output_cost_usd: Optional[float] = None,
         total_cost_usd: Optional[float] = None,
         latency_ms: Optional[int] = None,
+        changed_files: Optional[list[str]] = None,
     ) -> None:
         """Insert one turn record. Silently skips if DB is unavailable."""
         if not self._ready:
             return
+        import json
+        changed_files_json = json.dumps(changed_files) if changed_files else None
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
@@ -92,14 +101,14 @@ class AnalyticsDB:
                         (session_id, turn_id, model, provider,
                          input_tokens, output_tokens, total_tokens,
                          input_cost_usd, output_cost_usd, total_cost_usd,
-                         latency_ms)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                         latency_ms, changed_files)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         session_id, turn_id, model, provider,
                         input_tokens, output_tokens, total_tokens,
                         input_cost_usd, output_cost_usd, total_cost_usd,
-                        latency_ms,
+                        latency_ms, changed_files_json,
                     ),
                 )
                 await db.commit()

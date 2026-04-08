@@ -54,6 +54,9 @@ class AnalyticsTracker:
         self.last_turn_output_tokens: int = 0
         self.last_turn_cost_usd: Optional[float] = None
         self.last_turn_latency_ms: Optional[int] = None
+        self.last_turn_changed_files: list[str] = []
+        # Pending changed-files set by run_turn before finish_turn is called
+        self._pending_changed_files: list[str] = []
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -92,6 +95,8 @@ class AnalyticsTracker:
         self.last_turn_output_tokens = output_tokens
         self.last_turn_cost_usd      = total_cost
         self.last_turn_latency_ms    = latency_ms
+        self.last_turn_changed_files = list(self._pending_changed_files)
+        self._pending_changed_files  = []
 
         # Update session accumulators
         self._session_input_tokens  += input_tokens
@@ -104,18 +109,23 @@ class AnalyticsTracker:
 
         # Persist
         await self._db.record_turn(
-            session_id   = self._session_id,
-            turn_id      = self._turn_id,
-            model        = self._model,
-            provider     = provider,
-            input_tokens = input_tokens,
-            output_tokens= output_tokens,
-            total_tokens = total_tokens,
+            session_id    = self._session_id,
+            turn_id       = self._turn_id,
+            model         = self._model,
+            provider      = provider,
+            input_tokens  = input_tokens,
+            output_tokens = output_tokens,
+            total_tokens  = total_tokens,
             input_cost_usd  = input_cost,
             output_cost_usd = output_cost,
             total_cost_usd  = total_cost,
-            latency_ms   = latency_ms,
+            latency_ms      = latency_ms,
+            changed_files   = self.last_turn_changed_files or None,
         )
+
+    def set_changed_files(self, files: list[str]) -> None:
+        """Called by run_turn after tool execution to record changed paths."""
+        self._pending_changed_files = files
 
     # ------------------------------------------------------------------
     # Session-level aggregates (read by TUI for /cost, /usage commands)
@@ -165,6 +175,9 @@ class AnalyticsTracker:
             parts.append(f"{pct}% ctx")
         if self.last_turn_latency_ms is not None:
             parts.append(f"{self.last_turn_latency_ms:,}ms")
+        if self.last_turn_changed_files:
+            n = len(self.last_turn_changed_files)
+            parts.append(f"{n} file{'s' if n != 1 else ''} changed")
         return "  ·  ".join(parts)
 
     def format_session_cost(self) -> str:

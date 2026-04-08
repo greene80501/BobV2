@@ -146,6 +146,7 @@ class HookEventName(str, Enum):
     POST_TOOL_USE = "post_tool_use"
     SESSION_START = "session_start"
     USER_PROMPT_SUBMIT = "user_prompt_submit"
+    POST_TURN = "post_turn"
     STOP = "stop"
 
 

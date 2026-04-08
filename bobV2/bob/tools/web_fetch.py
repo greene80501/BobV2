@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 WEB_FETCH_DESCRIPTION = (
-    "Fetch the content of a URL. HTML pages are converted to Markdown. "
-    "Output is truncated at max_length characters."
+    "Fetch the full content of a specific URL. Use this only when you already have "
+    "a URL to read — not for discovery or search. If you get a 403 or access error, "
+    "use web_search instead. HTML is converted to Markdown; output is truncated at max_length characters."
 )
 
 WEB_FETCH_SCHEMA = {
@@ -44,7 +45,11 @@ async def web_fetch_handler(tool_input: dict, context: Any) -> str:
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            response = await client.get(url, headers={"User-Agent": "bob/1.0"})
+            response = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            })
             response.raise_for_status()
     except Exception as exc:
         return f"Error fetching {url}: {exc}"
