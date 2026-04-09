@@ -15,12 +15,15 @@ Main-loop contract
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 
@@ -259,6 +262,353 @@ def _parse_at_images(text: str) -> tuple[str, list]:
 
     cleaned = pattern.sub(_replace, text).strip()
     return cleaned, image_paths
+
+
+class _AsciiArtPreParser(HTMLParser):
+    """Extract per-character foreground colors from the uploaded HTML art."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_pre = False
+        self._current_fg: tuple[int, int, int] | None = None
+        self._current_bg: tuple[int, int, int] | None = None
+        self.lines: list[
+            list[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None]]
+        ] = [[]]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        if tag == "pre":
+            self._in_pre = True
+            return
+        if not self._in_pre or tag != "span":
+            return
+        style = attr_map.get("style") or ""
+        fg = re.search(r"(?:^|;)\s*color:\s*rgb\((\d+),(\d+),(\d+)\)", style)
+        bg = re.search(r"(?:^|;)\s*background-color:\s*rgb\((\d+),(\d+),(\d+)\)", style)
+        self._current_fg = tuple(int(part) for part in fg.groups()) if fg else None
+        self._current_bg = tuple(int(part) for part in bg.groups()) if bg else None
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre":
+            self._in_pre = False
+        elif self._in_pre and tag == "span":
+            self._current_fg = None
+            self._current_bg = None
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_pre:
+            return
+        text = html.unescape(data).replace("\xa0", " ")
+        for ch in text:
+            if ch == "\n":
+                self.lines.append([])
+            else:
+                self.lines[-1].append((ch, self._current_fg, self._current_bg))
+
+
+def _256_to_rgb(n: int) -> tuple[int, int, int]:
+    """Convert a 256-color palette index to an approximate (r, g, b) triple."""
+    if n < 16:
+        _std = [
+            (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+            (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+            (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+            (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+        ]
+        return _std[n]
+    if n < 232:
+        n -= 16
+        return (int((n // 36) * 51), int(((n % 36) // 6) * 51), int((n % 6) * 51))
+    v = (n - 232) * 10 + 8
+    return (v, v, v)
+
+
+def _parse_ansi_text_art(
+    source: str,
+) -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Parse ANSI-decorated text art into the common cell grid representation.
+
+    Handles both 24-bit true-color (38;2;r;g;b) and 256-color palette (38;5;n)
+    escape sequences so that art files using either encoding render correctly.
+    """
+    ansi_re = re.compile(r"\033\[([0-9;]*)m")
+    rows: list[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...]
+    ] = []
+
+    for raw_line in source.strip("\n").replace("\ufeff", "").replace("\\e", "\033").splitlines():
+        fg: tuple[int, int, int] | None = None
+        bg: tuple[int, int, int] | None = None
+        row: list[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None]] = []
+        index = 0
+        while index < len(raw_line):
+            match = ansi_re.match(raw_line, index)
+            if match:
+                params = [int(part) for part in match.group(1).split(";") if part] if match.group(1) else [0]
+                cursor = 0
+                while cursor < len(params):
+                    code = params[cursor]
+                    if code == 0:
+                        fg = None
+                        bg = None
+                    elif code == 39:
+                        fg = None
+                    elif code == 49:
+                        bg = None
+                    # 24-bit true color: 38;2;r;g;b
+                    elif code == 38 and cursor + 4 < len(params) and params[cursor + 1] == 2:
+                        fg = (params[cursor + 2], params[cursor + 3], params[cursor + 4])
+                        cursor += 4
+                    elif code == 48 and cursor + 4 < len(params) and params[cursor + 1] == 2:
+                        bg = (params[cursor + 2], params[cursor + 3], params[cursor + 4])
+                        cursor += 4
+                    # 256-color palette: 38;5;n
+                    elif code == 38 and cursor + 2 < len(params) and params[cursor + 1] == 5:
+                        fg = _256_to_rgb(params[cursor + 2])
+                        cursor += 2
+                    elif code == 48 and cursor + 2 < len(params) and params[cursor + 1] == 5:
+                        bg = _256_to_rgb(params[cursor + 2])
+                        cursor += 2
+                    cursor += 1
+                index = match.end()
+                continue
+            row.append((raw_line[index], fg, bg))
+            index += 1
+        rows.append(tuple(row))
+
+    width = max((len(row) for row in rows), default=0)
+    return tuple(
+        tuple(list(row) + [(" ", None, None)] * (width - len(row)))
+        for row in rows
+    )
+
+
+def _unwrap_shell_printf_art(source: str) -> str:
+    """Extract the quoted payload from a shell `printf "..."` art file."""
+    stripped = source.replace("\ufeff", "").strip()
+    match = re.match(
+        r'^\s*printf\s+(?P<quote>["\'])(?P<body>.*)(?P=quote)\s*;?\s*$',
+        stripped,
+        re.DOTALL,
+    )
+    if not match:
+        return stripped
+    return match.group("body")
+
+
+@lru_cache(maxsize=1)
+def _load_tui_bob_art() -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Load Bob's embedded ANSI art from the repository asset file."""
+    art_dir = Path(__file__).resolve().parents[3] / "chacter"
+    for name in ("bob_tui_ansi.sh", "bob_tui_ansi.txt", "bob_tui_ansi.ans", "img.ANS"):
+        art_path = art_dir / name
+        if not art_path.exists():
+            continue
+        raw_source = art_path.read_text(encoding="utf-8")
+        normalized = _unwrap_shell_printf_art(raw_source)
+        art = _parse_ansi_text_art(normalized)
+        if art:
+            return art
+    return tuple()
+
+
+@lru_cache(maxsize=1)
+def _load_uploaded_ascii_art() -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Load the newest generated or uploaded colored ASCII art from the repo."""
+    art_dir = Path(__file__).resolve().parents[3] / "chacter"
+    candidates = sorted(art_dir.glob("bob-terminal-*.html"), key=lambda path: path.stat().st_mtime)
+    if not candidates:
+        candidates = sorted(art_dir.glob("ascii-art-*.html"), key=lambda path: path.stat().st_mtime)
+    if not candidates:
+        return tuple()
+    art_path = candidates[-1]
+
+    parser = _AsciiArtPreParser()
+    parser.feed(art_path.read_text(encoding="utf-8"))
+    lines = parser.lines
+    if lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return tuple()
+
+    width = max(len(line) for line in lines)
+    normalized: list[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...]
+    ] = []
+    for line in lines:
+        padded = list(line)
+        if len(padded) < width:
+            padded.extend([(" ", None, None)] * (width - len(padded)))
+        normalized.append(tuple(padded))
+    return tuple(normalized)
+
+
+def _crop_ascii_art(
+    art: tuple[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+        ...,
+    ],
+) -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Trim fully empty rows and columns from the uploaded art."""
+    if not art:
+        return art
+
+    height = len(art)
+    width = len(art[0])
+
+    visible_rows = [
+        i for i, row in enumerate(art)
+        if any(ch != " " or bg is not None for ch, _, bg in row)
+    ]
+    visible_cols = [
+        j for j in range(width)
+        if any(art[i][j][0] != " " or art[i][j][2] is not None for i in range(height))
+    ]
+
+    if not visible_rows or not visible_cols:
+        return art
+
+    top = visible_rows[0]
+    bottom = visible_rows[-1]
+    left = visible_cols[0]
+    right = visible_cols[-1]
+
+    return tuple(
+        tuple(row[left:right + 1])
+        for row in art[top:bottom + 1]
+    )
+
+
+def _scale_ascii_art(
+    art: tuple[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+        ...,
+    ],
+    target_width: int,
+) -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Scale the uploaded art proportionally using nearest-neighbor sampling."""
+    if not art:
+        return art
+
+    src_h = len(art)
+    src_w = len(art[0])
+    if target_width >= src_w or target_width <= 0:
+        return art
+
+    scale = target_width / src_w
+    target_h = max(1, round(src_h * scale))
+    scaled: list[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...]
+    ] = []
+    for y in range(target_h):
+        src_y = min(src_h - 1, int((y + 0.5) / scale))
+        row: list[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None]] = []
+        for x in range(target_width):
+            src_x = min(src_w - 1, int((x + 0.5) / scale))
+            row.append(art[src_y][src_x])
+        scaled.append(tuple(row))
+    return tuple(scaled)
+
+
+def _fit_ascii_art(
+    art: tuple[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+        ...,
+    ],
+    *,
+    max_width: int,
+    max_height: int,
+) -> tuple[
+    tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+    ...,
+]:
+    """Downscale art proportionally so it fits the available width and height."""
+    if not art or max_width <= 0 or max_height <= 0:
+        return tuple()
+
+    src_h = len(art)
+    src_w = len(art[0])
+    if src_w <= max_width and src_h <= max_height:
+        return art
+
+    scale = min(max_width / src_w, max_height / src_h)
+    if scale >= 1:
+        return art
+
+    target_w = max(1, min(max_width, int(src_w * scale)))
+    scaled = _scale_ascii_art(art, target_w)
+    if len(scaled) > max_height:
+        trimmed = list(scaled[:max_height])
+        return tuple(trimmed)
+    return scaled
+
+
+def _render_ascii_art_lines(
+    art: tuple[
+        tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
+        ...,
+    ],
+    *,
+    color: bool,
+) -> list[str]:
+    """Render the uploaded art grid as ANSI terminal lines."""
+    if not art:
+        return []
+    if not color:
+        return ["".join(ch for ch, _, _ in row) for row in art]
+
+    reset = "\033[0m"
+    lines: list[str] = []
+
+    for row in art:
+        parts: list[str] = []
+        current_style: tuple[
+            tuple[int, int, int] | None,
+            tuple[int, int, int] | None,
+        ] | None = None
+        for ch, fg, bg in row:
+            fg = _remap_ascii_art_color(fg)
+            bg = _remap_ascii_art_color(bg)
+            style = (fg, bg)
+            if style != current_style:
+                if fg is None and bg is None:
+                    parts.append(reset)
+                else:
+                    codes: list[str] = []
+                    if fg is not None:
+                        codes.append(f"38;2;{fg[0]};{fg[1]};{fg[2]}")
+                    if bg is not None:
+                        codes.append(f"48;2;{bg[0]};{bg[1]};{bg[2]}")
+                    parts.append(f"\033[{';'.join(codes)}m")
+                current_style = style
+            parts.append(ch)
+        parts.append(reset)
+        lines.append("".join(parts))
+
+    return lines
+
+
+def _remap_ascii_art_color(
+    color: tuple[int, int, int] | None,
+) -> tuple[int, int, int] | None:
+    """Preserve source colors for generated art."""
+    return color
 
 
 # ── Output collapsing ─────────────────────────────────────────────────────────
@@ -665,68 +1015,20 @@ class Interface:
         except Exception:
             return raw[:16]
 
-    def _build_header_mascot(self, center_width: int) -> tuple[list[str], str]:
-        """Return a width-appropriate Bob mascot and welcome line."""
+    def _build_header_character(self, max_width: int, max_height: int) -> tuple[list[str], str]:
+        """Render Bob's ANSI art, fitting it to the available header space."""
         rst = "\033[0m"
-        if self._config.no_color:
-            blue = cyan = white = dim = brand = ""
-        else:
-            blue = "\033[1;38;5;75m"
-            cyan = "\033[1;38;5;81m"
-            white = "\033[97m"
-            dim = "\033[2;37m"
-            brand = "\033[1;38;5;75m"
-
-        compact = [
-            (blue,  "      ▄████████▄"),
-            (blue,  "   ▄████████████▄"),
-            (blue,  "  ████▀ ▄▄▄▄ ▀████"),
-            (blue,  " ▐██   █    █   ██▌"),
-            (white, " ███    ●  ●    ███"),
-            (white, " ███      ▀      ███"),
-            (white, " ▐██    \\___/    ██▌"),
-            (cyan,  "  ▀███   </>   ███▀"),
-            (dim,   "    ▀██████████▀"),
-        ]
-
-        standard = [
-            (blue,  "        ▄████████████▄"),
-            (blue,  "     ▄████████████████▄"),
-            (blue,  "    █████▀  ▄▄▄▄  ▀█████"),
-            (blue,  "   ████    █    █    ████"),
-            (white, "  ▐███      ●  ●      ███▌"),
-            (white, "  ███        ▀        ███"),
-            (white, "  ███      \\___/      ███"),
-            (white, "  ▐███                ███▌"),
-            (cyan,  "   ████    ─</>─    ████"),
-            (dim,   "    ▀████▄▄▄▄▄▄▄▄████▀"),
-        ]
-
-        wide = [
-            (blue,  "         ▄██████████████▄"),
-            (blue,  "      ▄████████████████████▄"),
-            (blue,  "     █████▀▀    ▄▄▄▄    ▀▀█████"),
-            (blue,  "    ████      █    █      ████"),
-            (white, "   ▐███        ●  ●        ███▌"),
-            (white, "   ███           ▀           ███"),
-            (white, "   ███         \\___/         ███"),
-            (white, "   ▐███                     ███▌"),
-            (dim,   "    ████       ▄▄▄▄       ████"),
-            (cyan,  "     ████     │</>│     ████"),
-            (dim,   "      ▀████▄  │__│  ▄████▀"),
-            (blue,  "        ▀████▄▄▄▄▄▄████▀"),
-        ]
-
-        if center_width >= 34:
-            variant = wide
-        elif center_width >= 26:
-            variant = standard
-        else:
-            variant = compact
-
-        mascot = [f"{style}{line}{rst}" if style else line for style, line in variant]
+        brand = "" if self._config.no_color else "\033[1;38;5;75m"
         welcome = f"{brand}Welcome to bob!{rst}" if brand else "Welcome to bob!"
-        return mascot, welcome
+
+        art = _load_tui_bob_art() or _load_uploaded_ascii_art()
+        if not art:
+            return [], welcome
+
+        cropped = _crop_ascii_art(art)
+        scaled = _fit_ascii_art(cropped, max_width=max_width, max_height=max_height)
+        lines = _render_ascii_art_lines(scaled, color=not self._config.no_color)
+        return lines, welcome
 
     # ── Header — Claude Code-style welcome panel ──────────────────────────────
 
@@ -739,7 +1041,9 @@ class Interface:
         except Exception:
             bob_version = "0.1.0"
 
-        term_w = shutil.get_terminal_size((120, 24)).columns
+        term_size = shutil.get_terminal_size((120, 24))
+        term_w = term_size.columns
+        term_h = term_size.lines
         inner_w = term_w - 4 # excluding the very outer frame chars (│  │)
 
         # ANSI helpers
@@ -778,18 +1082,14 @@ class Interface:
         except Exception:
             pass
 
-        # Left Column: System Info
-        left_rows = [
-            "",
+        info_rows = [
             f"  {BOLD}System Info{RST}",
             f"  {DIM}Model:    {model}{RST}",
             f"  {DIM}Workspace: {sandbox}{RST}",
             f"  {DIM}System:    Bob v2{RST}",
             f"  {DIM}Directory: {cwd_str}{RST}",
-            ""
         ]
 
-        # Right Column: Recent Activity & Commands
         right_rows = self._recent_session_rows(DIM, BOLD, RST)
         right_rows.extend([
             "",
@@ -799,18 +1099,22 @@ class Interface:
             f"  {DIM}• /new    - Start fresh session{RST}",
         ])
 
-        mascot_center_w = max(20, min(inner_w, 40))
-        mascot, welcome_line = self._build_header_mascot(mascot_center_w)
-
-        if term_w < 100:
-            body_rows = [
-                center(welcome_line, inner_w),
-                "",
-            ] + [center(row, inner_w) for row in mascot] + [
-                "",
-            ] + left_rows[1:-1] + [
-                "",
-            ] + right_rows
+        left_rows = [""] + info_rows + [""]
+        right_rows = right_rows
+        LEFT_W = max(vlen(row) for row in left_rows)
+        RIGHT_W = max(vlen(row) for row in right_rows)
+        min_center_w = 24
+        if inner_w < LEFT_W + RIGHT_W + min_center_w + 6:
+            stack_width = max(24, min(50, inner_w))
+            stack_height = max(14, min(26, term_h - len(info_rows) - len(right_rows) - 8))
+            character_lines, welcome_line = self._build_header_character(stack_width, stack_height)
+            body_rows = [center(welcome_line, inner_w), ""]
+            if character_lines:
+                body_rows.extend(center(row, inner_w) for row in character_lines)
+                body_rows.append("")
+            body_rows.extend(info_rows)
+            body_rows.append("")
+            body_rows.extend(right_rows)
 
             title  = f"bob v{bob_version}"
             ndash  = max(0, term_w - 5 - len(title) - 2)
@@ -826,23 +1130,22 @@ class Interface:
             out.flush()
             return
 
-        # Divvy up the columns dynamically based on actual content lengths!
-        LEFT_W = max([vlen(l) for l in left_rows])
-        RIGHT_W = max([vlen(r) for r in right_rows])
-        CENTER_W = max(20, inner_w - LEFT_W - RIGHT_W - 6) # accounting for two inner "   " dividers
-        mascot, welcome_line = self._build_header_mascot(CENTER_W)
+        CENTER_W = inner_w - LEFT_W - RIGHT_W - 6
+        art_target_width = min(max(20, CENTER_W), 52)
+        center_height_budget = max(14, min(26, term_h - 8))
+        character_lines, welcome_line = self._build_header_character(art_target_width, center_height_budget)
 
-        # Center Column: Mascot and Welcome
-        center_rows = [
-            center(welcome_line, CENTER_W),
-            "",
-        ] + [center(row, CENTER_W) for row in mascot]
+        center_rows = [center(welcome_line, CENTER_W), ""]
+        if character_lines:
+            center_rows.extend(center(row, CENTER_W) for row in character_lines)
 
-        # Ensure same number of rows
-        n = max(len(left_rows), len(center_rows), len(right_rows))
-        while len(left_rows) < n: left_rows.append("")
-        while len(center_rows) < n: center_rows.append("")
-        while len(right_rows) < n: right_rows.append("")
+        row_count = max(len(left_rows), len(center_rows), len(right_rows))
+        while len(left_rows) < row_count:
+            left_rows.append("")
+        while len(center_rows) < row_count:
+            center_rows.append("")
+        while len(right_rows) < row_count:
+            right_rows.append("")
 
         title  = f"bob v{bob_version}"
         ndash  = max(0, term_w - 5 - len(title) - 2)
@@ -852,11 +1155,10 @@ class Interface:
         import sys
         out = sys.__stdout__
         out.write("\n" + top + "\n")
-        
-        for l, c, r in zip(left_rows, center_rows, right_rows):
-            # 3 Columns with gentle spacing, dropping interior borders entirely to look floating
-            out.write(f"│ {rpad(l, LEFT_W)}   {center(c, CENTER_W)}   {rpad(r, RIGHT_W)} │\n")
-            
+
+        for left, center_row, right in zip(left_rows, center_rows, right_rows):
+            out.write(f"│ {rpad(left, LEFT_W)}   {rpad(center_row, CENTER_W)}   {rpad(right, RIGHT_W)} │\n")
+
         out.write(bot + "\n\n")
         out.flush()
 
