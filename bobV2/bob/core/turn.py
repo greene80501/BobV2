@@ -674,12 +674,14 @@ async def run_turn(
                     
                     import time
                     t0 = time.monotonic()
+                    tool_error: str | None = None
                     try:
                         result_text = await session.tool_registry.dispatch(
                             tool_name, tc.input, ctx
                         )
                     except Exception as exc:
                         result_text = f"Error: {exc}"
+                        tool_error = result_text
                     duration_ms = int((time.monotonic() - t0) * 1000)
                     
                     await emit(ToolCallCompletedEvent(
@@ -688,6 +690,7 @@ async def run_turn(
                         tool_name=tool_name,
                         output=result_text,
                         duration_ms=duration_ms,
+                        error=tool_error,
                     ))
                     
                     return {
@@ -767,6 +770,7 @@ async def run_turn(
                             tool_call_id=call_id,
                             tool_name=tool_name,
                             output=result_text,
+                            error=result_text if result_text.startswith("Error:") else None,
                         ))
                         tool_results.append({
                             "type": "function_call_output",
@@ -870,6 +874,7 @@ async def run_turn(
                             tool_name=tool_name,
                             output=result_text,
                             duration_ms=0,
+                            error=result_text,
                         ))
                         tool_results.append({
                             "type": "function_call_output",
@@ -927,12 +932,14 @@ async def run_turn(
 
                     import time
                     t0 = time.monotonic()
+                    tool_error: str | None = None
                     try:
                         result_text = await session.tool_registry.dispatch(
                             tool_name, tc.input, ctx
                         )
                     except Exception as exc:
                         result_text = f"Error: {exc}"
+                        tool_error = result_text
                     duration_ms = int((time.monotonic() - t0) * 1000)
 
                     await emit(ToolCallCompletedEvent(
@@ -941,6 +948,7 @@ async def run_turn(
                         tool_name=tool_name,
                         output=result_text,
                         duration_ms=duration_ms,
+                        error=tool_error,
                     ))
 
                 tool_results.append({

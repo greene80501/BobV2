@@ -162,14 +162,23 @@ def _p(s: str = "", end: str = "\n") -> None:
     print_formatted_text(ANSI(s + end), end="")
 
 
-def _render_error(message: str, tool_name: str | None = None) -> None:
+def _render_error(message: str, tool_name: str | None = None, tool_input: dict | None = None) -> None:
     """Print an error with file:line highlighting and optional traceback rendering."""
     import re as _re
     import io as _io
+    import json as _json
 
     prefix = f"  {_r('✗')}"
     if tool_name:
         prefix += f" {_d(f'[{tool_name}]')}"
+    if tool_input is not None:
+        try:
+            rendered_input = _json.dumps(tool_input, ensure_ascii=True, default=str)
+        except Exception:
+            rendered_input = str(tool_input)
+        if len(rendered_input) > 200:
+            rendered_input = rendered_input[:200] + "..."
+        prefix += f" {_d(f'input={rendered_input}')}"
 
     # Detect Python traceback: starts with "Traceback (most recent call last):"
     is_traceback = "Traceback (most recent call last)" in message
@@ -552,6 +561,7 @@ class Interface:
         # Frame-rate limiting: batch text deltas arriving within 16ms (≈60 fps)
         self._stream_flush_buf: str = ""
         self._stream_last_flush: float = 0.0
+        self._tool_call_inputs: dict[str, dict] = {}
 
     # ── Dynamic prompt ────────────────────────────────────────────────────────
 
@@ -906,6 +916,24 @@ class Interface:
         
         return ''.join(result)
 
+    def _flush_wrap_buffer(self) -> str:
+        """Flush any partial word buffered by _wrap_streaming_text()."""
+        tail = self._wrap_buffer
+        self._wrap_buffer = ""
+        if tail:
+            self._wrap_column += len(tail)
+        return tail
+
+    def _flush_completed_stream_lines(self) -> None:
+        """Render only completed markdown lines; keep the partial tail buffered."""
+        if "\n" not in self._stream_flush_buf:
+            return
+        last_newline = self._stream_flush_buf.rfind("\n")
+        ready = self._stream_flush_buf[: last_newline + 1]
+        self._stream_flush_buf = self._stream_flush_buf[last_newline + 1 :]
+        if ready:
+            _p(_md_render_chunk(ready), end="")
+
 
 
     async def _consume_events(self) -> None:  # noqa: C901
@@ -950,6 +978,8 @@ class Interface:
                     self._current_buf  = ""
                     self._text_started = False
                     self._after_tool   = False
+                    self._wrap_buffer = ""
+                    self._wrap_column = 0
                     # Spinner is started by _busy_wait AFTER the ❯ prompt is
                     # fully torn down — do NOT start it here.
 
@@ -963,7 +993,6 @@ class Interface:
                         if self._after_tool:
                             _p()
                         self._after_tool = False
-                        _p("• ", end="")
                     
                     # Handle code block syntax highlighting
                     delta = msg.delta
@@ -1029,18 +1058,25 @@ class Interface:
                     # Flush buffer if ≥16ms have elapsed since last render (≈60fps)
                     import time as _time
                     _now = _time.monotonic()
-                    if self._stream_flush_buf and (_now - self._stream_last_flush) >= 0.016:
-                        _p(_md_render_chunk(self._stream_flush_buf), end="")
-                        self._stream_flush_buf = ""
+                    if (
+                        self._stream_flush_buf
+                        and "\n" in self._stream_flush_buf
+                        and (_now - self._stream_last_flush) >= 0.016
+                    ):
+                        self._flush_completed_stream_lines()
                         self._stream_last_flush = _now
                         await asyncio.sleep(0)  # yield to event loop between batches
 
                 # ── Tool call lifecycle ───────────────────────────────────────
 
                 elif isinstance(msg, ToolCallStartedEvent):
+                    if self._wrap_buffer:
+                        self._stream_flush_buf += self._flush_wrap_buffer()
                     # Flush any buffered streaming text before tool output
                     if self._stream_flush_buf:
-                        _p(_md_render_chunk(self._stream_flush_buf), end="")
+                        self._flush_completed_stream_lines()
+                        if self._stream_flush_buf:
+                            _p(_render_md_line(self._stream_flush_buf), end="")
                         self._stream_flush_buf = ""
                     # Update spinner to show which tool is running
                     tool_name = msg.tool_name
@@ -1052,6 +1088,7 @@ class Interface:
                         self._spinner_label = f"🌐 {verb}"
                     else:
                         self._spinner_label = f"Running {display_name}…"
+                    self._tool_call_inputs[msg.tool_call_id] = msg.tool_input
                     if not self._spinner_active:
                         await self._start_spinner()
 
@@ -1059,14 +1096,29 @@ class Interface:
                     # Reset spinner label back to default
                     self._spinner_label = "Thinking…"
                     # Surface tool errors with file:line highlighting
+                    tool_input = self._tool_call_inputs.pop(msg.tool_call_id, None)
                     if getattr(msg, 'error', None):
-                        _render_error(msg.error, tool_name=getattr(msg, 'tool_name', None))
+                        _render_error(
+                            msg.error,
+                            tool_name=getattr(msg, 'tool_name', None),
+                            tool_input=tool_input,
+                        )
+                    elif isinstance(getattr(msg, "output", None), str) and msg.output.startswith("Error:"):
+                        _render_error(
+                            msg.output,
+                            tool_name=getattr(msg, 'tool_name', None),
+                            tool_input=tool_input,
+                        )
 
                 # ── Extended thinking ─────────────────────────────────────────
 
                 elif isinstance(msg, ReasoningDeltaEvent):
+                    if self._wrap_buffer:
+                        self._stream_flush_buf += self._flush_wrap_buffer()
                     if self._stream_flush_buf:
-                        _p(_md_render_chunk(self._stream_flush_buf), end="")
+                        self._flush_completed_stream_lines()
+                        if self._stream_flush_buf:
+                            _p(_render_md_line(self._stream_flush_buf), end="")
                         self._stream_flush_buf = ""
                     if not hasattr(self, '_reasoning_started') or not self._reasoning_started:
                         await self._stop_spinner()
@@ -1240,6 +1292,8 @@ class Interface:
                 # ── Turn end ──────────────────────────────────────────────────
 
                 elif isinstance(msg, TurnEndedEvent):
+                    if self._wrap_buffer:
+                        self._stream_flush_buf += self._flush_wrap_buffer()
                     # Flush any remaining buffered stream text — full line render
                     if self._stream_flush_buf:
                         _p(_render_md_line(self._stream_flush_buf), end="")
@@ -1299,6 +1353,8 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
+                    self._wrap_buffer = ""
+                    self._wrap_column = 0
                     # Token tracking
                     in_tok  = getattr(msg, "input_tokens",  0) or 0
                     out_tok = getattr(msg, "output_tokens", 0) or 0
@@ -2174,6 +2230,13 @@ class Interface:
                 if cost > 0:
                     _p(f"  {_d('Estimated cost')}       ${cost:.4f}")
                     _p()
+                changed_files = list(self._session.analytics.last_turn_changed_files or [])
+                _p(f"  {_d('Files changed last turn')} {len(changed_files):>6}")
+                for path in changed_files[:10]:
+                    _p(f"    {_d('-')} {path}")
+                if len(changed_files) > 10:
+                    _p(f"    {_d('...')} {len(changed_files) - 10} more")
+                _p()
 
         elif cmd == SlashCommand.SESSION:
             _p()

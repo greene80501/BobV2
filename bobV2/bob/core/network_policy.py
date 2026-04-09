@@ -28,22 +28,22 @@ class NetworkPolicy:
         Returns:
             True if approval is required
         """
-        if not self._network_access:
-            # Network access disabled entirely
-            return True
-        
         domain = self._extract_domain(url)
         if not domain:
             return True
-        
+
+        # Global network access means all domains are allowed.
+        if self._network_access:
+            return False
+
         # Check if domain is pre-approved
         if self._is_domain_approved(domain):
             return False
-        
+
         # Check if domain was approved this session
         if domain in self._session_approved_domains:
             return False
-        
+
         return True
     
     def approve_domain(self, domain: str, session_only: bool = True) -> None:

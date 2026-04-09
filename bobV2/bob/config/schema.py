@@ -114,6 +114,9 @@ class BobConfig(BaseModel):
     sandbox_mode: SandboxMode = SandboxMode.WORKSPACE_WRITE
     writable_roots: list[Path] = Field(default_factory=list)
     network_access: bool = False
+    # Domain patterns that may bypass per-request network approval
+    # (e.g. "github.com", "*.openai.com").
+    approved_network_domains: list[str] = Field(default_factory=list)
     windows_sandbox_level: WindowsSandboxLevel = WindowsSandboxLevel.DISABLED
     # HTTP proxy URL for all outbound requests
     network_proxy: str = ""

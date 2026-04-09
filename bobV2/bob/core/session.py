@@ -55,7 +55,6 @@ class BobSession:
         self._pending_approvals: dict[str, asyncio.Future] = {}
         # Domains approved for web access this session (key = request_id → Future)
         self._pending_network_approvals: dict[str, asyncio.Future] = {}
-        self._session_approved_domains: set[str] = set()
 
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
@@ -68,6 +67,12 @@ class BobSession:
             cwd=self.cwd,
         )
         self.sandbox_policy = sandbox_policy
+
+        from bob.core.network_policy import NetworkPolicy
+        self._network_policy = NetworkPolicy(
+            network_access=config.network_access,
+            approved_domains=config.approved_network_domains,
+        )
 
         from bob.sandbox import get_sandbox_runner
         self._sandbox_runner = get_sandbox_runner(sandbox_policy, self.cwd)
@@ -491,7 +496,7 @@ class BobSession:
             req = urllib.request.Request(
                 f"{base_url}/models",
                 headers={
-                    "Authorization": f"Bearer {self.config.api_key or ''}",
+                    "Authorization": f"Bearer {self._api_key or ''}",
                     "Content-Type": "application/json",
                 },
             )
@@ -704,10 +709,8 @@ class BobSession:
 
         Skips the prompt if *domain* was already session-approved.
         """
-        if domain in self._session_approved_domains:
+        if not self._network_policy.needs_approval(url):
             return True
-        if self.config.network_access:
-            return True  # Global network access enabled
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         self._pending_network_approvals[request_id] = fut
@@ -724,7 +727,7 @@ class BobSession:
         try:
             result = await fut
             if result.get("approve_always"):
-                self._session_approved_domains.add(domain)
+                self._network_policy.approve_domain(domain, session_only=True)
             return result.get("approved", False)
         finally:
             self._pending_network_approvals.pop(request_id, None)
@@ -1044,7 +1047,7 @@ class BobSession:
                                     "approve_always": inner_op.approve_always,
                                 })
                             if inner_op.approve_always:
-                                self._session_approved_domains.add(inner_op.domain)
+                                self._network_policy.approve_domain(inner_op.domain, session_only=True)
 
                         elif isinstance(inner_op, InterruptOp):
                             cancel_ev.set()

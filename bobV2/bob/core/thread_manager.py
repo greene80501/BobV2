@@ -1,5 +1,5 @@
 """
-ThreadManager — in-process multi-agent orchestration for Bob.
+ThreadManager - in-process multi-agent orchestration for Bob.
 
 Each sub-agent is a full BobSession running in the same asyncio event loop.
 Output is forwarded to the parent session as InfoEvents so the existing TUI
@@ -8,6 +8,7 @@ renders it without any protocol changes.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,15 +31,101 @@ _COLOR_PALETTE = [
 _RST = "\033[0m"
 
 
-async def _save_memory_snapshot(agent_name: str, task: str, result: str) -> None:
-    """Summarise *result* and persist it as a memory snapshot (fire-and-forget)."""
+async def _build_memory_snapshot(
+    session: "BobSession",
+    *,
+    task: str,
+    result: str,
+    changed_files: list[str],
+) -> str:
+    """Generate a reusable memory snapshot from the sub-agent's final context."""
+    context_items = session.context_manager.raw_items()[-12:]
+    context_json = json.dumps(context_items, ensure_ascii=True, default=str)
+    if len(context_json) > 12_000:
+        context_json = context_json[:12_000] + "\n... [truncated]"
+
+    changed = "\n".join(f"- {path}" for path in changed_files[:20]) if changed_files else "- none"
+    result_excerpt = result.strip()
+    if len(result_excerpt) > 6_000:
+        result_excerpt = result_excerpt[:6_000] + "\n... [truncated]"
+
+    prompt = (
+        "Create a durable memory snapshot for a coding sub-agent.\n"
+        "Summarize only facts that would help the next run of the same named agent.\n"
+        "Use this exact markdown structure:\n"
+        "## Key findings\n"
+        "- ...\n"
+        "## Important facts\n"
+        "- ...\n"
+        "## Files modified\n"
+        "- ...\n"
+        "Keep it concise and avoid filler.\n\n"
+        f"Task:\n{task}\n\n"
+        f"Changed files:\n{changed}\n\n"
+        f"Final result:\n{result_excerpt}\n\n"
+        f"Recent context items:\n{context_json}"
+    )
+
+    parts: list[str] = []
+    try:
+        async for ev in session.client.stream_turn(
+            input=[{
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }],
+            instructions=(
+                "You distill a sub-agent's final context into a compact reusable memory snapshot. "
+                "Preserve concrete findings, constraints, and edited files."
+            ),
+            tools=[],
+            max_retries=1,
+            temperature=0.2,
+            max_output_tokens=400,
+            extra_params={"prompt_caching": False},
+        ):
+            delta = getattr(ev, "delta", None)
+            if delta:
+                parts.append(delta)
+    except Exception:
+        parts = []
+
+    snapshot = "".join(parts).strip()
+    if snapshot:
+        return snapshot
+
+    fallback_lines = [
+        "## Key findings",
+        f"- Task: {task[:300]}",
+        f"- Outcome: {(result.strip()[:500] or 'No final result recorded.')}",
+        "## Important facts",
+        f"- Session cwd: {session.cwd}",
+        "## Files modified",
+    ]
+    if changed_files:
+        fallback_lines.extend(f"- {path}" for path in changed_files[:20])
+    else:
+        fallback_lines.append("- none")
+    return "\n".join(fallback_lines)
+
+
+async def _save_memory_snapshot(
+    session: "BobSession",
+    parent_session_id: str,
+    agent_name: str,
+    task: str,
+    result: str,
+    changed_files: list[str],
+) -> None:
+    """Summarise *result* and persist it as a session-scoped memory snapshot."""
     try:
         from bob.core.agent_memory import save_snapshot
-        # Build a concise summary: first 2000 chars of result, trimmed to sentences.
-        summary = result.strip()[:2000]
-        if len(result) > 2000:
-            summary += "\n… [truncated]"
-        save_snapshot(agent_name, task, summary)
+        summary = await _build_memory_snapshot(
+            session,
+            task=task,
+            result=result,
+            changed_files=changed_files,
+        )
+        save_snapshot(parent_session_id, agent_name, task, summary)
     except Exception:
         pass  # Memory snapshots are best-effort
 
@@ -64,8 +151,6 @@ class ThreadManager:
         self._agents: dict[str, AgentRecord] = {}
         self._color_index = 0
 
-    # ── Public API ─────────────────────────────────────────────────────────
-
     async def spawn(
         self,
         task: str,
@@ -74,27 +159,17 @@ class ThreadManager:
         template: Optional[str] = None,
         name: Optional[str] = None,
     ) -> str:
-        """Spawn a sub-agent and return its ID.
-
-        *name* is an optional stable identifier (e.g. "explorer", "reviewer").
-        If provided, the agent's prior memory snapshot is injected into its
-        context and a new snapshot is saved when it completes.
-        """
-        from bob.core.session import BobSession
-        from bob.core.agent_templates import get_template
+        """Spawn a sub-agent and return its ID."""
         from bob.core.agent_memory import load_snapshot
+        from bob.core.agent_templates import get_template
+        from bob.core.session import BobSession
 
-        # Build config for sub-agent
         config = self.parent_session.config.model_copy(deep=True)
         if model:
             config = config.model_copy(update={"model": model})
 
-        # Apply template system-prompt suffix
         tmpl = get_template(template) if template else None
-
-        agent_cwd: Path = (
-            Path(cwd) if cwd else self.parent_session.cwd
-        )
+        agent_cwd: Path = Path(cwd) if cwd else self.parent_session.cwd
 
         session = BobSession(config=config, cwd=agent_cwd, ephemeral=True)
         await session.start()
@@ -115,24 +190,20 @@ class ThreadManager:
         )
         self._agents[agent_id] = record
 
-        # Apply template tool restrictions
         if tmpl and tmpl.allowed_tools:
-            # Whittle the sub-agent registry down to allowed tools
             allowed = tmpl.allowed_tools
             all_names = list(session.tool_registry._tools.keys())
             for tname in all_names:
                 if tname not in allowed:
                     session.tool_registry.unregister(tname)
 
-        # Inject system prompt suffix if template specifies one
         if tmpl and tmpl.system_prompt_suffix:
             session._system_prompt = (
                 (session._system_prompt or "") + "\n\n" + tmpl.system_prompt_suffix
             )
 
-        # Inject prior memory snapshot for named agents
         if name:
-            prior = load_snapshot(name)
+            prior = load_snapshot(self.parent_session.session_id, name)
             if prior:
                 session._system_prompt = (
                     (session._system_prompt or "")
@@ -142,14 +213,13 @@ class ThreadManager:
         task_obj = asyncio.create_task(self._agent_worker(agent_id, task))
         record.task_ref = task_obj
         record.status = "running"
-
         return agent_id
 
     async def send_message(self, agent_id: str, message: str) -> str:
         """Submit a new user message to a running sub-agent."""
         record = self._get(agent_id)
-        from bob.protocol.ops import UserTurnOp
         from bob.protocol.items import TextUserInput
+        from bob.protocol.ops import UserTurnOp
         await record.session.submit(
             UserTurnOp(items=[TextUserInput(type="text", text=message)])
         )
@@ -197,14 +267,12 @@ class ThreadManager:
         return result
 
     async def shutdown_all(self) -> None:
-        """Close all agents — called on parent session shutdown."""
+        """Close all agents - called on parent session shutdown."""
         for agent_id in list(self._agents.keys()):
             try:
                 await self.close_agent(agent_id, reason="parent shutdown")
             except Exception:
                 pass
-
-    # ── Internal ───────────────────────────────────────────────────────────
 
     def _get(self, agent_id: str) -> AgentRecord:
         if agent_id not in self._agents:
@@ -222,6 +290,7 @@ class ThreadManager:
             """Emit a forwarded InfoEvent to the parent session."""
             from bob.protocol.events import Event, InfoEvent
             import asyncio as _as
+
             msg = InfoEvent(
                 type="info",
                 message=f"[{color}{short_id}{_RST}] {text}",
@@ -237,12 +306,15 @@ class ThreadManager:
                 pass
 
         try:
-            from bob.protocol.ops import UserTurnOp
-            from bob.protocol.items import TextUserInput
             from bob.protocol.events import (
-                TurnEndedEvent, SessionEndedEvent, TextDeltaEvent,
-                ErrorEvent, TurnInterruptedEvent,
+                ErrorEvent,
+                SessionEndedEvent,
+                TextDeltaEvent,
+                TurnEndedEvent,
+                TurnInterruptedEvent,
             )
+            from bob.protocol.items import TextUserInput
+            from bob.protocol.ops import UserTurnOp
 
             await session.submit(
                 UserTurnOp(items=[TextUserInput(type="text", text=task)])
@@ -257,11 +329,18 @@ class ThreadManager:
                 elif isinstance(msg, TurnEndedEvent):
                     record.result = "".join(text_buf)
                     record.status = "completed"
-                    _fwd(f"[done — {msg.output_tokens} tokens]")
-                    # Extract and persist memory snapshot for named agents
+                    _fwd(f"[done - {msg.output_tokens} tokens]")
                     if record.name and record.result:
+                        changed_files = list(getattr(session.analytics, "last_turn_changed_files", []) or [])
                         asyncio.ensure_future(
-                            _save_memory_snapshot(record.name, record.task, record.result)
+                            _save_memory_snapshot(
+                                session,
+                                self.parent_session.session_id,
+                                record.name,
+                                record.task,
+                                record.result,
+                                changed_files,
+                            )
                         )
                     break
                 elif isinstance(msg, (SessionEndedEvent, TurnInterruptedEvent)):
