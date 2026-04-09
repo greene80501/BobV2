@@ -587,6 +587,147 @@ class Interface:
         except Exception as exc:
             _p(f"  {_y('⚠')} Failed to save config: {exc}")
 
+    def _recent_session_rows(self, dim: str, bold: str, rst: str) -> list[str]:
+        """Return recent session lines for the welcome header."""
+        rows = [f"  {bold}Recent Activity{rst}"]
+        sessions = self._load_recent_sessions(limit=3)
+        if not sessions:
+            rows.append(f"  {dim}No recent sessions yet{rst}")
+            return rows
+
+        for session in sessions:
+            session_id = session["id"][:8]
+            name = session["name"]
+            when = self._format_header_timestamp(session["updated_at"])
+            if len(name) > 25:
+                name = name[:22] + "..."
+            rows.append(f"  {dim}• {session_id} - {name} ({when}){rst}")
+        return rows
+
+    def _load_recent_sessions(self, limit: int = 3) -> list[dict[str, str]]:
+        """Load recent sessions from the persisted session index."""
+        import sqlite3
+
+        db_path = self._session.bob_home / "state.sqlite"
+        if not db_path.exists():
+            return []
+
+        current_session_id = getattr(self._session, "session_id", "")
+        recent: list[dict[str, str]] = []
+
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT id, name, cwd, updated_at
+                    FROM threads
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit + 6,),
+                )
+                for row in cursor.fetchall():
+                    session_id = row["id"] or ""
+                    if not session_id or session_id == current_session_id:
+                        continue
+
+                    cwd = row["cwd"] or ""
+                    label = (row["name"] or "").strip()
+                    if not label:
+                        label = Path(cwd).name if cwd else "Untitled"
+
+                    recent.append(
+                        {
+                            "id": session_id,
+                            "name": label,
+                            "updated_at": row["updated_at"] or "",
+                        }
+                    )
+                    if len(recent) >= limit:
+                        break
+        except Exception:
+            return []
+
+        return recent
+
+    @staticmethod
+    def _format_header_timestamp(raw: str) -> str:
+        """Format ISO timestamps compactly for the startup header."""
+        if not raw:
+            return "unknown"
+
+        from datetime import datetime
+
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.strftime("%b %d, %H:%M")
+        except Exception:
+            return raw[:16]
+
+    def _build_header_mascot(self, center_width: int) -> tuple[list[str], str]:
+        """Return a width-appropriate Bob mascot and welcome line."""
+        rst = "\033[0m"
+        if self._config.no_color:
+            blue = cyan = white = dim = brand = ""
+        else:
+            blue = "\033[1;38;5;75m"
+            cyan = "\033[1;38;5;81m"
+            white = "\033[97m"
+            dim = "\033[2;37m"
+            brand = "\033[1;38;5;75m"
+
+        compact = [
+            (blue,  "      ▄████████▄"),
+            (blue,  "   ▄████████████▄"),
+            (blue,  "  ████▀ ▄▄▄▄ ▀████"),
+            (blue,  " ▐██   █    █   ██▌"),
+            (white, " ███    ●  ●    ███"),
+            (white, " ███      ▀      ███"),
+            (white, " ▐██    \\___/    ██▌"),
+            (cyan,  "  ▀███   </>   ███▀"),
+            (dim,   "    ▀██████████▀"),
+        ]
+
+        standard = [
+            (blue,  "        ▄████████████▄"),
+            (blue,  "     ▄████████████████▄"),
+            (blue,  "    █████▀  ▄▄▄▄  ▀█████"),
+            (blue,  "   ████    █    █    ████"),
+            (white, "  ▐███      ●  ●      ███▌"),
+            (white, "  ███        ▀        ███"),
+            (white, "  ███      \\___/      ███"),
+            (white, "  ▐███                ███▌"),
+            (cyan,  "   ████    ─</>─    ████"),
+            (dim,   "    ▀████▄▄▄▄▄▄▄▄████▀"),
+        ]
+
+        wide = [
+            (blue,  "         ▄██████████████▄"),
+            (blue,  "      ▄████████████████████▄"),
+            (blue,  "     █████▀▀    ▄▄▄▄    ▀▀█████"),
+            (blue,  "    ████      █    █      ████"),
+            (white, "   ▐███        ●  ●        ███▌"),
+            (white, "   ███           ▀           ███"),
+            (white, "   ███         \\___/         ███"),
+            (white, "   ▐███                     ███▌"),
+            (dim,   "    ████       ▄▄▄▄       ████"),
+            (cyan,  "     ████     │</>│     ████"),
+            (dim,   "      ▀████▄  │__│  ▄████▀"),
+            (blue,  "        ▀████▄▄▄▄▄▄████▀"),
+        ]
+
+        if center_width >= 34:
+            variant = wide
+        elif center_width >= 26:
+            variant = standard
+        else:
+            variant = compact
+
+        mascot = [f"{style}{line}{rst}" if style else line for style, line in variant]
+        welcome = f"{brand}Welcome to bob!{rst}" if brand else "Welcome to bob!"
+        return mascot, welcome
+
     # ── Header — Claude Code-style welcome panel ──────────────────────────────
 
     def _print_header(self) -> None:
@@ -601,17 +742,10 @@ class Interface:
         term_w = shutil.get_terminal_size((120, 24)).columns
         inner_w = term_w - 4 # excluding the very outer frame chars (│  │)
 
-        # Divvy up the columns.
-        # Mascot block requires ~30 inner chars minimum, 50 is safe
-        CENTER_W = 50
-        LEFT_W = 42 # sufficient for System info width
-        RIGHT_W = inner_w - LEFT_W - CENTER_W - 6 # accounting for two inner " │ " dividers 
-
         # ANSI helpers
         RST   = "\033[0m"
         DIM   = "\033[2m"
         BOLD  = "\033[1m"
-        BRAND = "" # monochrome
 
         def vlen(s: str) -> int:
             import re
@@ -627,20 +761,6 @@ class Interface:
         def rpad(s: str, w: int) -> str:
             v = vlen(s)
             return s if v >= w else s + " " * (w - v)
-
-        # Mascot (Unicode block chars, exact copy of bobart2.md, custom 10-line size)
-        mascot = [
-            f"{BRAND}⠀⠀⢀⣠⣴⣿⣿⣿⣷⣦⣀⠀⠀⠀{RST}",
-            f"{BRAND}⠀⢠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣦⠀⠀{RST}",
-            f"{BRAND}⢀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣇⡀{RST}",
-            f"{BRAND}⣻⣿⠿⢿⣿⠿⠿⠿⢿⣿⠿⢷⣾⡃{RST}",
-            f"{BRAND}⣿⣿⠀⢿⣿⡇⠀⠐⣿⣿⠆⢸⣿⡇{RST}",
-            f"{BRAND}⠉⢻⣄⣀⣀⣒⣶⣖⣂⣀⣀⣼⠋⠁{RST}",
-            f"{BRAND}⠀⢠⡞⢿⡟⠛⣛⡛⠛⣿⡟⣶⠀⠀{RST}",
-            f"{BRAND}⠀⣸⣧⣼⣷⡺⠿⠽⣢⣿⣧⣼⡀⠀{RST}",
-            f"{BRAND}⢰⣯⣤⣬⣯⡙⠛⠛⣹⣯⣤⣬⣷⠀{RST}",
-            f"{BRAND}⠀⠀⣾⣿⣿⣿⡆⣾⣿⣿⣿⡆⠀⠀{RST}",
-        ]
 
         import os
         import pathlib
@@ -670,41 +790,7 @@ class Interface:
         ]
 
         # Right Column: Recent Activity & Commands
-        right_rows = [
-            f"  {BOLD}Recent Activity{RST}",
-        ]
-        
-        # Query recent sessions from analytics DB
-        try:
-            from bob.analytics.db import get_analytics_db
-            db = get_analytics_db()
-            recent_sessions = db.get_recent_sessions(limit=3)
-            
-            if recent_sessions:
-                for session in recent_sessions:
-                    session_id = session.get('session_id', 'unknown')[:8]
-                    timestamp = session.get('created_at', '')
-                    # Format timestamp nicely
-                    if timestamp:
-                        from datetime import datetime
-                        try:
-                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            time_str = dt.strftime('%b %d, %H:%M')
-                        except Exception:
-                            time_str = timestamp[:16]
-                    else:
-                        time_str = 'unknown'
-                    
-                    thread_name = session.get('thread_name', 'Untitled')
-                    if len(thread_name) > 25:
-                        thread_name = thread_name[:22] + "..."
-                    
-                    right_rows.append(f"  {DIM}• {session_id} - {thread_name} ({time_str}){RST}")
-            else:
-                right_rows.append(f"  {DIM}No recent sessions{RST}")
-        except Exception:
-            right_rows.append(f"  {DIM}No recent activity{RST}")
-        
+        right_rows = self._recent_session_rows(DIM, BOLD, RST)
         right_rows.extend([
             "",
             f"  {BOLD}Quick Commands{RST}",
@@ -713,14 +799,42 @@ class Interface:
             f"  {DIM}• /new    - Start fresh session{RST}",
         ])
 
+        mascot_center_w = max(20, min(inner_w, 40))
+        mascot, welcome_line = self._build_header_mascot(mascot_center_w)
+
+        if term_w < 100:
+            body_rows = [
+                center(welcome_line, inner_w),
+                "",
+            ] + [center(row, inner_w) for row in mascot] + [
+                "",
+            ] + left_rows[1:-1] + [
+                "",
+            ] + right_rows
+
+            title  = f"bob v{bob_version}"
+            ndash  = max(0, term_w - 5 - len(title) - 2)
+            top    = f"╭─── {title} {'─' * ndash}╮"
+            bot    = "╰" + "─" * (term_w - 2) + "╯"
+
+            import sys
+            out = sys.__stdout__
+            out.write("\n" + top + "\n")
+            for row in body_rows:
+                out.write(f"│ {rpad(row, inner_w)} │\n")
+            out.write(bot + "\n\n")
+            out.flush()
+            return
+
         # Divvy up the columns dynamically based on actual content lengths!
         LEFT_W = max([vlen(l) for l in left_rows])
         RIGHT_W = max([vlen(r) for r in right_rows])
-        CENTER_W = inner_w - LEFT_W - RIGHT_W - 6 # accounting for two inner "   " dividers 
+        CENTER_W = max(20, inner_w - LEFT_W - RIGHT_W - 6) # accounting for two inner "   " dividers
+        mascot, welcome_line = self._build_header_mascot(CENTER_W)
 
         # Center Column: Mascot and Welcome
         center_rows = [
-            center(f"{BRAND}Welcome to bob!{RST}", CENTER_W),
+            center(welcome_line, CENTER_W),
             "",
         ] + [center(row, CENTER_W) for row in mascot]
 
