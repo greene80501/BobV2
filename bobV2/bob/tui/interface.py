@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from prompt_toolkit import PromptSession, print_formatted_text
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory, InMemoryHistory
@@ -762,6 +763,69 @@ class _SlashCompleter(Completer):
                 )
         except Exception:
             pass
+
+
+class _ModelPickerCompleter(Completer):
+    """Searchable completion menu for the interactive /model picker."""
+
+    def __init__(self, models: list[dict], current_model: str):
+        self._models = models
+        self._current_model = current_model
+
+    def get_completions(self, document, complete_event):
+        query = document.text_before_cursor.strip().lower()
+        start_position = -len(document.text_before_cursor)
+
+        for model in self._filter_models(query):
+            model_id = model["model_id"]
+            provider = model.get("provider") or ""
+            family = model.get("family") or ""
+            ctx = model.get("context_window")
+            ctx_str = f"{ctx // 1000}K" if ctx else ""
+            inp = model.get("input_price_per_1m")
+            out = model.get("output_price_per_1m")
+            price = (
+                f"${inp:.2f}/${out:.2f}"
+                if inp is not None and out is not None
+                else ""
+            )
+            current = "current" if model_id == self._current_model else ""
+            meta = "  ".join(
+                part for part in (provider, family, ctx_str, price, current) if part
+            )
+            display = f"{model_id}  *" if model_id == self._current_model else model_id
+            yield Completion(
+                model_id,
+                start_position=start_position,
+                display=display,
+                display_meta=meta,
+            )
+
+    def _filter_models(self, query: str) -> list[dict]:
+        if not query:
+            return self._models
+
+        matches: list[tuple[int, str, dict]] = []
+        for model in self._models:
+            haystacks = [
+                model.get("model_id", ""),
+                model.get("provider", ""),
+                model.get("family", ""),
+                model.get("display_name", ""),
+            ]
+            score = 99
+            matched = False
+            for field in haystacks:
+                text = str(field or "").lower()
+                idx = text.find(query)
+                if idx != -1:
+                    matched = True
+                    score = min(score, idx)
+            if matched:
+                matches.append((score, model.get("model_id", ""), model))
+
+        matches.sort(key=lambda row: (row[0], row[1]))
+        return [row[2] for row in matches]
     
     def _complete_filename(self, prefix: str):
         """Yield filename completions for @filename syntax."""
@@ -3018,6 +3082,143 @@ class Interface:
             _p(f"  {_g('✓')} Model set to: {_b(chosen)}{_d(ctx_s + pr_s)}")
         else:
             _p(f"  {_g('✓')} Model set to: {_b(chosen)}")
+
+    async def _load_model_picker_models(self) -> list[dict]:
+        """Return model metadata for the interactive picker."""
+        from bob.llm.catalog import get_catalog
+
+        catalog = get_catalog()
+        if catalog.is_populated():
+            return catalog.list_models(status="active")
+
+        try:
+            listed = await self._session.client.list_models()
+        except Exception:
+            listed = []
+
+        return [{"model_id": model_id} for model_id in listed]
+
+    def _apply_selected_model(self, model_name: str) -> None:
+        """Keep the visible config and session runtime model in sync."""
+        self._config = self._config.model_copy(update={"model": model_name})
+        self._session.config = self._session.config.model_copy(update={"model": model_name})
+        self._session.client = self._session._make_client(model_name)
+
+    async def _handle_model_picker(self, search: str) -> None:
+        """Interactive /model picker with immediate searchable dropdown."""
+        from bob.llm.catalog import get_catalog
+
+        catalog = get_catalog()
+        current = self._config.model
+        models = await self._load_model_picker_models()
+
+        if not models:
+            if search:
+                self._apply_selected_model(search)
+                _p(f"  {_g('OK')} Model set to: {_b(search)}")
+            else:
+                _p(f"  current model: {_b(current)}")
+                _p(f"  {_d('No model catalog available and the provider did not return a model list.')}")
+                _p(f"  {_d('You can still set a model manually with: /model <name>')}")
+            return
+
+        completer = _ModelPickerCompleter(models=models, current_model=current)
+        kb = KeyBindings()
+
+        @kb.add(Keys.Down)
+        def _(event):
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.complete_next()
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add(Keys.Up)
+        def _(event):
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.complete_previous()
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add(Keys.Tab)
+        def _(event):
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.complete_next()
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add(Keys.ControlN)
+        def _(event):
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.complete_next()
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add(Keys.ControlP)
+        def _(event):
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.complete_previous()
+            else:
+                buf.start_completion(select_first=True)
+
+        @kb.add(Keys.Enter)
+        def _(event):
+            buf = event.current_buffer
+            state = buf.complete_state
+            text = buf.text.strip()
+            if state and state.completions and (state.current_completion is not None or text):
+                completion = state.current_completion or state.completions[0]
+                buf.apply_completion(completion)
+            buf.validate_and_handle()
+
+        ps = PromptSession(
+            completer=completer,
+            complete_while_typing=True,
+            complete_in_thread=True,
+            complete_style="MULTI_COLUMN",
+            key_bindings=kb,
+            history=InMemoryHistory(),
+        )
+
+        _p()
+        _p(f"  {_d('Model picker: type to filter, use Up/Down, Enter to select, empty Enter to cancel.')}")
+        _p(f"  {_d(f'Current model: {current}')}")
+
+        try:
+            raw = await ps.prompt_async(
+                ANSI(f"  {_c('model')} {_cb('>')} "),
+                default=search,
+                pre_run=lambda: get_app().current_buffer.start_completion(select_first=False),
+            )
+            chosen = raw.strip()
+        except (KeyboardInterrupt, EOFError):
+            _p(f"  {_d('cancelled')}")
+            return
+
+        if not chosen:
+            _p(f"  {_d('cancelled')}")
+            return
+
+        self._apply_selected_model(chosen)
+
+        info = catalog.get_model(chosen) if catalog.is_populated() else None
+        if info:
+            ctx = info.get("context_window")
+            inp = info.get("input_price_per_1m")
+            out = info.get("output_price_per_1m")
+            ctx_s = f"  context: {ctx // 1000}K" if ctx else ""
+            pr_s = (
+                f"  ${inp:.2f}/${out:.2f} per 1M"
+                if inp is not None and out is not None
+                else ""
+            )
+            _p(f"  {_g('OK')} Model set to: {_b(chosen)}{_d(ctx_s + pr_s)}")
+        else:
+            _p(f"  {_g('OK')} Model set to: {_b(chosen)}")
 
     async def run(self) -> None:  # noqa: C901
         completer = _SlashCompleter()
