@@ -1,49 +1,29 @@
 """LiteLLM-based multi-provider async streaming client for Bob.
 
 Drop-in replacement for bob.client.openai_client.BobClient.
-
-Key differences from the old client:
-- Uses litellm.acompletion() instead of the OpenAI Responses API.
-- Supports 100+ providers by changing config.model (e.g. "anthropic/claude-3-5-sonnet").
-- Converts Bob's internal Responses-API history format → Chat Completions
-  messages internally, so turn.py needs no changes.
-- Yields the exact same typed events: TextDeltaEvent, ToolCallEvent,
-  ReasoningDeltaEvent, CompletedEvent, StreamErrorEvent.
-
-Re-exports those event types so existing imports from openai_client still work:
-
-    from bob.llm.client import (
-        TextDeltaEvent, ToolCallEvent, ReasoningDeltaEvent,
-        CompletedEvent, StreamErrorEvent, LiteLLMClient,
-    )
 """
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import json
 import logging
+import os
 from typing import Any, AsyncIterator, Optional, Union
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Typed events — identical to those in openai_client.py so turn.py is
-# unaffected. We simply re-define them here; session.py points at this module.
-# ---------------------------------------------------------------------------
-
-from dataclasses import dataclass
+_ENV_OVERRIDE_LOCK: asyncio.Lock | None = None
 
 
 @dataclass
 class TextDeltaEvent:
-    """A streaming text chunk from the model."""
     delta: str
 
 
 @dataclass
 class ToolCallEvent:
-    """A fully-assembled tool call (emitted once complete)."""
     id: str
     name: str
     input: dict[str, Any]
@@ -51,13 +31,11 @@ class ToolCallEvent:
 
 @dataclass
 class ReasoningDeltaEvent:
-    """A streaming reasoning/thinking token."""
     delta: str
 
 
 @dataclass
 class CompletedEvent:
-    """Emitted once the full response is done. Carries token usage."""
     input_tokens: int
     output_tokens: int
     total_tokens: int
@@ -66,45 +44,62 @@ class CompletedEvent:
 
 @dataclass
 class StreamErrorEvent:
-    """Emitted when a (possibly-transient) error occurs during streaming."""
     message: str
     retry_count: int
 
 
-# ---------------------------------------------------------------------------
-# History format conversion: Responses API → Chat Completions
-# ---------------------------------------------------------------------------
+def _get_env_override_lock() -> asyncio.Lock:
+    global _ENV_OVERRIDE_LOCK
+    if _ENV_OVERRIDE_LOCK is None:
+        _ENV_OVERRIDE_LOCK = asyncio.Lock()
+    return _ENV_OVERRIDE_LOCK
 
-def _to_chat_messages(instructions: str, items: list[dict], model: str = "", enable_caching: bool = True) -> list[dict]:
-    """Convert Bob's Responses-API history items to Chat Completions messages.
 
-    Bob stores history in OpenAI Responses API shape:
-        {"role": "user",      "content": [{"type": "input_text", "text": "…"}]}
-        {"role": "assistant", "content": [{"type": "output_text", "text": "…"}]}
-        {"type": "function_call",        "call_id": "…", "name": "…", "arguments": "…"}
-        {"type": "function_call_output", "call_id": "…", "output": "…"}
+@asynccontextmanager
+async def _temporary_env(overrides: dict[str, str]):
+    if not overrides:
+        yield
+        return
 
-    This converts to OpenAI Chat Completions shape that LiteLLM accepts:
-        {"role": "system",    "content": "…"}
-        {"role": "user",      "content": "…"}
-        {"role": "assistant", "content": "…", "tool_calls": […]}   ← merged
-        {"role": "tool",      "tool_call_id": "…", "content": "…"}
-    """
+    lock = _get_env_override_lock()
+    async with lock:
+        previous: dict[str, str | None] = {}
+        try:
+            for key, value in overrides.items():
+                previous[key] = os.environ.get(key)
+                os.environ[key] = value
+            yield
+        finally:
+            for key, old_value in previous.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+
+def _to_chat_messages(
+    instructions: str,
+    items: list[dict],
+    model: str = "",
+    enable_caching: bool = False,
+) -> list[dict]:
+    """Convert Bob's Responses-style history into chat-completions messages."""
     messages: list[dict] = []
     if instructions:
-        # Add cache_control for Anthropic models to reduce costs 70-90%
         is_anthropic = "claude" in model.lower()
         if is_anthropic and enable_caching:
-            messages.append({
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": instructions,
-                        "cache_control": {"type": "ephemeral"}
-                    }
-                ]
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": instructions,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            )
         else:
             messages.append({"role": "system", "content": instructions})
 
@@ -114,7 +109,6 @@ def _to_chat_messages(instructions: str, items: list[dict], model: str = "", ena
         role = item.get("role", "")
         itype = item.get("type", "")
 
-        # ── User message ─────────────────────────────────────────────────
         if role == "user":
             content = item.get("content", [])
             if isinstance(content, list):
@@ -125,128 +119,132 @@ def _to_chat_messages(instructions: str, items: list[dict], model: str = "", ena
                         if c.get("type") == "input_text":
                             parts.append({"type": "text", "text": c.get("text", "")})
                         elif c.get("type") == "input_image":
-                            parts.append({
-                                "type": "image_url",
-                                "image_url": {"url": c.get("image_url", "")},
-                            })
+                            parts.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": c.get("image_url", "")},
+                                }
+                            )
                     messages.append({"role": "user", "content": parts})
                 else:
                     text = "\n".join(
-                        c.get("text", "") for c in content
+                        c.get("text", "")
+                        for c in content
                         if c.get("type") == "input_text"
                     )
                     messages.append({"role": "user", "content": text})
             else:
                 messages.append({"role": "user", "content": str(content or "")})
             i += 1
+            continue
 
-        # ── Assistant text message — look ahead for tool calls ───────────
-        elif role == "assistant":
+        if role == "assistant":
             content_list = item.get("content", [])
             if isinstance(content_list, list):
                 text = "\n".join(
-                    c.get("text", "") for c in content_list
+                    c.get("text", "")
+                    for c in content_list
                     if c.get("type") == "output_text"
                 )
             else:
                 text = str(content_list or "")
 
-            # Greedily consume consecutive function_call items that belong
-            # to this same model response.
             tool_calls: list[dict] = []
             j = i + 1
             while j < len(items) and items[j].get("type") == "function_call":
                 fc = items[j]
-                tool_calls.append({
-                    "id": fc["call_id"],
-                    "type": "function",
-                    "function": {
-                        "name": fc["name"],
-                        "arguments": fc.get("arguments", "{}"),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": fc["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": fc["name"],
+                            "arguments": fc.get("arguments", "{}"),
+                        },
+                    }
+                )
                 j += 1
 
             if tool_calls:
-                msg: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": text or None,
-                    "tool_calls": tool_calls,
-                }
-                messages.append(msg)
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": text or None,
+                        "tool_calls": tool_calls,
+                    }
+                )
                 i = j
             else:
                 messages.append({"role": "assistant", "content": text})
                 i += 1
+            continue
 
-        # ── Orphaned function_call (no preceding assistant text) ─────────
-        elif itype == "function_call":
+        if itype == "function_call":
             tool_calls = []
             while i < len(items) and items[i].get("type") == "function_call":
                 fc = items[i]
-                tool_calls.append({
-                    "id": fc["call_id"],
-                    "type": "function",
-                    "function": {
-                        "name": fc["name"],
-                        "arguments": fc.get("arguments", "{}"),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": fc["call_id"],
+                        "type": "function",
+                        "function": {
+                            "name": fc["name"],
+                            "arguments": fc.get("arguments", "{}"),
+                        },
+                    }
+                )
                 i += 1
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": tool_calls,
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls,
+                }
+            )
+            continue
 
-        # ── Tool result ───────────────────────────────────────────────────
-        elif itype == "function_call_output":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": item["call_id"],
-                "content": str(item.get("output", "")),
-            })
+        if itype == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item["call_id"],
+                    "content": str(item.get("output", "")),
+                }
+            )
             i += 1
+            continue
 
-        else:
-            i += 1  # skip unknown items
+        i += 1
 
     return messages
 
 
-# ---------------------------------------------------------------------------
-# LiteLLMClient
-# ---------------------------------------------------------------------------
-
 class LiteLLMClient:
-    """Multi-provider LLM client backed by LiteLLM.
-
-    Accepts the same stream_turn() signature as BobClient and yields the
-    same typed events so bob/core/turn.py requires no changes.
-    """
+    """Multi-provider LLM client backed by LiteLLM."""
 
     def __init__(
         self,
         api_key: str = "",
         model: str = "gpt-4o",
         base_url: Optional[str] = None,
+        provider_kwargs: Optional[dict[str, Any]] = None,
+        env_overrides: Optional[dict[str, str]] = None,
     ) -> None:
         self.model = model
         self._api_key = api_key
         self._base_url = base_url
+        self._provider_kwargs = dict(provider_kwargs or {})
+        self._env_overrides = dict(env_overrides or {})
         self._configure_litellm()
 
     def _configure_litellm(self) -> None:
         try:
             import litellm
-            litellm.drop_params = True       # silently ignore unsupported params
+
+            litellm.drop_params = True
             litellm.suppress_debug_info = True
         except ImportError:
             pass
-
-    # ------------------------------------------------------------------
-    # Public API — identical signature to BobClient.stream_turn()
-    # ------------------------------------------------------------------
 
     def stream_turn(
         self,
@@ -277,10 +275,6 @@ class LiteLLMClient:
             extra_params=extra_params or {},
         )
 
-    # ------------------------------------------------------------------
-    # Retry wrapper
-    # ------------------------------------------------------------------
-
     async def _stream_with_retry(
         self,
         *,
@@ -307,21 +301,28 @@ class LiteLLMClient:
                 ):
                     yield ev
                 return
-
             except Exception as exc:
-                # Classify as transient or fatal
                 exc_name = type(exc).__name__.lower()
-                is_transient = any(k in exc_name for k in (
-                    "ratelimit", "connection", "timeout", "serviceunavailable",
-                    "overloaded", "apierror",
-                ))
-
+                is_transient = any(
+                    key in exc_name
+                    for key in (
+                        "ratelimit",
+                        "connection",
+                        "timeout",
+                        "serviceunavailable",
+                        "overloaded",
+                        "apierror",
+                    )
+                )
                 if is_transient and retry_count < max_retries:
                     retry_count += 1
                     delay = base_delay * (2 ** (retry_count - 1))
                     logger.warning(
                         "Transient error (attempt %d/%d), retrying in %.1fs: %s",
-                        retry_count, max_retries, delay, exc,
+                        retry_count,
+                        max_retries,
+                        delay,
+                        exc,
                     )
                     yield StreamErrorEvent(
                         message=f"Retrying ({retry_count}/{max_retries}): {exc}",
@@ -329,15 +330,8 @@ class LiteLLMClient:
                     )
                     await asyncio.sleep(delay)
                 else:
-                    yield StreamErrorEvent(
-                        message=str(exc),
-                        retry_count=retry_count,
-                    )
+                    yield StreamErrorEvent(message=str(exc), retry_count=retry_count)
                     return
-
-    # ------------------------------------------------------------------
-    # Single streaming attempt
-    # ------------------------------------------------------------------
 
     async def _stream_once(
         self,
@@ -358,9 +352,13 @@ class LiteLLMClient:
             )
             raise StopAsyncIteration from exc
 
-        # Enable prompt caching for Anthropic models (70-90% cost reduction)
-        enable_caching = extra_params.get("prompt_caching", True)
-        messages = _to_chat_messages(instructions, input, model=self.model, enable_caching=enable_caching)
+        enable_caching = bool(extra_params.get("prompt_caching", False))
+        messages = _to_chat_messages(
+            instructions,
+            input,
+            model=self.model,
+            enable_caching=enable_caching,
+        )
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -369,8 +367,6 @@ class LiteLLMClient:
             "temperature": temperature,
             **extra_params,
         }
-
-        # Optional params
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -380,78 +376,74 @@ class LiteLLMClient:
             kwargs["base_url"] = self._base_url
         if self._api_key:
             kwargs["api_key"] = self._api_key
-
-        # Request usage in the final streaming chunk (OpenAI + some others)
+        kwargs.update(self._provider_kwargs)
         kwargs["stream_options"] = {"include_usage": True}
 
-        # ── Accumulate tool-call fragments by index ─────────────────────
-        # { index: {"id": str, "name": str, "args": str} }
         tool_buffers: dict[int, dict[str, str]] = {}
         final_usage: Any = None
 
-        response = await litellm.acompletion(**kwargs)
+        async with _temporary_env(self._env_overrides):
+            response = await litellm.acompletion(**kwargs)
 
-        async for chunk in response:
-            # Some providers send a usage-only final chunk with no choices
-            if not getattr(chunk, "choices", None):
-                u = getattr(chunk, "usage", None)
-                if u:
-                    final_usage = u
-                continue
+            async for chunk in response:
+                if not getattr(chunk, "choices", None):
+                    usage = getattr(chunk, "usage", None)
+                    if usage:
+                        final_usage = usage
+                    continue
 
-            choice = chunk.choices[0]
-            delta = getattr(choice, "delta", None)
-            finish_reason = getattr(choice, "finish_reason", None)
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
 
-            if delta is None:
-                continue
+                content = getattr(delta, "content", None)
+                if content:
+                    yield TextDeltaEvent(delta=content)
 
-            # ── Text delta ───────────────────────────────────────────────
-            content = getattr(delta, "content", None)
-            if content:
-                yield TextDeltaEvent(delta=content)
+                thinking = getattr(delta, "thinking", None)
+                if thinking:
+                    yield ReasoningDeltaEvent(delta=thinking)
 
-            # ── Reasoning / thinking (Anthropic extended thinking) ───────
-            thinking = getattr(delta, "thinking", None)
-            if thinking:
-                yield ReasoningDeltaEvent(delta=thinking)
+                tc_deltas = getattr(delta, "tool_calls", None)
+                if tc_deltas:
+                    for tc in tc_deltas:
+                        idx = int(getattr(tc, "index", 0) or 0)
+                        if idx not in tool_buffers:
+                            tool_buffers[idx] = {"id": "", "name": "", "args": ""}
+                        buf = tool_buffers[idx]
+                        if getattr(tc, "id", None):
+                            buf["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn:
+                            fn_name = getattr(fn, "name", None)
+                            fn_args = getattr(fn, "arguments", None)
+                            if fn_name:
+                                buf["name"] += fn_name
+                            if fn_args:
+                                buf["args"] += fn_args
 
-            # ── Tool-call deltas ─────────────────────────────────────────
-            tc_deltas = getattr(delta, "tool_calls", None)
-            if tc_deltas:
-                for tc in tc_deltas:
-                    idx: int = getattr(tc, "index", 0)
-                    if idx not in tool_buffers:
-                        tool_buffers[idx] = {"id": "", "name": "", "args": ""}
-                    buf = tool_buffers[idx]
-                    if getattr(tc, "id", None):
-                        buf["id"] = tc.id
-                    fn = getattr(tc, "function", None)
-                    if fn:
-                        fn_name = getattr(fn, "name", None)
-                        fn_args = getattr(fn, "arguments", None)
-                        if fn_name:
-                            buf["name"] += fn_name
-                        if fn_args:
-                            buf["args"] += fn_args
+                usage = getattr(chunk, "usage", None)
+                if usage and (
+                    getattr(usage, "prompt_tokens", None)
+                    or getattr(usage, "total_tokens", None)
+                ):
+                    final_usage = usage
 
-            # ── Capture usage when it arrives in-stream ──────────────────
-            u = getattr(chunk, "usage", None)
-            if u and (getattr(u, "prompt_tokens", None) or getattr(u, "total_tokens", None)):
-                final_usage = u
-
-        # ── After stream ends: emit completed tool calls ─────────────────
         for idx in sorted(tool_buffers):
             buf = tool_buffers[idx]
             raw_args = buf["args"]
             try:
                 parsed: dict[str, Any] = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
-                logger.warning("Failed to parse tool args for %r: %r", buf["name"], raw_args)
+                logger.warning(
+                    "Failed to parse tool args for %r: %r",
+                    buf["name"],
+                    raw_args,
+                )
                 parsed = {"_raw": raw_args}
             yield ToolCallEvent(id=buf["id"], name=buf["name"], input=parsed)
 
-        # ── Emit usage ────────────────────────────────────────────────────
         if final_usage is not None:
             yield CompletedEvent(
                 input_tokens=int(getattr(final_usage, "prompt_tokens", 0) or 0),
@@ -459,24 +451,19 @@ class LiteLLMClient:
                 total_tokens=int(getattr(final_usage, "total_tokens", 0) or 0),
             )
         else:
-            # Provider didn't return usage — emit zeros so callers don't break
             yield CompletedEvent(input_tokens=0, output_tokens=0, total_tokens=0)
 
-    # ------------------------------------------------------------------
-    # Utility methods (mirror BobClient API)
-    # ------------------------------------------------------------------
-
     async def list_models(self) -> list[str]:
-        """Return available model IDs (best-effort — not all providers support this)."""
         try:
             import litellm
+
             models = litellm.model_list or []
             return sorted(str(m) for m in models)
         except Exception:
             return []
 
     async def close(self) -> None:
-        """No-op — LiteLLM uses per-request httpx clients."""
+        return None
 
     async def __aenter__(self) -> "LiteLLMClient":
         return self

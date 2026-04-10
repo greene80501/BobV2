@@ -1,13 +1,13 @@
 # bob - Your AI-Powered Development Partner
 
-bob is a Python-based AI coding assistant that runs directly in your terminal. It uses OpenAI's `gpt-5.1-codex-mini` model via the Responses API.
+bob is a Python-based AI coding assistant that runs directly in your terminal. It supports native OpenAI Responses models plus multi-provider models through LiteLLM, including OpenAI, Anthropic, Gemini, Vertex AI, Azure, OpenRouter, Groq, Mistral, Cohere, Together AI, xAI, Ollama, and catalog-backed providers.
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- An OpenAI API key
+- At least one provider credential for the model you want to use
 
 ---
 
@@ -27,24 +27,32 @@ pip install -e .
 
 ---
 
-## Set your API key
+## Set provider credentials
 
-**PowerShell** (recommended):
+Examples:
+
+**OpenAI**
 ```powershell
-$env:OPENAI_API_KEY = "sk-proj-"
+$env:OPENAI_API_KEY = "sk-proj-..."
 ```
 
-**cmd.exe**:
-```
-set OPENAI_API_KEY=sk-proj-...
-```
-
-**bash / zsh**:
-```bash
-export OPENAI_API_KEY=sk-proj-...
+**Anthropic**
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
 ```
 
-To set it permanently, add it to your PowerShell profile or System Environment Variables.
+**Gemini (Google AI Studio)**
+```powershell
+$env:GEMINI_API_KEY = "..."
+```
+
+**Gemini via Vertex AI**
+```powershell
+$env:VERTEXAI_LOCATION = "us-central1"
+$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\service-account.json"
+```
+
+You can also put provider-specific settings in `~/.bob/config.toml`.
 
 ---
 
@@ -133,7 +141,19 @@ When bob wants to run a shell command, it will ask:
 Create `~/.bob/config.toml` to set defaults:
 
 ```toml
-api_key = "sk-<your-key-here>"          # avoids needing the env var
 model = "gpt-5.1-codex-mini"
 ask_for_approval = "unless-trusted"   # never | unless-trusted | on-request
+
+[providers.openai]
+api_key = "sk-..."
+
+[providers.anthropic]
+api_key = "sk-ant-..."
+
+[providers.gemini]
+api_key = "..."
+
+[providers.vertex_ai]
+location = "us-central1"
+credentials_path = "C:\\path\\to\\service-account.json"
 ```

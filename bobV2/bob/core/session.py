@@ -81,14 +81,9 @@ class BobSession:
         from bob.core.context_manager import ContextManager
         self.context_manager = ContextManager()
 
-        # Resolve API key: prefer config.api_key, then common env vars.
-        api_key = (
-            config.api_key
-            or os.environ.get("OPENAI_API_KEY", "")
-            or os.environ.get("ANTHROPIC_API_KEY", "")
-            or os.environ.get("BOB_API_KEY", "")
-        )
-        self._api_key = api_key
+        self._api_key = ""
+        self._model_compatibility = None
+        self._provider_auth = None
         self.client = self._make_client(config.model)
 
         # Analytics: per-turn token/cost/latency tracking
@@ -439,15 +434,41 @@ class BobSession:
 
     # Models that only work with OpenAI's Responses API (not Chat Completions).
     # LiteLLM routes to /v1/chat/completions; these must go through BobClient.
-    _RESPONSES_API_MODELS: frozenset[str] = frozenset({
-        "gpt-5.1-codex-mini",
-        "codex-mini-latest",
-    })
+    def get_model_runtime(self, model: Optional[str] = None):
+        from bob.llm.compatibility import get_model_compatibility, resolve_provider_auth
 
-    def _make_client(self, model: str):
-        """Return BobClient for Responses-API-only models, LiteLLMClient for everything else."""
+        selected_model = model or self.config.model
+        compatibility = get_model_compatibility(selected_model)
+        provider_auth = resolve_provider_auth(
+            selected_model,
+            self.config,
+            compatibility=compatibility,
+        )
+        return compatibility, provider_auth
+
+    def describe_model_runtime(self, model: Optional[str] = None) -> dict[str, Any]:
+        compatibility, provider_auth = self.get_model_runtime(model)
+        return {
+            "requested_model": compatibility.requested_model,
+            "canonical_model": compatibility.canonical_model,
+            "bare_model": compatibility.bare_model,
+            "provider": compatibility.provider,
+            "route": compatibility.route.value,
+            "support_level": compatibility.support_level.value,
+            "supports_reasoning_effort": compatibility.supports_reasoning_effort,
+            "supports_thinking_budget": compatibility.supports_thinking_budget,
+            "supports_prompt_caching": compatibility.supports_prompt_caching,
+            "supports_vision": compatibility.supports_vision,
+            "supports_service_tier": compatibility.supports_service_tier,
+            "missing_auth": list(provider_auth.missing),
+            "used_global_fallback": provider_auth.used_global_fallback,
+            "notes": list(compatibility.notes),
+        }
+
+    def _unused_make_client_legacy(self, model: str):
+        """Return the right client for the selected model and provider."""
         bare = model.split("/")[-1]  # strip provider prefix e.g. "openai/gpt-4o" → "gpt-4o"
-        if bare in self._RESPONSES_API_MODELS or model in self._RESPONSES_API_MODELS:
+        if True:
             from bob.client.openai_client import BobClient
             kwargs: dict = {"api_key": self._api_key, "model": bare}
             if self.config.base_url:
@@ -488,7 +509,7 @@ class BobSession:
             )
         ))
 
-    async def _prewarm_connection(self) -> None:
+    async def _unused_prewarm_connection_legacy(self) -> None:
         """Send a minimal request to warm the TCP+TLS connection before the user types."""
         try:
             base_url = self.config.base_url.rstrip("/")
@@ -504,6 +525,59 @@ class BobSession:
             urllib.request.urlopen(req, timeout=3)
         except Exception:
             pass  # Best-effort; never block the session
+
+    def _make_client(self, model: str):
+        """Return the right client for the selected model and provider."""
+        from bob.llm.compatibility import ClientRoute
+
+        compatibility, provider_auth = self.get_model_runtime(model)
+        self._model_compatibility = compatibility
+        self._provider_auth = provider_auth
+        self._api_key = provider_auth.api_key
+
+        if compatibility.route == ClientRoute.OPENAI_RESPONSES:
+            from bob.client.openai_client import BobClient
+
+            kwargs: dict[str, Any] = {
+                "api_key": provider_auth.api_key,
+                "model": compatibility.canonical_model,
+            }
+            if provider_auth.base_url:
+                kwargs["base_url"] = provider_auth.base_url
+            return BobClient(**kwargs)
+
+        from bob.llm.client import LiteLLMClient
+
+        return LiteLLMClient(
+            api_key=provider_auth.api_key,
+            model=compatibility.canonical_model,
+            base_url=provider_auth.base_url,
+            provider_kwargs=provider_auth.provider_kwargs,
+            env_overrides=provider_auth.env_overrides,
+        )
+
+    async def _prewarm_connection(self) -> None:
+        """Warm the connection for the active provider when it is safe to do so."""
+        try:
+            compatibility, provider_auth = self.get_model_runtime(self.config.model)
+            if compatibility.route.value != "openai_responses":
+                return
+            if not provider_auth.base_url or not provider_auth.api_key:
+                return
+
+            base_url = provider_auth.base_url.rstrip("/")
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"{base_url}/models",
+                headers={
+                    "Authorization": f"Bearer {provider_auth.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
 
     async def _setup_persistence(self) -> None:
         if self.ephemeral:

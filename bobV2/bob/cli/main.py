@@ -26,16 +26,6 @@ app = typer.Typer(
     no_args_is_help=False,
     invoke_without_command=True,
 )
-
-
-def _get_api_key() -> str:
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if not key:
-        typer.echo("Error: OPENAI_API_KEY environment variable not set.", err=True)
-        raise typer.Exit(1)
-    return key
-
-
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,

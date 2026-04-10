@@ -196,17 +196,23 @@ class AnalyticsTracker:
 # ---------------------------------------------------------------------------
 
 def _infer_provider(model: str) -> Optional[str]:
-    m = model.lower()
-    if "/" in m:
-        return m.split("/")[0]
-    if m.startswith(("gpt-", "o1", "o3", "o4", "text-")):
-        return "openai"
-    if m.startswith("claude-"):
-        return "anthropic"
-    if m.startswith("gemini-"):
-        return "google"
-    if m.startswith(("kimi-", "moonshot-")):
-        return "moonshot"
-    if m.startswith("glm-"):
-        return "glm"
-    return None
+    try:
+        from bob.llm.compatibility import infer_provider, resolve_catalog_provider
+
+        provider = infer_provider(model, catalog_provider=resolve_catalog_provider(model))
+        return None if provider == "unknown" else provider
+    except Exception:
+        m = model.lower()
+        if "/" in m:
+            return m.split("/")[0]
+        if m.startswith(("gpt-", "o1", "o3", "o4", "text-")):
+            return "openai"
+        if m.startswith("claude-"):
+            return "anthropic"
+        if m.startswith("gemini-"):
+            return "gemini"
+        if m.startswith(("kimi-", "moonshot-")):
+            return "moonshot"
+        if m.startswith("glm-"):
+            return "glm_zai"
+        return None

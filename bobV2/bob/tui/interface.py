@@ -740,13 +740,32 @@ class _SlashCompleter(Completer):
         """Yield model-name completions from the catalog."""
         try:
             from bob.llm.catalog import get_catalog
+            from bob.llm.compatibility import get_picker_seed_models, get_model_compatibility
+
             catalog = get_catalog()
-            if not catalog.is_populated():
-                return
+            merged: dict[str, dict] = {
+                row["model_id"]: dict(row) for row in get_picker_seed_models()
+            }
+            if catalog.is_populated():
+                catalog_models = catalog.search_models(query) if query else catalog.list_models(status="active")
+                for row in catalog_models:
+                    compat = get_model_compatibility(row["model_id"], catalog_provider=row.get("provider"))
+                    merged[row["model_id"]] = {
+                        **merged.get(row["model_id"], {}),
+                        **row,
+                        "route": compat.route.value,
+                        "support_level": compat.support_level.value,
+                    }
+            models = list(merged.values())
             if query:
-                models = catalog.search_models(query)
-            else:
-                models = catalog.list_models(status="active")
+                q = query.lower()
+                models = [
+                    row for row in models
+                    if q in str(row.get("model_id", "")).lower()
+                    or q in str(row.get("provider", "")).lower()
+                    or q in str(row.get("family", "")).lower()
+                    or q in str(row.get("display_name", "")).lower()
+                ]
             for m in models[:40]:
                 mid      = m["model_id"]
                 provider = m.get("provider") or ""
@@ -754,7 +773,8 @@ class _SlashCompleter(Completer):
                 ctx_str  = f"{ctx // 1000}K" if ctx else ""
                 inp      = m.get("input_price_per_1m")
                 price    = f"${inp:.2f}/1M" if inp is not None else ""
-                meta     = "  ".join(x for x in [provider, ctx_str, price] if x)
+                support  = m.get("support_level") or ""
+                meta     = "  ".join(x for x in [provider, ctx_str, price, support] if x)
                 yield Completion(
                     mid,
                     start_position=-len(query),
@@ -784,6 +804,8 @@ class _ModelPickerCompleter(Completer):
             ctx_str = f"{ctx // 1000}K" if ctx else ""
             inp = model.get("input_price_per_1m")
             out = model.get("output_price_per_1m")
+            support = model.get("support_level") or ""
+            route = model.get("route") or ""
             price = (
                 f"${inp:.2f}/${out:.2f}"
                 if inp is not None and out is not None
@@ -791,7 +813,7 @@ class _ModelPickerCompleter(Completer):
             )
             current = "current" if model_id == self._current_model else ""
             meta = "  ".join(
-                part for part in (provider, family, ctx_str, price, current) if part
+                part for part in (provider, family, support, route, ctx_str, price, current) if part
             )
             display = f"{model_id}  *" if model_id == self._current_model else model_id
             yield Completion(
@@ -2465,16 +2487,12 @@ class Interface:
 
         elif cmd == SlashCommand.DOCTOR:
             import shutil as _shutil
+            runtime = self._session.describe_model_runtime(self._config.model)
             _p()
             checks: list[tuple[bool, str]] = []
 
-            # 1. API key
-            api_key = (
-                getattr(self._config, "api_key", "") or
-                os.environ.get("OPENAI_API_KEY", "") or
-                os.environ.get("BOB_API_KEY", "")
-            )
-            checks.append((bool(api_key), "OPENAI_API_KEY is set"))
+            missing_auth = runtime.get("missing_auth", [])
+            checks.append((not missing_auth, f"auth configured for provider '{runtime['provider']}'"))
 
             # 2. Git available
             checks.append((bool(_shutil.which("git")), "git is in PATH"))
@@ -2496,8 +2514,19 @@ class Interface:
             # 5. Node.js available (for js_repl)
             checks.append((bool(_shutil.which("node")), "node.js in PATH (js_repl)"))
 
+            _p("  " + _d(f"model: {runtime['requested_model']}"))
+            _p("  " + _d(f"provider: {runtime['provider']}  route: {runtime['route']}  support: {runtime['support_level']}"))
+            if runtime.get("canonical_model") and runtime["canonical_model"] != runtime["requested_model"]:
+                _p("  " + _d(f"canonical: {runtime['canonical_model']}"))
+
             for ok, label in checks:
                 icon = _g("✓") if ok else _r("✗")
+
+                _p(f"  {icon} {label}")
+            if missing_auth:
+                _p(f"  {_y('WARN')} Missing provider settings: {', '.join(missing_auth)}")
+            for note in runtime.get("notes", [])[:3]:
+                _p(f"  {_d(note)}")
 
         elif cmd == SlashCommand.TASKS:
             # Display task list
@@ -3086,17 +3115,48 @@ class Interface:
     async def _load_model_picker_models(self) -> list[dict]:
         """Return model metadata for the interactive picker."""
         from bob.llm.catalog import get_catalog
+        from bob.llm.compatibility import get_model_compatibility, get_picker_seed_models
 
         catalog = get_catalog()
+        merged: dict[str, dict] = {
+            row["model_id"]: dict(row) for row in get_picker_seed_models()
+        }
+
         if catalog.is_populated():
-            return catalog.list_models(status="active")
+            for row in catalog.list_models(status="active"):
+                compat = get_model_compatibility(row["model_id"], catalog_provider=row.get("provider"))
+                merged[row["model_id"]] = {
+                    **merged.get(row["model_id"], {}),
+                    **row,
+                    "route": compat.route.value,
+                    "support_level": compat.support_level.value,
+                }
 
         try:
             listed = await self._session.client.list_models()
         except Exception:
             listed = []
 
-        return [{"model_id": model_id} for model_id in listed]
+        for model_id in listed:
+            compat = get_model_compatibility(model_id)
+            merged[model_id] = {
+                **merged.get(model_id, {}),
+                "model_id": model_id,
+                "provider": compat.provider,
+                "family": compat.provider,
+                "route": compat.route.value,
+                "support_level": compat.support_level.value,
+            }
+
+        order = {"stable": 0, "experimental": 1, "catalog_only": 2, "unknown": 3}
+        return sorted(
+            merged.values(),
+            key=lambda row: (
+                order.get(str(row.get("support_level", "unknown")), 9),
+                str(row.get("provider", "")),
+                str(row.get("model_id", "")),
+            ),
+        )
 
     def _apply_selected_model(self, model_name: str) -> None:
         """Keep the visible config and session runtime model in sync."""
@@ -3240,8 +3300,16 @@ class Interface:
             def _(event):
                 """Alt+Enter inserts a newline."""
                 event.current_buffer.insert_text('\n')
+
+            @kb.add("/")
+            def _(event):
+                """Typing / at the start of a prompt immediately opens slash-command completion."""
+                buf = event.current_buffer
+                buf.insert_text("/")
+                if buf.text == "/" and buf.cursor_position == 1:
+                    buf.start_completion(select_first=False)
             
-            return PromptSession(
+            session = PromptSession(
                 history=_history,
                 completer=completer,
                 complete_while_typing=True,
@@ -3252,6 +3320,14 @@ class Interface:
                 key_bindings=kb,
                 complete_style='MULTI_COLUMN',
             )
+
+            def _refresh_slash_menu(_buff) -> None:
+                text = session.default_buffer.text
+                if text.startswith("/") and " " not in text:
+                    session.default_buffer.start_completion(select_first=False)
+
+            session.default_buffer.on_text_changed += _refresh_slash_menu
+            return session
 
         ps: PromptSession = _make_session()
 

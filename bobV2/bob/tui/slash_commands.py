@@ -175,12 +175,21 @@ def fuzzy_match_commands(query: str, task_running: bool = False) -> list[Command
             cmds = [c for c in cmds if c in AVAILABLE_DURING_TASK]
         return [CommandMatch(c, 100.0) for c in cmds]
 
+    q = query.lower()
     candidates = {c.value: c for c in SlashCommand}
     if task_running:
         candidates = {v: c for v, c in candidates.items() if c in AVAILABLE_DURING_TASK}
 
+    prefix_matches = [
+        CommandMatch(command=command, score=100.0 - (len(name) - len(q)))
+        for name, command in candidates.items()
+        if name.startswith(q)
+    ]
+    if prefix_matches:
+        return sorted(prefix_matches, key=lambda match: (match.command.value, -match.score))
+
     results = fuzz_process.extract(
-        query, list(candidates.keys()), scorer=fuzz.partial_ratio, limit=20
+        q, list(candidates.keys()), scorer=fuzz.partial_ratio, limit=20
     )
     matches = []
     for name, score, _ in results:

@@ -72,6 +72,23 @@ class TrustedCommandRule(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Provider / model backend configuration
+# ---------------------------------------------------------------------------
+
+class ProviderConfig(BaseModel):
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    api_version: Optional[str] = None
+    project: Optional[str] = None
+    location: Optional[str] = None
+    credentials_path: Optional[Path] = None
+    organization: Optional[str] = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    extra_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Full BobConfig
 # ---------------------------------------------------------------------------
 
@@ -82,6 +99,7 @@ class BobConfig(BaseModel):
     model: str = "gpt-5.1-codex-mini"
     api_key: Optional[str] = None
     base_url: str = "https://api.openai.com/v1"
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     # Enable prompt caching (Anthropic cache_control headers)
     prompt_caching: bool = True
 

@@ -53,7 +53,33 @@ async def _config_get(params: dict) -> dict:
 
 @_register("bob.models.list")
 async def _models_list(params: dict) -> dict:
-    return {"models": ["gpt-5.1-codex-mini"]}
+    from bob.llm.catalog import get_catalog
+    from bob.llm.compatibility import (
+        get_compatibility_matrix_rows,
+        get_model_compatibility,
+        get_picker_seed_models,
+    )
+
+    rows: dict[str, dict[str, Any]] = {}
+    for seed in get_picker_seed_models():
+        rows[seed["model_id"]] = dict(seed)
+
+    catalog = get_catalog()
+    for row in catalog.list_models(status="active") if catalog.is_populated() else []:
+        compat = get_model_compatibility(row["model_id"], catalog_provider=row.get("provider"))
+        merged = dict(row)
+        merged["route"] = compat.route.value
+        merged["support_level"] = compat.support_level.value
+        rows[row["model_id"]] = {**rows.get(row["model_id"], {}), **merged}
+
+    models = sorted(
+        rows.values(),
+        key=lambda row: (str(row.get("provider", "")), str(row.get("model_id", ""))),
+    )
+    return {
+        "models": models,
+        "compatibility_matrix": get_compatibility_matrix_rows(),
+    }
 
 
 async def handle_request(msg: dict) -> Optional[dict]:

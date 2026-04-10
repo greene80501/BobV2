@@ -435,15 +435,11 @@ async def run_turn(
             # ----------------------------------------------------------
             # Stream from model
             # ----------------------------------------------------------
-            # Build extra_params for extended thinking if enabled
-            extra_params = {}
-            if session.config.thinking_budget_tokens > 0:
-                # Anthropic extended thinking format
-                extra_params["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": session.config.thinking_budget_tokens
-                }
-            
+            from bob.llm.compatibility import build_model_request_params
+
+            compatibility, _provider_auth = session.get_model_runtime(session.config.model)
+            extra_params = build_model_request_params(session.config, compatibility)
+
             try:
                 async for ev in session.client.stream_turn(
                     input=current_history,
