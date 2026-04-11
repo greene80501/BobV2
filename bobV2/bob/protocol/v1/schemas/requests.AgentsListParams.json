@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "include_completed": {
+      "default": false,
+      "title": "Include Completed",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "AgentsListParams",
+  "type": "object"
+}

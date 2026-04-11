@@ -1,0 +1,25 @@
+{
+  "properties": {
+    "channels": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Channels",
+      "type": "array"
+    },
+    "after_cursor": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "After Cursor"
+    }
+  },
+  "title": "RealtimeSubscribeParams",
+  "type": "object"
+}

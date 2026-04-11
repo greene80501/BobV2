@@ -1,0 +1,37 @@
+{
+  "properties": {
+    "type": {
+      "const": "realtime.event",
+      "default": "realtime.event",
+      "title": "Type",
+      "type": "string"
+    },
+    "subscription_id": {
+      "title": "Subscription Id",
+      "type": "string"
+    },
+    "cursor": {
+      "title": "Cursor",
+      "type": "integer"
+    },
+    "channels": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Channels",
+      "type": "array"
+    },
+    "event": {
+      "additionalProperties": true,
+      "title": "Event",
+      "type": "object"
+    }
+  },
+  "required": [
+    "subscription_id",
+    "cursor",
+    "event"
+  ],
+  "title": "RealtimeEventEnvelope",
+  "type": "object"
+}

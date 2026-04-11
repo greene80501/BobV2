@@ -1,0 +1,34 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "items": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Items",
+      "type": "array"
+    },
+    "developer_message_override": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Developer Message Override"
+    }
+  },
+  "required": [
+    "thread_id",
+    "items"
+  ],
+  "title": "TurnsSubmitParams",
+  "type": "object"
+}

@@ -1,0 +1,47 @@
+{
+  "properties": {
+    "cwd": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cwd"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model"
+    },
+    "name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Name"
+    },
+    "ephemeral": {
+      "default": false,
+      "title": "Ephemeral",
+      "type": "boolean"
+    }
+  },
+  "title": "ThreadsCreateParams",
+  "type": "object"
+}

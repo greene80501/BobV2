@@ -18,20 +18,21 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS turns (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id      TEXT    NOT NULL,
-    turn_id         TEXT,
-    model           TEXT    NOT NULL,
-    provider        TEXT,
-    input_tokens    INTEGER DEFAULT 0,
-    output_tokens   INTEGER DEFAULT 0,
-    total_tokens    INTEGER DEFAULT 0,
-    input_cost_usd  REAL,
-    output_cost_usd REAL,
-    total_cost_usd  REAL,
-    latency_ms      INTEGER,
-    changed_files   TEXT,
-    timestamp       TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id            TEXT    NOT NULL,
+    turn_id               TEXT,
+    model                 TEXT    NOT NULL,
+    provider              TEXT,
+    input_tokens          INTEGER DEFAULT 0,
+    output_tokens         INTEGER DEFAULT 0,
+    total_tokens          INTEGER DEFAULT 0,
+    cached_input_tokens   INTEGER DEFAULT 0,
+    input_cost_usd        REAL,
+    output_cost_usd       REAL,
+    total_cost_usd        REAL,
+    latency_ms            INTEGER,
+    changed_files         TEXT,
+    timestamp             TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_session   ON turns (session_id);
@@ -57,12 +58,16 @@ class AnalyticsDB:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.executescript(_SCHEMA)
-                # Migration: add changed_files column to existing DBs
-                try:
-                    await db.execute("ALTER TABLE turns ADD COLUMN changed_files TEXT")
-                    await db.commit()
-                except Exception:
-                    pass  # Column already exists
+                # Migrations for existing DBs
+                for migration in [
+                    "ALTER TABLE turns ADD COLUMN changed_files TEXT",
+                    "ALTER TABLE turns ADD COLUMN cached_input_tokens INTEGER DEFAULT 0",
+                ]:
+                    try:
+                        await db.execute(migration)
+                        await db.commit()
+                    except Exception:
+                        pass  # Column already exists
             self._ready = True
         except Exception as exc:
             logger.warning("Analytics DB setup failed (continuing without analytics): %s", exc)
@@ -82,6 +87,7 @@ class AnalyticsDB:
         input_tokens: int = 0,
         output_tokens: int = 0,
         total_tokens: int = 0,
+        cached_input_tokens: int = 0,
         input_cost_usd: Optional[float] = None,
         output_cost_usd: Optional[float] = None,
         total_cost_usd: Optional[float] = None,
@@ -100,13 +106,15 @@ class AnalyticsDB:
                     INSERT INTO turns
                         (session_id, turn_id, model, provider,
                          input_tokens, output_tokens, total_tokens,
+                         cached_input_tokens,
                          input_cost_usd, output_cost_usd, total_cost_usd,
                          latency_ms, changed_files)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         session_id, turn_id, model, provider,
                         input_tokens, output_tokens, total_tokens,
+                        cached_input_tokens,
                         input_cost_usd, output_cost_usd, total_cost_usd,
                         latency_ms, changed_files_json,
                     ),

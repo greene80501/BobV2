@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "graceful": {
+      "default": true,
+      "title": "Graceful",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "TurnsInterruptParams",
+  "type": "object"
+}

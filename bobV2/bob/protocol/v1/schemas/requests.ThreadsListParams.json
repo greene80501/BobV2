@@ -1,0 +1,28 @@
+{
+  "properties": {
+    "limit": {
+      "default": 25,
+      "title": "Limit",
+      "type": "integer"
+    },
+    "offset": {
+      "default": 0,
+      "title": "Offset",
+      "type": "integer"
+    },
+    "cwd": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cwd"
+    }
+  },
+  "title": "ThreadsListParams",
+  "type": "object"
+}

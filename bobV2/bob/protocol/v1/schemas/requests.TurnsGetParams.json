@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "turn_id": {
+      "title": "Turn Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "turn_id"
+  ],
+  "title": "TurnsGetParams",
+  "type": "object"
+}

@@ -1441,6 +1441,7 @@ class Interface:
     async def _consume_events(self) -> None:  # noqa: C901
         from bob.protocol.events import (
             BackgroundTerminalOutputEvent,
+            ContextCompactionEvent,
             ErrorEvent,
             ExecApprovalRequestedEvent,
             ExecCompletedEvent,
@@ -1931,6 +1932,13 @@ class Interface:
 
                 elif isinstance(msg, WarningEvent):
                     _p(f"  {_y('⚠')} {msg.message}")
+
+                elif isinstance(msg, ContextCompactionEvent):
+                    if msg.success:
+                        delta = max(0, int(msg.token_before) - int(msg.token_after))
+                        _p(f"  {_d(f'[context] compacted ({msg.reason}) -{delta:,} tokens')}")
+                    else:
+                        _p(f"  {_y('⚠')} context compaction failed ({msg.reason})")
 
                 elif isinstance(msg, InfoEvent):
                     _p(f"  {_d(msg.message)}")

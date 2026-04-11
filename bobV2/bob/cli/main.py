@@ -182,6 +182,15 @@ def completion(
         typer.echo(f"Unknown shell: {shell}", err=True)
 
 
+@app.command("export-schemas")
+def export_schemas() -> None:
+    """Export bob protocol v1 JSON schemas."""
+    from bob.protocol.v1.export_schemas import export_jsonschemas
+
+    out = export_jsonschemas(Path(__file__).resolve().parents[1] / "protocol" / "v1" / "schemas")
+    typer.echo(f"Exported {len(out)} schema files")
+
+
 def cli_main() -> None:
     app()
 

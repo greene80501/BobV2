@@ -1,0 +1,54 @@
+{
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "status": {
+      "default": "running",
+      "enum": [
+        "running",
+        "closed"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "cwd": {
+      "title": "Cwd",
+      "type": "string"
+    },
+    "created_at_ts": {
+      "title": "Created At Ts",
+      "type": "integer"
+    },
+    "updated_at_ts": {
+      "title": "Updated At Ts",
+      "type": "integer"
+    },
+    "name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Name"
+    }
+  },
+  "required": [
+    "id",
+    "model",
+    "cwd",
+    "created_at_ts",
+    "updated_at_ts"
+  ],
+  "title": "ThreadObject",
+  "type": "object"
+}

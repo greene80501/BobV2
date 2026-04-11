@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 EDIT_FILE_DESCRIPTION = (
     "Edit a file by replacing an exact string with a new string. "
@@ -37,9 +38,7 @@ async def edit_file_handler(tool_input: dict, context: Any) -> str:
     if not path_str:
         return "Error: path is required"
 
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = context.cwd / p
+    p = resolve_tool_path(path_str, context.cwd)
 
     # Create mode: empty old_string + file doesn't exist
     if old_string == "" and not p.exists():

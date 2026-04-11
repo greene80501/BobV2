@@ -738,6 +738,137 @@ class BobSession:
     async def submit_compact(self) -> None:
         await self.submit(CompactOp(type="compact"))
 
+    async def _record_compaction_checkpoint(self, result) -> None:
+        if not self._recorder:
+            return
+        await self._recorder.write({
+            "type": "compacted",
+            "reason": result.reason,
+            "summary": result.summary_text,
+            "token_before": result.token_before,
+            "token_after": result.token_after,
+            "replacement_history": result.new_history,
+        })
+
+    async def compact_history(
+        self,
+        *,
+        reason: str,
+        sub_id: str = "system",
+        hint: str | None = None,
+    ):
+        from bob.core.compact import run_compact
+        from bob.protocol.events import (
+            ContextCompactionEvent,
+            HistoryCompactedEvent,
+            WarningEvent,
+        )
+
+        result = await run_compact(self, reason=reason, hint=hint)
+        if not result:
+            if hasattr(self, "analytics") and self.analytics is not None:
+                self.analytics.record_compaction(
+                    reason=reason,
+                    token_before=self.context_manager.approx_token_count(),
+                    token_after=self.context_manager.approx_token_count(),
+                    success=False,
+                )
+            await self._emit(Event(
+                id=sub_id,
+                msg=ContextCompactionEvent(
+                    type="context_compaction",
+                    reason=reason,
+                    token_before=self.context_manager.approx_token_count(),
+                    token_after=self.context_manager.approx_token_count(),
+                    success=False,
+                ),
+            ))
+            return None
+
+        # Guardrail: reject non-effective compactions to avoid compaction loops.
+        # Require at least 5% reduction unless the history is already very small.
+        if result.token_before > 20_000 and result.token_after >= int(result.token_before * 0.95):
+            if hasattr(self, "analytics") and self.analytics is not None:
+                self.analytics.record_compaction(
+                    reason=reason,
+                    token_before=result.token_before,
+                    token_after=result.token_after,
+                    success=False,
+                )
+            await self._emit(Event(
+                id=sub_id,
+                msg=ContextCompactionEvent(
+                    type="context_compaction",
+                    reason=reason,
+                    token_before=result.token_before,
+                    token_after=result.token_after,
+                    success=False,
+                ),
+            ))
+            return None
+
+        self.context_manager.replace(result.new_history)
+        await self._record_compaction_checkpoint(result)
+        if hasattr(self, "analytics") and self.analytics is not None:
+            self.analytics.record_compaction(
+                reason=reason,
+                token_before=result.token_before,
+                token_after=result.token_after,
+                success=True,
+            )
+        await self._emit(Event(
+            id=sub_id,
+            msg=ContextCompactionEvent(
+                type="context_compaction",
+                reason=reason,
+                token_before=result.token_before,
+                token_after=result.token_after,
+                success=True,
+            ),
+        ))
+        await self._emit(Event(
+            id=sub_id,
+            msg=HistoryCompactedEvent(
+                type="history_compacted",
+                summary=result.summary_text[:500],
+                turns_removed=0,
+            ),
+        ))
+        await self._emit(Event(
+            id=sub_id,
+            msg=WarningEvent(
+                type="warning",
+                message=(
+                    "Heads up: Long threads and multiple compactions can cause "
+                    "the model to be less accurate. Start a new thread when possible."
+                ),
+            ),
+        ))
+        return result
+
+    def _lightweight_trim_context(self) -> int:
+        removed = 0
+        removed += self.context_manager.trim_oldest_tool_results(keep_recent=40)
+        removed += self.context_manager.trim_oldest_assistant_messages(keep_recent=24)
+        return removed
+
+    async def manage_context_pre_turn(self, sub_id: str) -> None:
+        from bob.core.context_budget import compute_context_budget, should_compact
+
+        token_count = self.context_manager.approx_token_count()
+        budget = compute_context_budget(self)
+        threshold = self.config.auto_compact_threshold_tokens
+        if not should_compact(token_count, budget, threshold):
+            return
+
+        removed = self._lightweight_trim_context()
+        if removed > 0:
+            token_count = self.context_manager.approx_token_count()
+            if not should_compact(token_count, budget, threshold):
+                return
+
+        await self.compact_history(reason="pre_turn_threshold", sub_id=sub_id)
+
     async def submit_set_name(self, name: str) -> None:
         await self.submit(SetThreadNameOp(type="set_thread_name", name=name))
 
@@ -821,8 +952,8 @@ class BobSession:
             DropMemoriesOp, UpdateMemoriesOp,
         )
         from bob.protocol.events import (
-            SessionEndedEvent, WarningEvent, ThreadNameSetEvent,
-            HistoryCompactedEvent, UndoCompletedEvent, ThreadRollbackCompletedEvent,
+            SessionEndedEvent, ThreadNameSetEvent,
+            UndoCompletedEvent, ThreadRollbackCompletedEvent,
         )
 
         current_turn_task: Optional[asyncio.Task] = None
@@ -920,27 +1051,11 @@ class BobSession:
             # Compact
             # ----------------------------------------------------------------
             if isinstance(op, CompactOp):
-                from bob.core.compact import run_compact
-                summary = await run_compact(self)
-                if summary:
-                    await self._emit(Event(
-                        id=sub_id,
-                        msg=HistoryCompactedEvent(
-                            type="history_compacted",
-                            summary=summary[:500],
-                            turns_removed=0,
-                        )
-                    ))
-                    await self._emit(Event(
-                        id=sub_id,
-                        msg=WarningEvent(
-                            type="warning",
-                            message=(
-                                "Heads up: Long threads and multiple compactions can cause "
-                                "the model to be less accurate. Start a new thread when possible."
-                            )
-                        )
-                    ))
+                await self.compact_history(
+                    reason="manual",
+                    sub_id=sub_id,
+                    hint=op.hint,
+                )
                 continue
 
             # ----------------------------------------------------------------
@@ -974,6 +1089,11 @@ class BobSession:
             if isinstance(op, UndoOp):
                 n = max(1, op.turns)
                 self.context_manager.drop_last_n_user_turns(n)
+                if self._recorder:
+                    await self._recorder.write({
+                        "type": "thread_rolled_back",
+                        "num_turns": n,
+                    })
                 await self._emit(Event(
                     id=sub_id,
                     msg=UndoCompletedEvent(type="undo_completed", turns_removed=n)
@@ -988,6 +1108,12 @@ class BobSession:
                 # we do a single-turn undo as a safe approximation when we
                 # don't have per-submission snapshots.
                 self.context_manager.drop_last_n_user_turns(1)
+                if self._recorder:
+                    await self._recorder.write({
+                        "type": "thread_rolled_back",
+                        "num_turns": 1,
+                        "to_submission_id": op.to_submission_id,
+                    })
                 await self._emit(Event(
                     id=sub_id,
                     msg=ThreadRollbackCompletedEvent(
@@ -1070,15 +1196,7 @@ class BobSession:
             # User turn — the main path
             # ----------------------------------------------------------------
             if isinstance(op, UserTurnOp):
-                # Auto-compact when context grows too large
-                token_count = self.context_manager.approx_token_count()
-                threshold = self.config.auto_compact_threshold_tokens
-                if threshold and token_count > threshold:
-                    from bob.core.compact import run_compact
-                    await run_compact(self)
-                elif token_count > 150_000:
-                    from bob.core.compact import run_compact
-                    await run_compact(self)
+                await self.manage_context_pre_turn(sub_id)
 
                 cancel_ev = asyncio.Event()
                 self._current_turn_cancel = cancel_ev

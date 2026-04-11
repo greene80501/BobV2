@@ -1,0 +1,23 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "agent_id": {
+      "title": "Agent Id",
+      "type": "string"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "agent_id",
+    "message"
+  ],
+  "title": "AgentsSendParams",
+  "type": "object"
+}

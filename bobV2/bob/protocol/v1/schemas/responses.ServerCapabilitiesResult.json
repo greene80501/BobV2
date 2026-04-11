@@ -1,0 +1,44 @@
+{
+  "properties": {
+    "server_name": {
+      "default": "bob",
+      "title": "Server Name",
+      "type": "string"
+    },
+    "protocol_version": {
+      "default": "1.0",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "supported_protocol_versions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Supported Protocol Versions",
+      "type": "array"
+    },
+    "methods": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Methods",
+      "type": "array"
+    },
+    "legacy_methods": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Legacy Methods",
+      "type": "array"
+    },
+    "features": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Features",
+      "type": "object"
+    }
+  },
+  "title": "ServerCapabilitiesResult",
+  "type": "object"
+}

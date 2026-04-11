@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from bob.core.exec import execute_command, DEFAULT_TIMEOUT_MS
+from bob.tools.path_utils import resolve_tool_path
 
 SHELL_TOOL_DESCRIPTION = (
     "Execute a shell command in the sandbox. Use this for running programs, "
@@ -73,9 +74,7 @@ async def shell_handler(tool_input: dict, context: Any) -> str:
     # ------------------------------------------------------------------ #
     workdir_str: Optional[str] = tool_input.get("workdir")
     if workdir_str:
-        cwd = Path(workdir_str)
-        if not cwd.is_absolute():
-            cwd = context.cwd / cwd
+        cwd = resolve_tool_path(workdir_str, context.cwd)
     else:
         cwd = context.cwd
 

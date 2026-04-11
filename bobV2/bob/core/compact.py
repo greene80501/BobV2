@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
+from dataclasses import dataclass
+import json
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -23,23 +23,25 @@ SUMMARY_PREFIX = "Context compaction summary:"
 COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000
 
 
+@dataclass(frozen=True)
+class CompactionResult:
+    summary_text: str
+    old_history: list[dict]
+    new_history: list[dict]
+    reason: str
+    token_before: int
+    token_after: int
+
+
 def approx_token_count(text: str) -> int:
-    """Rough token estimate: character count divided by 4."""
     return len(text) // 4
 
 
 def is_summary_message(text: str) -> bool:
-    """Return True if *text* is itself a prior compaction summary."""
     return text.startswith(SUMMARY_PREFIX)
 
 
 def collect_user_messages(history: list[dict]) -> list[str]:
-    """
-    Extract all non-summary user-turn text messages from *history*.
-
-    Tool results (items with "tool_call_id") are skipped.
-    Items whose combined text is a prior summary are also skipped.
-    """
     messages: list[str] = []
     for item in history:
         if item.get("role") != "user":
@@ -59,40 +61,21 @@ def collect_user_messages(history: list[dict]) -> list[str]:
     return messages
 
 
-def build_compacted_history(
-    user_messages: list[str],
-    summary_text: str,
-) -> list[dict]:
-    """
-    Build a minimal history consisting of:
-      1. The most-recent user messages that fit within the token budget.
-      2. The compaction summary as the final user message.
-
-    The token budget prevents the compacted history from itself being too large.
-    """
+def build_compacted_history(user_messages: list[str], summary_text: str) -> list[dict]:
     selected: list[str] = []
     remaining = COMPACT_USER_MESSAGE_MAX_TOKENS
-
-    # Walk messages from newest to oldest; keep as many as the budget allows.
     for msg in reversed(user_messages):
         tokens = approx_token_count(msg)
         if tokens <= remaining:
             selected.insert(0, msg)
             remaining -= tokens
         else:
-            # Stop as soon as the next message would overflow the budget.
             break
 
-    history: list[dict] = []
-    for msg in selected:
-        history.append(
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": msg}],
-            }
-        )
-
-    # Always append the summary as the final context anchor.
+    history: list[dict] = [
+        {"role": "user", "content": [{"type": "input_text", "text": msg}]}
+        for msg in selected
+    ]
     history.append(
         {
             "role": "user",
@@ -102,46 +85,80 @@ def build_compacted_history(
     return history
 
 
-async def run_compact(session: "BobSession") -> Optional[str]:
-    """
-    Run context compaction against the current session history.
+def _is_prompt_too_long(message: str) -> bool:
+    m = (message or "").lower()
+    return any(
+        key in m
+        for key in (
+            "prompt too long",
+            "maximum context",
+            "context window",
+            "too many tokens",
+            "context_length_exceeded",
+            "input is too long",
+        )
+    )
 
-    Sends the full history to the model with a summarization instruction,
-    replaces session history with the compacted version, and returns the
-    summary text.  Returns None on failure (history is left unchanged).
-    """
-    # Import here to avoid circular deps at module level.
-    from bob.client.openai_client import TextDeltaEvent  # type: ignore
 
-    history = session.context_manager.raw_items()
+async def run_compact(
+    session: "BobSession",
+    *,
+    reason: str = "manual",
+    hint: Optional[str] = None,
+    max_retries: Optional[int] = None,
+) -> Optional[CompactionResult]:
+    from bob.llm.client import TextDeltaEvent, StreamErrorEvent  # type: ignore
 
-    # Build the compaction request: full history + compaction instruction
-    compact_input: list[dict] = list(history) + [
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": SUMMARIZATION_PROMPT}],
-        }
+    old_history = session.context_manager.raw_items()
+    token_before = session.context_manager.approx_token_count()
+    retries = max_retries
+    if retries is None:
+        retries = int(getattr(session.config, "compact_max_retries", 3) or 3)
+    retries = max(0, retries)
+
+    prompt = SUMMARIZATION_PROMPT
+    if hint:
+        prompt += f"\n\nAdditional preservation hint:\n{hint}"
+
+    compact_input: list[dict] = list(old_history) + [
+        {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
     ]
 
-    summary_parts: list[str] = []
-    try:
-        async for event in session.client.stream_turn(
-            input=compact_input,
-            instructions="Produce a concise handoff summary.",
-            tools=[],
-        ):
-            if isinstance(event, TextDeltaEvent):
-                summary_parts.append(event.delta)
-    except Exception:
-        return None
+    for _attempt in range(retries + 1):
+        summary_parts: list[str] = []
+        stream_error: str | None = None
+        try:
+            async for event in session.client.stream_turn(
+                input=compact_input,
+                instructions="Produce a concise handoff summary.",
+                tools=[],
+            ):
+                if isinstance(event, TextDeltaEvent):
+                    summary_parts.append(event.delta)
+                elif isinstance(event, StreamErrorEvent):
+                    stream_error = event.message
+        except Exception as exc:
+            stream_error = str(exc)
 
-    summary = "".join(summary_parts).strip()
-    if not summary:
-        return None
+        summary = "".join(summary_parts).strip()
+        if summary:
+            summary_text = f"{SUMMARY_PREFIX}\n{summary}"
+            user_messages = collect_user_messages(old_history)
+            new_history = build_compacted_history(user_messages, summary_text)
+            token_after = len(json.dumps(new_history)) // 4
+            return CompactionResult(
+                summary_text=summary_text,
+                old_history=old_history,
+                new_history=new_history,
+                reason=reason,
+                token_before=token_before,
+                token_after=token_after,
+            )
 
-    summary_text = f"{SUMMARY_PREFIX}\n{summary}"
-    user_messages = collect_user_messages(history)
-    new_history = build_compacted_history(user_messages, summary_text)
+        if not _is_prompt_too_long(stream_error or ""):
+            return None
+        if len(compact_input) <= 3:
+            return None
+        compact_input = compact_input[1:]
 
-    session.context_manager.replace(new_history)
-    return summary_text
+    return None

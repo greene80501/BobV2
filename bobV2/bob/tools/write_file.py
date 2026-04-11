@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 WRITE_FILE_DESCRIPTION = (
     "Write content to a file, creating parent directories as needed. "
@@ -36,9 +37,7 @@ async def write_file_handler(tool_input: dict, context: Any) -> str:
     if not path_str:
         return "Error: path is required"
 
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = context.cwd / p
+    p = resolve_tool_path(path_str, context.cwd)
 
     try:
         p.parent.mkdir(parents=True, exist_ok=True)

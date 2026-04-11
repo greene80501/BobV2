@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 LIST_DIR_DESCRIPTION = "List the contents of a directory."
 
@@ -33,12 +34,7 @@ async def list_dir_handler(tool_input: dict, context: Any) -> str:
       - ``context.cwd`` – :class:`pathlib.Path`
     """
     path_str: str = tool_input.get("path", ".")
-    path = Path(path_str)
-
-    if not path.is_absolute():
-        path = context.cwd / path
-
-    path = path.resolve()
+    path = resolve_tool_path(path_str, context.cwd)
 
     if not path.exists():
         return f"Error: directory not found: {path}"

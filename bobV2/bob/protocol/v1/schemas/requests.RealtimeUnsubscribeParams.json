@@ -1,0 +1,13 @@
+{
+  "properties": {
+    "subscription_id": {
+      "title": "Subscription Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "subscription_id"
+  ],
+  "title": "RealtimeUnsubscribeParams",
+  "type": "object"
+}

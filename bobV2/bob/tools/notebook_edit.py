@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 NOTEBOOK_EDIT_DESCRIPTION = (
     "Edit a cell in a Jupyter notebook (.ipynb). "
@@ -42,9 +43,7 @@ async def notebook_edit_handler(tool_input: dict, context: Any) -> str:
     new_source: str = tool_input.get("new_source", "")
     clear_outputs: bool = tool_input.get("clear_outputs", False)
 
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = context.cwd / p
+    p = resolve_tool_path(path_str, context.cwd)
 
     if not p.exists():
         return f"Error: file not found: {p}"

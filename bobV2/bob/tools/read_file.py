@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 READ_FILE_DESCRIPTION = (
     "Read the contents of a file. Supports partial reads via start_line/end_line. "
@@ -41,9 +42,7 @@ async def read_file_handler(tool_input: dict, context: Any) -> str:
 
     encoding: str = tool_input.get("encoding", "utf-8")
 
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = context.cwd / p
+    p = resolve_tool_path(path_str, context.cwd)
 
     if not p.exists():
         return f"Error: file not found: {p}"

@@ -1,0 +1,13 @@
+{
+  "properties": {
+    "path": {
+      "title": "Path",
+      "type": "string"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "title": "FilesReadParams",
+  "type": "object"
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 VIEW_IMAGE_DESCRIPTION = (
     "View a local image file and attach it to the conversation context."
@@ -46,11 +47,7 @@ async def view_image_handler(tool_input: dict, context: Any) -> str:
     if not path_str:
         return "Error: path is required"
 
-    path = Path(path_str)
-    if not path.is_absolute():
-        path = context.cwd / path
-
-    path = path.resolve()
+    path = resolve_tool_path(path_str, context.cwd)
 
     if not path.exists():
         return f"Error: image not found: {path}"

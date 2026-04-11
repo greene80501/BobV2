@@ -1,0 +1,23 @@
+{
+  "properties": {
+    "status": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status"
+    },
+    "limit": {
+      "default": 100,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "title": "TasksListParams",
+  "type": "object"
+}

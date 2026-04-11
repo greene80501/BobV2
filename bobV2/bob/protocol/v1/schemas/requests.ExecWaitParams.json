@@ -1,0 +1,23 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "command_id": {
+      "title": "Command Id",
+      "type": "string"
+    },
+    "timeout_ms": {
+      "default": 30000,
+      "title": "Timeout Ms",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "thread_id",
+    "command_id"
+  ],
+  "title": "ExecWaitParams",
+  "type": "object"
+}

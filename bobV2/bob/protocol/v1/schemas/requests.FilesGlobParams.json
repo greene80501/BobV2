@@ -1,0 +1,25 @@
+{
+  "properties": {
+    "pattern": {
+      "title": "Pattern",
+      "type": "string"
+    },
+    "root": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Root"
+    }
+  },
+  "required": [
+    "pattern"
+  ],
+  "title": "FilesGlobParams",
+  "type": "object"
+}

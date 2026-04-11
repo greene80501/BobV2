@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "command_id": {
+      "title": "Command Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "thread_id",
+    "command_id"
+  ],
+  "title": "ExecTerminateParams",
+  "type": "object"
+}

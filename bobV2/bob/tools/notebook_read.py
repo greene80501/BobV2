@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 NOTEBOOK_READ_DESCRIPTION = (
     "Read a Jupyter notebook (.ipynb) and return its cells as formatted text. "
@@ -34,9 +35,7 @@ async def notebook_read_handler(tool_input: dict, context: Any) -> str:
 
     include_outputs: bool = tool_input.get("include_outputs", True)
 
-    p = Path(path_str)
-    if not p.is_absolute():
-        p = context.cwd / p
+    p = resolve_tool_path(path_str, context.cwd)
 
     if not p.exists():
         return f"Error: file not found: {p}"

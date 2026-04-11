@@ -1,0 +1,23 @@
+{
+  "properties": {
+    "path": {
+      "title": "Path",
+      "type": "string"
+    },
+    "content": {
+      "title": "Content",
+      "type": "string"
+    },
+    "create_parents": {
+      "default": true,
+      "title": "Create Parents",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "path",
+    "content"
+  ],
+  "title": "FilesWriteParams",
+  "type": "object"
+}

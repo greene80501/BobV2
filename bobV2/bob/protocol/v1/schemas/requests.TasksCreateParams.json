@@ -1,0 +1,45 @@
+{
+  "properties": {
+    "type": {
+      "title": "Type",
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "title": "Payload",
+      "type": "object"
+    },
+    "priority": {
+      "default": "medium",
+      "title": "Priority",
+      "type": "string"
+    },
+    "max_attempts": {
+      "default": 3,
+      "title": "Max Attempts",
+      "type": "integer"
+    },
+    "timeout_seconds": {
+      "default": 900,
+      "title": "Timeout Seconds",
+      "type": "integer"
+    },
+    "run_at_ts": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Run At Ts"
+    }
+  },
+  "required": [
+    "type"
+  ],
+  "title": "TasksCreateParams",
+  "type": "object"
+}

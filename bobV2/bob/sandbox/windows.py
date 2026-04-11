@@ -3,6 +3,7 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 import os
+import re
 
 from bob.sandbox.base import SandboxRunner
 from bob.protocol.config_types import SandboxPolicy, SandboxMode
@@ -33,8 +34,12 @@ class WindowsSandbox(SandboxRunner):
     def __init__(self, policy: SandboxPolicy, cwd: Path):
         self._policy = policy
         self._cwd = cwd
-        self._read_dirs = getattr(policy, 'sandbox_read_dirs', [])
-        self._write_dirs = getattr(policy, 'sandbox_write_dirs', [])
+        # New schema uses writable_roots. Keep legacy attr fallback for compatibility.
+        legacy_read = getattr(policy, "sandbox_read_dirs", [])
+        legacy_write = getattr(policy, "sandbox_write_dirs", [])
+        writable_roots = [Path(p) for p in getattr(policy, "writable_roots", [])]
+        self._read_dirs = [Path(p) for p in legacy_read] or writable_roots
+        self._write_dirs = [Path(p) for p in legacy_write] or writable_roots
 
     def wrap_command(self, cmd: list[str]) -> list[str]:
         if not HAS_WIN32:
@@ -46,7 +51,7 @@ class WindowsSandbox(SandboxRunner):
             return cmd
 
         # Validate path grants before executing
-        if mode in (SandboxMode.WORKSPACE_READ, SandboxMode.WORKSPACE_WRITE):
+        if self._is_workspace_scoped_mode(mode):
             violation = self._check_path_grants(cmd)
             if violation:
                 raise PermissionError(
@@ -69,6 +74,38 @@ class WindowsSandbox(SandboxRunner):
         # This is left as a platform-specific enhancement; the no-op return
         # ensures the CLI stays functional on Windows today.
         return cmd
+
+    @staticmethod
+    def _is_workspace_scoped_mode(mode: SandboxMode) -> bool:
+        """
+        Handle current and legacy mode names without relying on removed enum members.
+        """
+        value = mode.value if hasattr(mode, "value") else str(mode)
+        return value in ("workspace-write", "workspace-read")
+
+    @staticmethod
+    def _unwrap_shell_wrappers(cmd: list[str]) -> list[str]:
+        """
+        Canonicalize shell wrappers so policy checks inspect real command args.
+        """
+        if not cmd:
+            return cmd
+        out = list(cmd)
+        exe = out[0].lower().replace(".exe", "")
+
+        # cmd /c <command...>
+        if exe == "cmd" and len(out) >= 3 and out[1].lower() == "/c":
+            return WindowsSandbox._unwrap_shell_wrappers(out[2:])
+
+        # powershell -command <command...>
+        if exe in ("powershell", "pwsh") and len(out) >= 3 and out[1].lower() in ("-command", "-c"):
+            remainder = out[2:]
+            if len(remainder) == 1:
+                # Cheap split is enough for path-grant checks.
+                return WindowsSandbox._unwrap_shell_wrappers(remainder[0].split())
+            return WindowsSandbox._unwrap_shell_wrappers(remainder)
+
+        return out
     
     def _check_path_grants(self, cmd: list[str]) -> str | None:
         """Check if command accesses paths outside granted directories.
@@ -79,16 +116,21 @@ class WindowsSandbox(SandboxRunner):
         if not cmd:
             return None
         
+        canonical = self._unwrap_shell_wrappers(cmd)
+
         # Extract potential file paths from command arguments
         paths_to_check = []
-        for arg in cmd[1:]:  # Skip command name
-            # Skip flags
-            if arg.startswith("-"):
+        for arg in canonical[1:]:  # Skip command name
+            # Skip standard flags (/c, /s, -n, --long-flag, etc.)
+            if re.match(r"^[-/][A-Za-z?][\w-]*$", arg):
                 continue
             # Check if argument looks like a path
             if "/" in arg or "\\" in arg or os.path.exists(arg):
                 try:
-                    paths_to_check.append(Path(arg).resolve())
+                    p = Path(arg)
+                    if not p.is_absolute():
+                        p = self._cwd / p
+                    paths_to_check.append(p.resolve())
                 except Exception:
                     continue
         
@@ -99,9 +141,10 @@ class WindowsSandbox(SandboxRunner):
         
         # Determine which directories are allowed
         allowed_dirs = []
-        if mode == SandboxMode.WORKSPACE_READ:
+        mode_value = mode.value if hasattr(mode, "value") else str(mode)
+        if mode_value == "workspace-read":
             allowed_dirs = self._read_dirs or [self._cwd]
-        elif mode == SandboxMode.WORKSPACE_WRITE:
+        elif mode_value == "workspace-write":
             allowed_dirs = self._write_dirs or [self._cwd]
         
         # Check each path against allowed directories

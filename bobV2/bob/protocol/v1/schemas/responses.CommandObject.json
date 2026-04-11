@@ -1,0 +1,56 @@
+{
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "running",
+        "completed",
+        "failed",
+        "cancelled"
+      ],
+      "title": "State",
+      "type": "string"
+    },
+    "created_at_ts": {
+      "title": "Created At Ts",
+      "type": "integer"
+    },
+    "updated_at_ts": {
+      "title": "Updated At Ts",
+      "type": "integer"
+    },
+    "command": {
+      "title": "Command",
+      "type": "string"
+    },
+    "exit_code": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Exit Code"
+    }
+  },
+  "required": [
+    "id",
+    "thread_id",
+    "state",
+    "created_at_ts",
+    "updated_at_ts",
+    "command"
+  ],
+  "title": "CommandObject",
+  "type": "object"
+}

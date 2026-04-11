@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "limit": {
+      "default": 200,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "HistoryReadParams",
+  "type": "object"
+}

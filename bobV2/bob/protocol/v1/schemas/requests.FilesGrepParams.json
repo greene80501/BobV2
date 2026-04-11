@@ -1,0 +1,30 @@
+{
+  "properties": {
+    "pattern": {
+      "title": "Pattern",
+      "type": "string"
+    },
+    "root": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Root"
+    },
+    "case_sensitive": {
+      "default": false,
+      "title": "Case Sensitive",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "pattern"
+  ],
+  "title": "FilesGrepParams",
+  "type": "object"
+}

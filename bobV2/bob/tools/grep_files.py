@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 GREP_FILES_DESCRIPTION = (
     "Search files for lines matching a regular expression. "
@@ -44,9 +45,7 @@ async def grep_files_handler(tool_input: dict, context: Any) -> str:
 
     root_str: str | None = tool_input.get("path")
     if root_str:
-        root = Path(root_str)
-        if not root.is_absolute():
-            root = context.cwd / root
+        root = resolve_tool_path(root_str, context.cwd)
     else:
         root = context.cwd
 

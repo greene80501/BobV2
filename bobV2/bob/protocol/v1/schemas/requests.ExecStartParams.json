@@ -1,0 +1,35 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "command": {
+      "title": "Command",
+      "type": "string"
+    },
+    "cwd": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Cwd"
+    },
+    "background": {
+      "default": false,
+      "title": "Background",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "thread_id",
+    "command"
+  ],
+  "title": "ExecStartParams",
+  "type": "object"
+}

@@ -186,6 +186,19 @@ class BobConfig(BaseModel):
     auto_compact_threshold_tokens: int = 0
     # Maximum context tokens to use (0 = use model default)
     max_context_tokens: int = 0
+    # Effective share of model context window usable for rolling history.
+    # Keeps headroom for instructions/tools/provider-side overhead.
+    effective_context_window_percent: float = 0.85
+    # Reserved output headroom used when deciding compaction thresholds.
+    compact_reserve_output_tokens: int = 12_000
+    # Safety buffer below effective context window where compaction triggers.
+    compact_trigger_buffer_tokens: int = 8_000
+    # Enable reactive context-overflow recovery in turn execution.
+    enable_reactive_compaction: bool = True
+    # Enable compaction in the middle of tool-heavy turns when near limit.
+    enable_mid_turn_compaction: bool = True
+    # Maximum compact/retry recovery attempts for a single turn.
+    compact_max_retries: int = 3
 
     # ------------------------------------------------------------------
     # Service tier / billing

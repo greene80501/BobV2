@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from bob.tools.path_utils import resolve_tool_path
 
 GLOB_FILES_DESCRIPTION = (
     "Find files matching a glob pattern. "
@@ -33,9 +34,7 @@ async def glob_files_handler(tool_input: dict, context: Any) -> str:
 
     root_str: str | None = tool_input.get("path")
     if root_str:
-        root = Path(root_str)
-        if not root.is_absolute():
-            root = context.cwd / root
+        root = resolve_tool_path(root_str, context.cwd)
     else:
         root = context.cwd
 

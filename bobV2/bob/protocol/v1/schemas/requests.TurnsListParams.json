@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "thread_id"
+  ],
+  "title": "TurnsListParams",
+  "type": "object"
+}

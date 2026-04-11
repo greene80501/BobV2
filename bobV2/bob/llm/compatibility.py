@@ -69,6 +69,7 @@ _PROVIDER_ALIASES: dict[str, str] = {
     "anthropic": "anthropic",
     "gemini": "gemini",
     "google_ai_studio": "gemini",
+    "google_gemini": "gemini",
     "vertex_ai": "vertex_ai",
     "azure": "azure",
     "groq": "groq",
@@ -362,13 +363,13 @@ def resolve_catalog_provider(model: str) -> Optional[str]:
 
 
 def infer_provider(model: str, catalog_provider: Optional[str] = None) -> str:
-    if catalog_provider:
-        return _PROVIDER_ALIASES.get(catalog_provider, catalog_provider)
-
     if "/" in model:
         prefix = model.split("/", 1)[0].lower()
         if prefix in _PREFIX_PROVIDER_MAP:
             return _PREFIX_PROVIDER_MAP[prefix]
+
+    if catalog_provider:
+        return _PROVIDER_ALIASES.get(catalog_provider, catalog_provider)
 
     bare = model.split("/", 1)[-1].lower()
     for prefix, provider in _MODEL_PATTERNS:

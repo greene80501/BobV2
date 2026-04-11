@@ -1,0 +1,30 @@
+{
+  "properties": {
+    "channels": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Channels",
+      "type": "array"
+    },
+    "after_cursor": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "After Cursor"
+    },
+    "limit": {
+      "default": 200,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "title": "RealtimeReplayParams",
+  "type": "object"
+}

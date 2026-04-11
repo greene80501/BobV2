@@ -1,0 +1,18 @@
+{
+  "properties": {
+    "protocol_version": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Protocol Version"
+    }
+  },
+  "title": "ServerCapabilitiesParams",
+  "type": "object"
+}

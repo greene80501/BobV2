@@ -46,17 +46,26 @@ class AnalyticsTracker:
         # Session accumulators
         self._session_input_tokens: int = 0
         self._session_output_tokens: int = 0
+        self._session_cached_input_tokens: int = 0
         self._session_cost_usd: float = 0.0
         self._session_turns: int = 0
 
         # Last turn (for display after each response)
         self.last_turn_input_tokens: int = 0
         self.last_turn_output_tokens: int = 0
+        self.last_turn_cached_input_tokens: int = 0
         self.last_turn_cost_usd: Optional[float] = None
         self.last_turn_latency_ms: Optional[int] = None
         self.last_turn_changed_files: list[str] = []
         # Pending changed-files set by run_turn before finish_turn is called
         self._pending_changed_files: list[str] = []
+        # Compaction telemetry
+        self._compaction_count: int = 0
+        self._compaction_success_count: int = 0
+        self._compaction_failure_count: int = 0
+        self._compaction_reduction_tokens: int = 0
+        self._compaction_reason_counts: dict[str, int] = {}
+        self._last_compaction_summary: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -69,20 +78,36 @@ class AnalyticsTracker:
         self._model = model
         self._start_time = time.monotonic()
 
-    async def finish_turn(self, input_tokens: int, output_tokens: int) -> None:
+    async def finish_turn(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int = 0,
+    ) -> None:
         """Call after the model stream ends with the token counts.
 
         Computes cost via the model catalog, updates session accumulators,
         and persists the record to the analytics DB.
+
+        cached_input_tokens is the portion of input_tokens served from the
+        provider cache (included in input_tokens total).  Cached tokens are
+        billed at the model's cached_per_1m rate rather than the full
+        input_per_1m rate, so passing this value is required for an
+        accurate cost estimate.
         """
         latency_ms = int((time.monotonic() - self._start_time) * 1000) if self._start_time else None
 
-        # Cost calculation from catalog pricing
+        # Cost calculation from catalog pricing.
+        # input_tokens INCLUDES cached_input_tokens; split them so cached
+        # tokens are billed at the discounted rate.
         pricing = self._catalog.get_pricing(self._model)
         if pricing and (input_tokens or output_tokens):
-            input_cost  = (input_tokens  / 1_000_000) * pricing["input_per_1m"]
-            output_cost = (output_tokens / 1_000_000) * pricing["output_per_1m"]
-            total_cost  = input_cost + output_cost
+            cached_rate  = pricing.get("cached_per_1m") or pricing["input_per_1m"] * 0.1
+            normal_input = max(0, input_tokens - cached_input_tokens)
+            input_cost   = (normal_input        / 1_000_000) * pricing["input_per_1m"]
+            input_cost  += (cached_input_tokens / 1_000_000) * cached_rate
+            output_cost  = (output_tokens       / 1_000_000) * pricing["output_per_1m"]
+            total_cost   = input_cost + output_cost
         else:
             input_cost  = None
             output_cost = None
@@ -91,41 +116,63 @@ class AnalyticsTracker:
         total_tokens = input_tokens + output_tokens
 
         # Update last-turn display values
-        self.last_turn_input_tokens  = input_tokens
-        self.last_turn_output_tokens = output_tokens
-        self.last_turn_cost_usd      = total_cost
-        self.last_turn_latency_ms    = latency_ms
-        self.last_turn_changed_files = list(self._pending_changed_files)
-        self._pending_changed_files  = []
+        self.last_turn_input_tokens        = input_tokens
+        self.last_turn_output_tokens       = output_tokens
+        self.last_turn_cached_input_tokens = cached_input_tokens
+        self.last_turn_cost_usd            = total_cost
+        self.last_turn_latency_ms          = latency_ms
+        self.last_turn_changed_files       = list(self._pending_changed_files)
+        self._pending_changed_files        = []
 
         # Update session accumulators
-        self._session_input_tokens  += input_tokens
-        self._session_output_tokens += output_tokens
-        self._session_cost_usd      += total_cost or 0.0
-        self._session_turns         += 1
+        self._session_input_tokens        += input_tokens
+        self._session_output_tokens       += output_tokens
+        self._session_cached_input_tokens += cached_input_tokens
+        self._session_cost_usd            += total_cost or 0.0
+        self._session_turns               += 1
 
         # Derive provider from model name prefix
         provider = _infer_provider(self._model)
 
         # Persist
         await self._db.record_turn(
-            session_id    = self._session_id,
-            turn_id       = self._turn_id,
-            model         = self._model,
-            provider      = provider,
-            input_tokens  = input_tokens,
-            output_tokens = output_tokens,
-            total_tokens  = total_tokens,
-            input_cost_usd  = input_cost,
-            output_cost_usd = output_cost,
-            total_cost_usd  = total_cost,
-            latency_ms      = latency_ms,
-            changed_files   = self.last_turn_changed_files or None,
+            session_id          = self._session_id,
+            turn_id             = self._turn_id,
+            model               = self._model,
+            provider            = provider,
+            input_tokens        = input_tokens,
+            output_tokens       = output_tokens,
+            total_tokens        = total_tokens,
+            cached_input_tokens = cached_input_tokens,
+            input_cost_usd      = input_cost,
+            output_cost_usd     = output_cost,
+            total_cost_usd      = total_cost,
+            latency_ms          = latency_ms,
+            changed_files       = self.last_turn_changed_files or None,
         )
 
     def set_changed_files(self, files: list[str]) -> None:
         """Called by run_turn after tool execution to record changed paths."""
         self._pending_changed_files = files
+
+    def record_compaction(
+        self,
+        *,
+        reason: str,
+        token_before: int,
+        token_after: int,
+        success: bool,
+    ) -> None:
+        self._compaction_count += 1
+        self._compaction_reason_counts[reason] = self._compaction_reason_counts.get(reason, 0) + 1
+        if success:
+            self._compaction_success_count += 1
+            reduced = max(0, token_before - token_after)
+            self._compaction_reduction_tokens += reduced
+            self._last_compaction_summary = f"{reason}: -{reduced:,} tokens"
+        else:
+            self._compaction_failure_count += 1
+            self._last_compaction_summary = f"{reason}: failed"
 
     # ------------------------------------------------------------------
     # Session-level aggregates (read by TUI for /cost, /usage commands)
@@ -138,6 +185,10 @@ class AnalyticsTracker:
     @property
     def session_output_tokens(self) -> int:
         return self._session_output_tokens
+
+    @property
+    def session_cached_input_tokens(self) -> int:
+        return self._session_cached_input_tokens
 
     @property
     def session_tokens(self) -> int:
@@ -187,7 +238,10 @@ class AnalyticsTracker:
             f"Total tokens:   {self.session_tokens:,}  "
             f"({self._session_input_tokens:,} in + {self._session_output_tokens:,} out)",
             f"Turns:          {self._session_turns}",
+            f"Compactions:    {self._compaction_success_count}/{self._compaction_count} successful",
         ]
+        if self._compaction_count:
+            lines.append(f"Compaction cut: {self._compaction_reduction_tokens:,} tokens total")
         return "\n".join(lines)
 
 

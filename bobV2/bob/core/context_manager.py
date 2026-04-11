@@ -37,6 +37,54 @@ class ContextManager:
         if self._items:
             self._items.pop(0)
 
+    def trim_oldest_tool_results(self, keep_recent: int = 40) -> int:
+        """
+        Drop older ``function_call_output`` entries while keeping recent ones.
+
+        Returns the number of removed items.
+        """
+        if keep_recent < 0:
+            keep_recent = 0
+
+        output_indexes = [
+            i for i, item in enumerate(self._items)
+            if item.get("type") == "function_call_output"
+        ]
+        if len(output_indexes) <= keep_recent:
+            return 0
+
+        remove_indexes = set(output_indexes[: len(output_indexes) - keep_recent])
+        before = len(self._items)
+        self._items = [
+            item for i, item in enumerate(self._items)
+            if i not in remove_indexes
+        ]
+        return before - len(self._items)
+
+    def trim_oldest_assistant_messages(self, keep_recent: int = 24) -> int:
+        """
+        Drop older assistant messages (role=assistant) while keeping recent ones.
+
+        Returns the number of removed items.
+        """
+        if keep_recent < 0:
+            keep_recent = 0
+
+        assistant_indexes = [
+            i for i, item in enumerate(self._items)
+            if item.get("role") == "assistant"
+        ]
+        if len(assistant_indexes) <= keep_recent:
+            return 0
+
+        remove_indexes = set(assistant_indexes[: len(assistant_indexes) - keep_recent])
+        before = len(self._items)
+        self._items = [
+            item for i, item in enumerate(self._items)
+            if i not in remove_indexes
+        ]
+        return before - len(self._items)
+
     def drop_last_n_user_turns(self, n: int) -> None:
         """
         Drop the last *n* user-turn boundaries from history.

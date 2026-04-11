@@ -25,6 +25,7 @@ from bob.protocol.events import (
     ExecApprovalResolvedEvent,
     TokenBudgetEvent,
     ErrorEvent,
+    WarningEvent,
 )
 from bob.llm.client import (
     TextDeltaEvent as ClientTextDelta,
@@ -378,6 +379,8 @@ async def run_turn(
     total_input_tokens = 0
     total_output_tokens = 0
     total_cached_input_tokens = 0
+    context_recovery_attempts = 0
+    max_compact_retries = max(1, int(getattr(session.config, "compact_max_retries", 3) or 3))
 
     try:
         while iteration < max_iterations:
@@ -431,6 +434,7 @@ async def run_turn(
             tool_calls: list[ClientToolCall] = []
             iter_input_tokens = 0
             iter_output_tokens = 0
+            stream_error_message: str | None = None
 
             # ----------------------------------------------------------
             # Stream from model
@@ -470,6 +474,7 @@ async def run_turn(
                         total_cached_input_tokens += ev.cached_input_tokens
 
                     elif isinstance(ev, ClientStreamError):
+                        stream_error_message = ev.message
                         await emit(ErrorEvent(
                             type="error",
                             message=f"Stream error: {ev.message}",
@@ -495,6 +500,57 @@ async def run_turn(
                     type="turn_interrupted", turn_id=turn_id, graceful=True
                 ))
                 return
+
+            if stream_error_message:
+                from bob.core.context_errors import classify_context_error
+
+                classification = classify_context_error(stream_error_message)
+                if (
+                    classification.kind == "context_window_exceeded"
+                    and getattr(session.config, "enable_reactive_compaction", True)
+                ):
+                    if context_recovery_attempts < max_compact_retries:
+                        context_recovery_attempts += 1
+                        if context_recovery_attempts == 1 and session.context_manager.size > 1:
+                            session.context_manager.remove_first_item()
+                            await emit(WarningEvent(
+                                type="warning",
+                                message="Context window exceeded. Retrying after trimming oldest history item.",
+                            ))
+                            continue
+
+                        compacted = await session.compact_history(
+                            reason="context_window_exceeded",
+                            sub_id=sub_id,
+                        )
+                        if compacted:
+                            await emit(WarningEvent(
+                                type="warning",
+                                message="Recovered from context overflow by compacting history and continuing.",
+                            ))
+                            continue
+                    await emit(ErrorEvent(
+                        type="error",
+                        message=(
+                            "Context window exceeded and recovery attempts were exhausted. "
+                            "Please start a new thread or compact manually."
+                        ),
+                    ))
+                    break
+
+                if classification.kind == "max_output_exceeded":
+                    session.context_manager.record_items([{
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "Continue from where you stopped. Do not repeat prior text.",
+                        }],
+                    }])
+                    await emit(WarningEvent(
+                        type="warning",
+                        message="Model hit output limits. Auto-continuing response.",
+                    ))
+                    continue
 
             # ----------------------------------------------------------
             # Emit token budget update
@@ -963,6 +1019,17 @@ async def run_turn(
                         "results": tool_results,
                     })
 
+                if getattr(session.config, "enable_mid_turn_compaction", True):
+                    from bob.core.context_budget import compute_context_budget
+
+                    budget = compute_context_budget(session)
+                    token_count = session.context_manager.approx_token_count()
+                    if token_count >= budget.effective_context_window:
+                        await session.compact_history(
+                            reason="mid_turn_continuation",
+                            sub_id=sub_id,
+                        )
+
         # ------------------------------------------------------------------ #
         # Turn ended normally                                                 #
         # ------------------------------------------------------------------ #
@@ -988,7 +1055,11 @@ async def run_turn(
             changed = _diff_snapshot(_file_snapshot_before, _snapshot_dir(session.cwd))
             if changed:
                 session.analytics.set_changed_files(changed)
-            await session.analytics.finish_turn(total_input_tokens, total_output_tokens)
+            await session.analytics.finish_turn(
+                total_input_tokens,
+                total_output_tokens,
+                total_cached_input_tokens,
+            )
 
     except asyncio.CancelledError:
         await emit(TurnInterruptedEvent(

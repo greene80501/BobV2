@@ -413,6 +413,14 @@ class HistoryCompactedEvent(BaseModel):
     turns_removed: int
 
 
+class ContextCompactionEvent(BaseModel):
+    type: Literal["context_compaction"] = "context_compaction"
+    reason: str
+    token_before: int
+    token_after: int
+    success: bool
+
+
 class UndoCompletedEvent(BaseModel):
     type: Literal["undo_completed"] = "undo_completed"
     turns_removed: int
@@ -682,6 +690,7 @@ EventMsg = Annotated[
         # History
         HistoryEntryResponseEvent,
         HistoryCompactedEvent,
+        ContextCompactionEvent,
         UndoCompletedEvent,
         ThreadRollbackCompletedEvent,
         # Hooks

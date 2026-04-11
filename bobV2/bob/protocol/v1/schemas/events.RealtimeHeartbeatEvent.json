@@ -1,0 +1,24 @@
+{
+  "properties": {
+    "type": {
+      "const": "realtime.heartbeat",
+      "default": "realtime.heartbeat",
+      "title": "Type",
+      "type": "string"
+    },
+    "connection_id": {
+      "title": "Connection Id",
+      "type": "string"
+    },
+    "ts_ms": {
+      "title": "Ts Ms",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "connection_id",
+    "ts_ms"
+  ],
+  "title": "RealtimeHeartbeatEvent",
+  "type": "object"
+}

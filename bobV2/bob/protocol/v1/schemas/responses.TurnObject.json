@@ -1,0 +1,82 @@
+{
+  "properties": {
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "thread_id": {
+      "title": "Thread Id",
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "interrupted",
+        "failed",
+        "cancelled"
+      ],
+      "title": "State",
+      "type": "string"
+    },
+    "created_at_ts": {
+      "title": "Created At Ts",
+      "type": "integer"
+    },
+    "updated_at_ts": {
+      "title": "Updated At Ts",
+      "type": "integer"
+    },
+    "submission_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Submission Id"
+    },
+    "turn_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Turn Id"
+    },
+    "output_text": {
+      "default": "",
+      "title": "Output Text",
+      "type": "string"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    }
+  },
+  "required": [
+    "id",
+    "thread_id",
+    "state",
+    "created_at_ts",
+    "updated_at_ts"
+  ],
+  "title": "TurnObject",
+  "type": "object"
+}
