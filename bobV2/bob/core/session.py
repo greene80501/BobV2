@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 import os
+import datetime
 from pathlib import Path
 from typing import Optional, AsyncIterator, Any
 from bob.config.schema import BobConfig
@@ -672,7 +673,6 @@ class BobSession:
         from bob.rollout.state_db import StateDb
         from bob.rollout.session_index import SessionIndex
         from bob.rollout.recorder import RolloutRecorder
-        import datetime
 
         db_path = bob_home / "state.sqlite"
         self._state_db = StateDb(db_path)
@@ -681,14 +681,40 @@ class BobSession:
 
         ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         rollout_path = sessions_dir / f"{ts}-{self.session_id[:8]}.jsonl"
+        await self._switch_persistence_target(
+            session_id=self.session_id,
+            rollout_path=rollout_path,
+            append_existing=False,
+        )
 
+    async def _switch_persistence_target(
+        self,
+        *,
+        session_id: str,
+        rollout_path: Path,
+        append_existing: bool,
+    ) -> None:
+        """Rotate recorder + index entry to a specific session/thread."""
+        if self.ephemeral or self._state_db is None:
+            self.session_id = session_id
+            return
+
+        from bob.rollout.recorder import RolloutRecorder
+
+        if self._recorder is not None:
+            await self._recorder.stop()
+
+        self.session_id = session_id
         self._recorder = RolloutRecorder(
             path=rollout_path,
             session_id=self.session_id,
             model=self.config.model,
             cwd=str(self.cwd),
         )
-        await self._recorder.start()
+        if append_existing:
+            await self._recorder.start_append()
+        else:
+            await self._recorder.start()
 
         await self._state_db.upsert_thread(
             id=self.session_id,
@@ -697,6 +723,12 @@ class BobSession:
             model=self.config.model,
             cwd=str(self.cwd),
         )
+
+    def _build_new_rollout_path(self, session_id: str) -> Path:
+        ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        sessions_dir = self.bob_home / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        return sessions_dir / f"{ts}-{session_id[:8]}.jsonl"
 
     async def _load_system_prompt(self) -> None:
         from bob.prompts import load_system_prompt
@@ -785,10 +817,18 @@ class BobSession:
     async def reset(self) -> None:
         """Start a new conversation (clear history, keep session alive)."""
         self.context_manager.replace([])
-        self.session_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        if not self.ephemeral and self._state_db is not None:
+            await self._switch_persistence_target(
+                session_id=new_id,
+                rollout_path=self._build_new_rollout_path(new_id),
+                append_existing=False,
+            )
+        else:
+            self.session_id = new_id
         await self._load_system_prompt()
 
-    async def resume(self, path: str) -> None:
+    async def resume(self, path: str, session_id: Optional[str] = None) -> None:
         """Load history from a rollout file."""
         from bob.rollout.recorder import load_rollout
         from bob.core.rollout_reconstruction import reconstruct_history
@@ -798,22 +838,66 @@ class BobSession:
         self.context_manager.replace(result.history)
         if result.previous_model:
             self.config = self.config.model_copy(update={"model": result.previous_model})
+            self.client = self._make_client(self.config.model)
+        if not self.ephemeral and self._state_db is not None:
+            target_session_id = session_id or self.session_id
+            await self._switch_persistence_target(
+                session_id=target_session_id,
+                rollout_path=Path(path),
+                append_existing=True,
+            )
 
     async def resume_by_id(self, session_id: str) -> None:
         if self._session_index:
             record = await self._session_index.find_by_id(session_id)
             if record and record.path:
-                await self.resume(record.path)
+                await self.resume(record.path, session_id=record.id)
 
     async def fork(self, path: str) -> None:
         """Fork from an existing session's history, creating a new session_id."""
         await self.resume(path)
-        self.session_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        if not self.ephemeral and self._state_db is not None:
+            await self._switch_persistence_target(
+                session_id=new_id,
+                rollout_path=self._build_new_rollout_path(new_id),
+                append_existing=False,
+            )
+        else:
+            self.session_id = new_id
 
     async def list_sessions(self):
         if self._session_index:
-            return await self._session_index.list_sessions()
+            return await self._session_index.list_sessions(sort_by="updated_at")
         return []
+
+    async def _touch_session_activity(self, preview: Optional[str], *, turn_completed: bool = True) -> None:
+        if self.ephemeral or self._state_db is None:
+            return
+        try:
+            await self._state_db.touch_thread_activity(
+                self.session_id,
+                preview=preview[:300] if preview else None,
+                increment_turn_count=turn_completed,
+            )
+        except Exception:
+            pass
+
+    def _preview_from_user_turn(self, op: UserTurnOp) -> str:
+        parts: list[str] = []
+        for item in getattr(op, "items", []) or []:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+                continue
+            if isinstance(item, dict):
+                v = item.get("text")
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
+        merged = " ".join(parts).strip()
+        if len(merged) > 280:
+            return merged[:280] + "..."
+        return merged
 
     async def submit_compact(self) -> None:
         await self.submit(CompactOp(type="compact"))
@@ -1361,6 +1445,7 @@ class BobSession:
             # ----------------------------------------------------------------
             if isinstance(op, UserTurnOp):
                 await self.manage_context_pre_turn(sub_id)
+                user_preview = self._preview_from_user_turn(op)
 
                 cancel_ev = asyncio.Event()
                 self._current_turn_cancel = cancel_ev
@@ -1432,6 +1517,7 @@ class BobSession:
                 finally:
                     self._current_turn_cancel = None
                     current_turn_task = None
+                    await self._touch_session_activity(user_preview, turn_completed=True)
 
     # ------------------------------------------------------------------
     # Shell execution helper (user shell commands, outside agent turns)

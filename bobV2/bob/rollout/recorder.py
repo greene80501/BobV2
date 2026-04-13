@@ -64,6 +64,20 @@ class RolloutRecorder:
         self._task = asyncio.create_task(self._writer_loop())
         self._started = True
 
+    async def start_append(self) -> None:
+        """
+        Start writer in append mode for an existing rollout file.
+
+        If the file does not exist yet, this falls back to :meth:`start`
+        so a valid ``session_meta`` header is written.
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._path.exists() or self._path.stat().st_size == 0:
+            await self.start()
+            return
+        self._task = asyncio.create_task(self._writer_loop())
+        self._started = True
+
     async def write(self, record: dict) -> None:
         """
         Enqueue *record* for writing.

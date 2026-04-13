@@ -2141,7 +2141,12 @@ class Interface:
 
         elif cmd == SlashCommand.CLEAR:
             os.system("cls" if sys.platform == "win32" else "clear")
+            await self._session.reset()
+            self._pending_context_items.clear()
+            self._last_assistant_text = ""
             self._print_header()
+            _p(f"  {_d('cleared screen, chat history, and context window for this session')}")
+            _p()
 
         elif cmd == SlashCommand.NEW:
             _p(f"  {_d('starting new chat…')}")
@@ -2253,22 +2258,71 @@ class Interface:
             if not sessions:
                 _p(f"  {_d('no saved sessions')}")
             else:
+                shown = sessions[:20]
                 _p()
-                for i, s in enumerate(sessions[:10], 1):
-                    label = getattr(s, "name", None) or getattr(s, "id", "?")[:12]
-                    _p(f"  {_d(str(i) + '.')}  {label}")
+                for i, s in enumerate(shown, 1):
+                    label = (getattr(s, "name", None) or "").strip() or getattr(s, "id", "?")[:12]
+                    sid = getattr(s, "id", "?")[:8]
+                    model = getattr(s, "model", None) or "unknown-model"
+                    updated = getattr(s, "updated_at", "") or ""
+                    preview = (getattr(s, "preview", None) or "").strip()
+                    line = f"  {_d(str(i) + '.')}  {label} [{sid}] ({model})"
+                    if updated:
+                        line += f"  {updated[:19]}"
+                    _p(line)
+                    if preview:
+                        _p(f"      {_d(preview[:120])}")
                 _p()
-                try:
-                    ps = PromptSession()
-                    raw = await ps.prompt_async("  select number or id: ")
-                    idx = int(raw.strip()) - 1
-                    if 0 <= idx < len(sessions):
-                        s = sessions[idx]
-                        await self._session.resume(s.path)
-                        label = getattr(s, "name", None) or getattr(s, "id", "?")[:12]
-                        _p(f"  {_d(f'resumed: {label}')}")
-                except Exception:
+
+                raw = args.strip()
+                if not raw:
+                    try:
+                        ps = PromptSession()
+                        raw = (await ps.prompt_async("  select number, id prefix, or search text: ")).strip()
+                    except Exception:
+                        raw = ""
+                if not raw:
                     _p(f"  {_d('cancelled')}")
+                else:
+                    selected = None
+                    # Numeric choice
+                    if raw.isdigit():
+                        idx = int(raw) - 1
+                        if 0 <= idx < len(shown):
+                            selected = shown[idx]
+                    # Direct/partial id match
+                    if selected is None:
+                        id_matches = [s for s in sessions if str(getattr(s, "id", "")).startswith(raw)]
+                        if len(id_matches) == 1:
+                            selected = id_matches[0]
+                    # Name/preview search fallback
+                    if selected is None:
+                        q = raw.lower()
+                        text_matches = []
+                        for s in sessions:
+                            hay = " ".join([
+                                str(getattr(s, "name", "") or ""),
+                                str(getattr(s, "cwd", "") or ""),
+                                str(getattr(s, "preview", "") or ""),
+                                str(getattr(s, "id", "") or ""),
+                            ]).lower()
+                            if q in hay:
+                                text_matches.append(s)
+                        if len(text_matches) == 1:
+                            selected = text_matches[0]
+                        elif len(text_matches) > 1:
+                            _p(f"  {_y('⚠')} multiple matches; use a number or longer id prefix")
+                            selected = None
+
+                    if selected is None:
+                        _p(f"  {_y('⚠')} no matching saved session")
+                    else:
+                        await self._session.resume(
+                            selected.path,
+                            session_id=getattr(selected, "id", None),
+                        )
+                        label = getattr(selected, "name", None) or getattr(selected, "id", "?")[:12]
+                        _p(f"  {_d(f'resumed: {label}')}")
 
         elif cmd == SlashCommand.DEBUG_M_DROP:
             from bob.protocol.ops import DropMemoriesOp

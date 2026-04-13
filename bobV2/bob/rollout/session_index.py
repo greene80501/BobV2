@@ -26,6 +26,7 @@ class SessionIndex:
         page: int = 0,
         page_size: int = 25,
         cwd_filter: Optional[str] = None,
+        sort_by: str = "updated_at",
     ) -> list[ThreadRecord]:
         """
         Return a page of sessions ordered by creation time (newest first).
@@ -45,6 +46,7 @@ class SessionIndex:
             limit=page_size,
             offset=page * page_size,
             cwd_filter=cwd_filter,
+            sort_by=sort_by,
         )
 
     # ------------------------------------------------------------------
@@ -69,3 +71,11 @@ class SessionIndex:
         if record is None:
             record = await self.find_by_id(name_or_id)
         return record
+
+    async def find_by_prefix(self, id_prefix: str) -> Optional[ThreadRecord]:
+        """Find a unique session by short id prefix."""
+        rows = await self.list_sessions(page=0, page_size=200, sort_by="updated_at")
+        matches = [r for r in rows if r.id.startswith(id_prefix)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
