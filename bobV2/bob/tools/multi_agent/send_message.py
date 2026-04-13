@@ -3,23 +3,27 @@ from __future__ import annotations
 from typing import Any
 
 SEND_MESSAGE_DESCRIPTION = (
-    "Send a message to a running sub-agent. "
-    "Use this to provide additional instructions or context after spawning."
+    "Send a contextual message to a sub-agent without replacing its primary task. "
+    "Use assign_task when you want to schedule a new concrete task."
 )
 
 SEND_MESSAGE_SCHEMA = {
     "type": "object",
     "properties": {
+        "agent_ref": {
+            "type": "string",
+            "description": "Target sub-agent reference (id, path, or unique name).",
+        },
         "agent_id": {
             "type": "string",
-            "description": "ID of the target sub-agent (returned by spawn_agent).",
+            "description": "Backward-compatible alias for agent_ref.",
         },
         "message": {
             "type": "string",
             "description": "Message content to deliver to the sub-agent.",
         },
     },
-    "required": ["agent_id", "message"],
+    "required": ["message"],
 }
 
 
@@ -34,18 +38,18 @@ async def send_message_handler(tool_input: dict, context: Any) -> str:
     if thread_manager is None:
         return "Error: multi-agent not available in this session"
 
-    agent_id: str = tool_input.get("agent_id", "")
+    agent_ref: str = (tool_input.get("agent_ref") or tool_input.get("agent_id") or "").strip()
     message: str = tool_input.get("message", "")
 
-    if not agent_id:
-        return "Error: agent_id is required"
+    if not agent_ref:
+        return "Error: agent_ref (or agent_id) is required"
     if not message:
         return "Error: message is required"
 
     try:
-        await thread_manager.send_message(agent_id=agent_id, message=message)
-        return f"Message sent to agent {agent_id}."
+        result = await thread_manager.send_message(agent_id=agent_ref, message=message)
+        return result
     except KeyError:
-        return f"Error: no sub-agent found with id '{agent_id}'"
+        return f"Error: no sub-agent found with reference '{agent_ref}'"
     except Exception as exc:
-        return f"Error sending message to agent {agent_id}: {exc}"
+        return f"Error sending message to agent {agent_ref}: {exc}"

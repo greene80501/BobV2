@@ -14,7 +14,7 @@ from bob.protocol.events import Event, EventMsg
 
 
 class ToolContext:
-    """Passed to tool handlers — contains session state they need."""
+    """Passed to tool handlers â€” contains session state they need."""
 
     def __init__(self, session: "BobSession"):
         self.cwd = session.cwd
@@ -25,6 +25,7 @@ class ToolContext:
         self.on_output_delta = None  # set per-turn
         self.on_plan_update = None   # set per-turn
         self.on_request_user_input = None
+        self.current_tool_call_id = None
         # Back-reference so plan_mode tools can toggle the flag
         self._session = session
         # Task database for task management tools
@@ -53,8 +54,9 @@ class BobSession:
         self._agent_task: Optional[asyncio.Task] = None
         self._current_turn_cancel: Optional[asyncio.Event] = None
         self._pending_approvals: dict[str, asyncio.Future] = {}
-        # Domains approved for web access this session (key = request_id → Future)
+        # Domains approved for web access this session (key = request_id â†’ Future)
         self._pending_network_approvals: dict[str, asyncio.Future] = {}
+        self._pending_dynamic_tool_calls: dict[str, asyncio.Future] = {}
 
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
@@ -107,7 +109,7 @@ class BobSession:
         # Pending user-input futures keyed by request_id
         self._pending_user_inputs: dict[str, asyncio.Future] = {}
 
-        # Persistence handles — populated in _setup_persistence
+        # Persistence handles â€” populated in _setup_persistence
         self._recorder = None
         self._state_db = None
         self._session_index = None
@@ -200,6 +202,12 @@ class BobSession:
         from bob.tools.multi_agent.close_agent import (
             close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
         )
+        from bob.tools.multi_agent.assign_task import (
+            assign_task_handler, ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
+        )
+        from bob.tools.multi_agent.resume_agent import (
+            resume_agent_handler, RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA,
+        )
         from bob.tools.task_create import (
             task_create_handler, TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA,
         )
@@ -221,6 +229,9 @@ class BobSession:
         from bob.tools.request_user_input import (
             request_user_input_handler, REQUEST_USER_INPUT_DESCRIPTION, REQUEST_USER_INPUT_SCHEMA,
         )
+        from bob.tools.tool_search import (
+            tool_search_handler, TOOL_SEARCH_DESCRIPTION, TOOL_SEARCH_SCHEMA,
+        )
         from bob.tools.git_worktree import (
             enter_worktree_handler, ENTER_WORKTREE_DESCRIPTION, ENTER_WORKTREE_SCHEMA,
             exit_worktree_handler, EXIT_WORKTREE_DESCRIPTION, EXIT_WORKTREE_SCHEMA,
@@ -241,20 +252,31 @@ class BobSession:
 
         # Core tools
         self.tool_registry.register(
-            "shell", SHELL_TOOL_DESCRIPTION, SHELL_TOOL_SCHEMA, shell_handler
+            "shell", SHELL_TOOL_DESCRIPTION, SHELL_TOOL_SCHEMA, shell_handler,
+            is_mutating=True,
+            supports_parallel=False,
+            emits_exec_events=True,
         )
         self.tool_registry.register(
-            "update_plan", UPDATE_PLAN_DESCRIPTION, UPDATE_PLAN_SCHEMA, update_plan_handler
+            "update_plan", UPDATE_PLAN_DESCRIPTION, UPDATE_PLAN_SCHEMA, update_plan_handler,
+            is_mutating=False,
+            supports_parallel=False,
         )
         self.tool_registry.register(
-            "view_image", VIEW_IMAGE_DESCRIPTION, VIEW_IMAGE_SCHEMA, view_image_handler
+            "view_image", VIEW_IMAGE_DESCRIPTION, VIEW_IMAGE_SCHEMA, view_image_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
-            "list_dir", LIST_DIR_DESCRIPTION, LIST_DIR_SCHEMA, list_dir_handler
+            "list_dir", LIST_DIR_DESCRIPTION, LIST_DIR_SCHEMA, list_dir_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
-        # Phase 1 — file tools
+        # Phase 1 â€” file tools
         self.tool_registry.register(
-            "read_file", READ_FILE_DESCRIPTION, READ_FILE_SCHEMA, read_file_handler
+            "read_file", READ_FILE_DESCRIPTION, READ_FILE_SCHEMA, read_file_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "write_file", WRITE_FILE_DESCRIPTION, WRITE_FILE_SCHEMA, write_file_handler
@@ -263,33 +285,49 @@ class BobSession:
             "edit_file", EDIT_FILE_DESCRIPTION, EDIT_FILE_SCHEMA, edit_file_handler
         )
         self.tool_registry.register(
-            "glob_files", GLOB_FILES_DESCRIPTION, GLOB_FILES_SCHEMA, glob_files_handler
+            "glob_files", GLOB_FILES_DESCRIPTION, GLOB_FILES_SCHEMA, glob_files_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
-            "grep_files", GREP_FILES_DESCRIPTION, GREP_FILES_SCHEMA, grep_files_handler
+            "grep_files", GREP_FILES_DESCRIPTION, GREP_FILES_SCHEMA, grep_files_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
-        # Phase 2 — utilities
+        # Phase 2 â€” utilities
         self.tool_registry.register(
-            "sleep", SLEEP_DESCRIPTION, SLEEP_SCHEMA, sleep_handler
+            "sleep", SLEEP_DESCRIPTION, SLEEP_SCHEMA, sleep_handler,
+            is_mutating=False,
+            supports_parallel=False,
         )
         self.tool_registry.register(
             "todo_write", TODO_WRITE_DESCRIPTION, TODO_WRITE_SCHEMA, todo_write_handler
         )
         self.tool_registry.register(
             "enter_plan_mode", ENTER_PLAN_MODE_DESCRIPTION, ENTER_PLAN_MODE_SCHEMA,
-            enter_plan_mode_handler
+            enter_plan_mode_handler,
+            is_mutating=True,
+            supports_parallel=False,
         )
         self.tool_registry.register(
             "exit_plan_mode", EXIT_PLAN_MODE_DESCRIPTION, EXIT_PLAN_MODE_SCHEMA,
-            exit_plan_mode_handler
+            exit_plan_mode_handler,
+            is_mutating=True,
+            supports_parallel=False,
         )
         from bob.protocol.config_types import WebSearchMode
         if self.config.web_search_mode != WebSearchMode.DISABLED:
             self.tool_registry.register(
-                "web_search", WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA, web_search_handler
+                "web_search", WEB_SEARCH_DESCRIPTION, WEB_SEARCH_SCHEMA, web_search_handler,
+                is_mutating=False,
+                supports_parallel=True,
+                requires_network_approval=True,
             )
         self.tool_registry.register(
-            "web_fetch", WEB_FETCH_DESCRIPTION, WEB_FETCH_SCHEMA, web_fetch_handler
+            "web_fetch", WEB_FETCH_DESCRIPTION, WEB_FETCH_SCHEMA, web_fetch_handler,
+            is_mutating=False,
+            supports_parallel=True,
+            requires_network_approval=True,
         )
         # Cron / schedule tools
         from bob.tools.cron_tools import (
@@ -302,17 +340,21 @@ class BobSession:
         self.tool_registry.register(
             "remote_trigger", REMOTE_TRIGGER_DESCRIPTION, REMOTE_TRIGGER_SCHEMA, remote_trigger_handler
         )
-        # Phase 5 — advanced
+        # Phase 5 â€” advanced
         self.tool_registry.register(
-            "js_repl", JS_REPL_DESCRIPTION, JS_REPL_SCHEMA, js_repl_handler
+            "js_repl", JS_REPL_DESCRIPTION, JS_REPL_SCHEMA, js_repl_handler,
+            is_mutating=True,
+            supports_parallel=False,
         )
         self.tool_registry.register(
-            "notebook_read", NOTEBOOK_READ_DESCRIPTION, NOTEBOOK_READ_SCHEMA, notebook_read_handler
+            "notebook_read", NOTEBOOK_READ_DESCRIPTION, NOTEBOOK_READ_SCHEMA, notebook_read_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "notebook_edit", NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA, notebook_edit_handler
         )
-        # Phase 4 — multi-agent
+        # Phase 4 â€” multi-agent
         self.tool_registry.register(
             "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA, spawn_agent_handler
         )
@@ -320,13 +362,23 @@ class BobSession:
             "send_message", SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA, send_message_handler
         )
         self.tool_registry.register(
-            "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA, wait_agent_handler
+            "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA, wait_agent_handler,
+            is_mutating=False,
+            supports_parallel=False,
         )
         self.tool_registry.register(
-            "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA, list_agents_handler
+            "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA, list_agents_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA, close_agent_handler
+        )
+        self.tool_registry.register(
+            "assign_task", ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA, assign_task_handler
+        )
+        self.tool_registry.register(
+            "resume_agent", RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA, resume_agent_handler
         )
         # Task management tools
         self.tool_registry.register(
@@ -336,10 +388,14 @@ class BobSession:
             "task_update", TASK_UPDATE_DESCRIPTION, TASK_UPDATE_SCHEMA, task_update_handler
         )
         self.tool_registry.register(
-            "task_list", TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA, task_list_handler
+            "task_list", TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA, task_list_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
-            "task_get", TASK_GET_DESCRIPTION, TASK_GET_SCHEMA, task_get_handler
+            "task_get", TASK_GET_DESCRIPTION, TASK_GET_SCHEMA, task_get_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "task_output", TASK_OUTPUT_DESCRIPTION, TASK_OUTPUT_SCHEMA, task_output_handler
@@ -350,7 +406,15 @@ class BobSession:
         # User interaction tool
         self.tool_registry.register(
             "request_user_input", REQUEST_USER_INPUT_DESCRIPTION, REQUEST_USER_INPUT_SCHEMA,
-            request_user_input_handler
+            request_user_input_handler,
+            is_mutating=False,
+            supports_parallel=False,
+        )
+        self.tool_registry.register(
+            "tool_search", TOOL_SEARCH_DESCRIPTION, TOOL_SEARCH_SCHEMA, tool_search_handler,
+            is_mutating=False,
+            supports_parallel=True,
+            source="core",
         )
         # Git worktree tools
         self.tool_registry.register(
@@ -364,19 +428,27 @@ class BobSession:
         # LSP integration tools
         self.tool_registry.register(
             "lsp_diagnostics", LSP_DIAGNOSTICS_DESCRIPTION, LSP_DIAGNOSTICS_SCHEMA,
-            lsp_diagnostics_handler
+            lsp_diagnostics_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "lsp_hover", LSP_HOVER_DESCRIPTION, LSP_HOVER_SCHEMA,
-            lsp_hover_handler
+            lsp_hover_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "lsp_definition", LSP_DEFINITION_DESCRIPTION, LSP_DEFINITION_SCHEMA,
-            lsp_definition_handler
+            lsp_definition_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "lsp_references", LSP_REFERENCES_DESCRIPTION, LSP_REFERENCES_SCHEMA,
-            lsp_references_handler
+            lsp_references_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "lsp_rename", LSP_RENAME_DESCRIPTION, LSP_RENAME_SCHEMA,
@@ -385,19 +457,27 @@ class BobSession:
         # IDE bridge tools
         self.tool_registry.register(
             "ide_get_open_files", IDE_GET_OPEN_FILES_DESCRIPTION, IDE_GET_OPEN_FILES_SCHEMA,
-            ide_get_open_files_handler
+            ide_get_open_files_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "ide_get_selection", IDE_GET_SELECTION_DESCRIPTION, IDE_GET_SELECTION_SCHEMA,
-            ide_get_selection_handler
+            ide_get_selection_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "ide_get_diagnostics", IDE_GET_DIAGNOSTICS_DESCRIPTION, IDE_GET_DIAGNOSTICS_SCHEMA,
-            ide_get_diagnostics_handler
+            ide_get_diagnostics_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
         self.tool_registry.register(
             "ide_get_active_file", IDE_GET_ACTIVE_FILE_DESCRIPTION, IDE_GET_ACTIVE_FILE_SCHEMA,
-            ide_get_active_file_handler
+            ide_get_active_file_handler,
+            is_mutating=False,
+            supports_parallel=True,
         )
 
     def ensure_thread_manager(self):
@@ -408,7 +488,7 @@ class BobSession:
         return self._thread_manager
 
     async def request_user_input(self, request_id: str, prompt: str, fields: list) -> str:
-        """Called by ask_user tool — creates a future and waits for UserInputAnswerOp."""
+        """Called by ask_user tool â€” creates a future and waits for UserInputAnswerOp."""
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
         self._pending_user_inputs[request_id] = fut
@@ -429,7 +509,7 @@ class BobSession:
             self._pending_user_inputs.pop(request_id, None)
 
     # ------------------------------------------------------------------
-    # Client factory — routes by model to Responses API or LiteLLM
+    # Client factory â€” routes by model to Responses API or LiteLLM
     # ------------------------------------------------------------------
 
     # Models that only work with OpenAI's Responses API (not Chat Completions).
@@ -467,7 +547,7 @@ class BobSession:
 
     def _unused_make_client_legacy(self, model: str):
         """Return the right client for the selected model and provider."""
-        bare = model.split("/")[-1]  # strip provider prefix e.g. "openai/gpt-4o" → "gpt-4o"
+        bare = model.split("/")[-1]  # strip provider prefix e.g. "openai/gpt-4o" â†’ "gpt-4o"
         if True:
             from bob.client.openai_client import BobClient
             kwargs: dict = {"api_key": self._api_key, "model": bare}
@@ -521,7 +601,7 @@ class BobSession:
                     "Content-Type": "application/json",
                 },
             )
-            # Use a very short timeout — we don't care about the result
+            # Use a very short timeout â€” we don't care about the result
             urllib.request.urlopen(req, timeout=3)
         except Exception:
             pass  # Best-effort; never block the session
@@ -874,6 +954,11 @@ class BobSession:
 
     async def shutdown(self) -> None:
         self._shutdown_event.set()
+        if self._thread_manager is not None:
+            try:
+                await self._thread_manager.shutdown_all()
+            except Exception:
+                pass
         if self._agent_task:
             self._agent_task.cancel()
             try:
@@ -937,6 +1022,80 @@ class BobSession:
         finally:
             self._pending_network_approvals.pop(request_id, None)
 
+    async def request_dynamic_tool(
+        self,
+        tool_call_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        timeout_seconds: float = 120.0,
+        max_retries: int = 1,
+        max_output_chars: int = 32_000,
+    ) -> str:
+        """Emit a dynamic tool call event and wait for a response op."""
+        from bob.protocol.events import DynamicToolCallEvent
+
+        timeout_seconds = max(1.0, min(float(timeout_seconds), 900.0))
+        retries = max(0, min(int(max_retries), 5))
+        capped_output = max(256, min(int(max_output_chars), 100_000))
+
+        import json
+
+        try:
+            input_payload = json.dumps(tool_input, ensure_ascii=True, default=str)
+        except Exception as exc:
+            return f"Error: dynamic tool '{tool_name}' input is not JSON serializable: {exc}"
+        if len(input_payload) > 64_000:
+            return (
+                f"Error: dynamic tool '{tool_name}' input too large "
+                f"({len(input_payload)} chars, max 64000)."
+            )
+
+        async def _await_once() -> str:
+            loop = asyncio.get_running_loop()
+            fut = loop.create_future()
+            self._pending_dynamic_tool_calls[tool_call_id] = fut
+            await self._emit(Event(
+                id=tool_call_id,
+                msg=DynamicToolCallEvent(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                ),
+            ))
+            try:
+                result = await asyncio.wait_for(fut, timeout=timeout_seconds)
+                if isinstance(result, str):
+                    text = result
+                else:
+                    try:
+                        text = json.dumps(result, ensure_ascii=False)
+                    except Exception:
+                        text = str(result)
+                if len(text) > capped_output:
+                    return text[:capped_output] + "\n... [dynamic output truncated]"
+                return text
+            finally:
+                self._pending_dynamic_tool_calls.pop(tool_call_id, None)
+
+        for attempt in range(retries + 1):
+            try:
+                return await _await_once()
+            except asyncio.TimeoutError:
+                if attempt < retries:
+                    continue
+                return (
+                    f"Error: dynamic tool '{tool_name}' timed out after "
+                    f"{int(timeout_seconds * 1000)}ms waiting for response."
+                )
+        return f"Error: dynamic tool '{tool_name}' failed unexpectedly."
+
+    def resolve_dynamic_tool(self, tool_call_id: str, result: Any) -> bool:
+        fut = self._pending_dynamic_tool_calls.get(tool_call_id)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(result)
+        return True
+
     # ------------------------------------------------------------------
     # Agent loop
     # ------------------------------------------------------------------
@@ -947,6 +1106,7 @@ class BobSession:
         from bob.protocol.ops import (
             UserTurnOp, InterruptOp, ExecApprovalOp, PatchApprovalOp,
             NetworkApprovalOp,
+            DynamicToolResponseOp,
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
@@ -1014,6 +1174,10 @@ class BobSession:
                         "approved": op.approved,
                         "approve_always": op.approve_always,
                     })
+                continue
+
+            if isinstance(op, DynamicToolResponseOp):
+                self.resolve_dynamic_tool(op.tool_call_id, op.result)
                 continue
 
             # ----------------------------------------------------------------
@@ -1193,7 +1357,7 @@ class BobSession:
                 continue
 
             # ----------------------------------------------------------------
-            # User turn — the main path
+            # User turn â€” the main path
             # ----------------------------------------------------------------
             if isinstance(op, UserTurnOp):
                 await self.manage_context_pre_turn(sub_id)
@@ -1205,7 +1369,7 @@ class BobSession:
                     run_turn(self, sub_id, op, cancel_ev)
                 )
 
-                # IMPORTANT: Do NOT await the turn task directly — that would
+                # IMPORTANT: Do NOT await the turn task directly â€” that would
                 # block the loop and create a deadlock when an approval future
                 # is waiting for an ExecApprovalOp to arrive in the queue.
                 # Instead, poll the queue while the turn is running so we can
@@ -1240,6 +1404,9 @@ class BobSession:
                                 })
                             if inner_op.approve_always:
                                 self._network_policy.approve_domain(inner_op.domain, session_only=True)
+
+                        elif isinstance(inner_op, DynamicToolResponseOp):
+                            self.resolve_dynamic_tool(inner_op.tool_call_id, inner_op.result)
 
                         elif isinstance(inner_op, InterruptOp):
                             cancel_ev.set()

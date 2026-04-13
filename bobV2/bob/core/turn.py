@@ -1,7 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import asyncio
 import uuid
-from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,13 +15,6 @@ from bob.protocol.events import (
     TextDeltaEvent,
     TextFinalEvent,
     ReasoningDeltaEvent,
-    ToolCallStartedEvent,
-    ToolCallCompletedEvent,
-    ExecStartedEvent,
-    ExecOutputEvent,
-    ExecCompletedEvent,
-    ExecApprovalRequestedEvent,
-    ExecApprovalResolvedEvent,
     TokenBudgetEvent,
     ErrorEvent,
     WarningEvent,
@@ -34,7 +26,7 @@ from bob.llm.client import (
     StreamErrorEvent as ClientStreamError,
     ReasoningDeltaEvent as ClientReasoningDelta,
 )
-from bob.protocol.config_types import AskForApproval, ReviewDecision, ExecCommandSource, ExecCommandStatus
+from bob.protocol.config_types import AskForApproval
 
 # ---------------------------------------------------------------------------
 # Approval policy helpers
@@ -213,7 +205,7 @@ def detect_escalation(command: list[str]) -> str | None:
     for tok in canonical[1:]:
         if meta_re.search(tok):
             _escalation_logger.warning("Possible metachar injection: %s", command)
-            # Don't hard-block — just force approval
+            # Don't hard-block â€” just force approval
             return f"Shell metacharacter in argument '{tok[:40]}'"
 
     return None
@@ -350,7 +342,7 @@ async def run_turn(
     # ------------------------------------------------------------------ #
     async def on_output_delta(data: str, stream: str) -> None:
         # Streaming shell output from within the turn reaches here; we emit
-        # it via ExecOutputEvent but need the call_id — shell tool directly
+        # it via ExecOutputEvent but need the call_id â€” shell tool directly
         # uses the context callback it receives.
         pass
 
@@ -425,10 +417,26 @@ async def run_turn(
                 current_history = patched
 
             tool_specs = session.tool_registry.get_tool_specs()
-            # In plan mode: only expose read-only tools
+            allowed_tools = getattr(session, "_allowed_tools", None)
+            if allowed_tools:
+                filtered_specs: list[dict] = []
+                for s in tool_specs:
+                    name = s.get("name")
+                    if name is None:
+                        name = s.get("function", {}).get("name")
+                    if name in allowed_tools:
+                        filtered_specs.append(s)
+                tool_specs = filtered_specs
+            # In plan mode: only expose non-mutating tools.
             if getattr(session, "_plan_mode", False):
-                _write_tools = {"write_file", "edit_file", "shell", "apply_patch"}
-                tool_specs = [s for s in tool_specs if s.get("function", {}).get("name") not in _write_tools]
+                filtered_specs: list[dict] = []
+                for s in tool_specs:
+                    name = s.get("name")
+                    if name is None:
+                        name = s.get("function", {}).get("name")
+                    if name and not session.tool_registry.get_tool_capabilities(name).is_mutating:
+                        filtered_specs.append(s)
+                tool_specs = filtered_specs
 
             text_parts: list[str] = []
             tool_calls: list[ClientToolCall] = []
@@ -574,8 +582,8 @@ async def run_turn(
 
             # ----------------------------------------------------------
             # Build history items in Responses API format:
-            #   - text → {"role":"assistant","content":[{"type":"output_text",...}]}
-            #   - each tool call → top-level {"type":"function_call",...}
+            #   - text â†’ {"role":"assistant","content":[{"type":"output_text",...}]}
+            #   - each tool call â†’ top-level {"type":"function_call",...}
             # ----------------------------------------------------------
             import json as _json
 
@@ -613,401 +621,23 @@ async def run_turn(
             # Execute tool calls and collect results
             # ----------------------------------------------------------
             tool_results: list[dict] = []
+            from bob.core.tool_orchestrator import ToolOrchestrator, TurnAbortRequested
 
-            # Classify tools as read-only (safe for parallel) vs write (sequential)
-            READ_ONLY_TOOLS = frozenset({
-                "read_file", "list_dir", "glob_files", "grep_files",
-                "web_fetch", "web_search", "view_image", "notebook_read",
-                "task_list", "task_get",  # read-only task tools
-            })
-            
-            # Check if in plan mode and block write tools
-            if getattr(session, '_plan_mode', False):
-                blocked_calls = [tc for tc in tool_calls if tc.name not in READ_ONLY_TOOLS]
-                if blocked_calls:
-                    # Block all write tools in plan mode
-                    for tc in blocked_calls:
-                        await emit(ToolCallStartedEvent(
-                            type="tool_call_started",
-                            tool_call_id=tc.id,
-                            tool_name=tc.name,
-                            tool_input=tc.input,
-                        ))
-                        await emit(ToolCallCompletedEvent(
-                            type="tool_call_completed",
-                            tool_call_id=tc.id,
-                            tool_name=tc.name,
-                            output=f"❌ Tool '{tc.name}' blocked in Plan mode. Only read-only tools are available. Use exit_plan_mode to unlock.",
-                            duration_ms=0,
-                        ))
-                        tool_results.append({
-                            "type": "function_call_output",
-                            "call_id": tc.id,
-                            "output": f"❌ Tool '{tc.name}' blocked in Plan mode. Only read-only tools are available. Use exit_plan_mode to unlock.",
-                        })
-                    # Only process read-only tools
-                    tool_calls = [tc for tc in tool_calls if tc.name in READ_ONLY_TOOLS]
-                    if not tool_calls:
-                        # All tools were blocked, continue to next iteration
-                        continue
-            
-            # Network approval for web tools (must happen sequentially before parallel dispatch)
-            _WEB_TOOLS = frozenset({"web_fetch", "web_search"})
-            _denied_call_ids: set[str] = set()
-            for tc in tool_calls:
-                if tc.name not in _WEB_TOOLS:
-                    continue
-                if tc.name == "web_search":
-                    url = f"duckduckgo.com/search?q={tc.input.get('query', '')}"
-                    domain = "duckduckgo.com"
-                else:
-                    url = tc.input.get("url", "")
-                    try:
-                        from urllib.parse import urlparse as _up
-                        domain = _up(url).netloc or url.split("/")[0]
-                    except Exception:
-                        domain = url[:50]
-                import uuid as _uuid
-                req_id = str(_uuid.uuid4())[:12]
-                approved = await session.get_network_approval(req_id, url, domain, tool_name=tc.name)
-                if not approved:
-                    _denied_call_ids.add(tc.id)
-
-            # Block denied web tool calls
-            for tc in [t for t in tool_calls if t.id in _denied_call_ids]:
-                await emit(ToolCallStartedEvent(
-                    type="tool_call_started",
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
-                    tool_input=tc.input,
-                ))
-                result_text = f"Network access to '{tc.input.get('url', tc.input.get('query', ''))}' was denied by user."
-                await emit(ToolCallCompletedEvent(
-                    type="tool_call_completed",
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
-                    output=result_text,
-                    duration_ms=0,
-                ))
-                tool_results.append({
-                    "type": "function_call_output",
-                    "call_id": tc.id,
-                    "output": result_text,
-                })
-            tool_calls = [t for t in tool_calls if t.id not in _denied_call_ids]
-
-            # Separate tool calls into parallel-safe and sequential groups
-            read_only_calls = [tc for tc in tool_calls if tc.name in READ_ONLY_TOOLS]
-            write_calls = [tc for tc in tool_calls if tc.name not in READ_ONLY_TOOLS]
-            
-            # Execute read-only tools in parallel
-            if read_only_calls:
-                async def execute_read_only_tool(tc):
-                    """Execute a single read-only tool and return its result."""
-                    if cancel_event.is_set():
-                        return None
-                    
-                    call_id = tc.id
-                    tool_name = tc.name
-                    
-                    await emit(ToolCallStartedEvent(
-                        type="tool_call_started",
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        tool_input=tc.input,
-                    ))
-                    
-                    from bob.core.session import ToolContext
-                    ctx = ToolContext(session)
-                    ctx.on_output_delta = on_output_delta
-                    ctx.on_plan_update = on_plan_update
-                    ctx.thread_manager = session.ensure_thread_manager()
-                    ctx.on_request_user_input = session.request_user_input
-                    
-                    import time
-                    t0 = time.monotonic()
-                    tool_error: str | None = None
-                    try:
-                        result_text = await session.tool_registry.dispatch(
-                            tool_name, tc.input, ctx
-                        )
-                    except Exception as exc:
-                        result_text = f"Error: {exc}"
-                        tool_error = result_text
-                    duration_ms = int((time.monotonic() - t0) * 1000)
-                    
-                    await emit(ToolCallCompletedEvent(
-                        type="tool_call_completed",
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        output=result_text,
-                        duration_ms=duration_ms,
-                        error=tool_error,
-                    ))
-                    
-                    return {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": result_text,
-                    }
-                
-                # Execute all read-only tools in parallel
-                parallel_results = await asyncio.gather(
-                    *[execute_read_only_tool(tc) for tc in read_only_calls],
-                    return_exceptions=False
-                )
-                tool_results.extend([r for r in parallel_results if r is not None])
-            
-            # Execute write tools sequentially (includes shell, write_file, edit_file, etc.)
-            for tc in write_calls:
-                if cancel_event.is_set():
-                    break
-
-                call_id = tc.id
-                tool_name = tc.name
-                result_text = ""
-
-                await emit(ToolCallStartedEvent(
-                    type="tool_call_started",
-                    tool_call_id=call_id,
-                    tool_name=tool_name,
-                    tool_input=tc.input,
-                ))
-
-                # -------------------------------------------------------
-                # Shell tool (and aliases)
-                # -------------------------------------------------------
-                if tool_name in ("shell", "local_shell", "bash"):
-                    raw_cmd = tc.input.get("command", [])
-                    # Model sometimes sends command as a string instead of array
-                    if isinstance(raw_cmd, str):
-                        command: list[str] = raw_cmd.split()
-                    else:
-                        command: list[str] = list(raw_cmd)
-
-                    exec_cwd = session.cwd
-                    workdir = tc.input.get("workdir")
-                    if workdir:
-                        p = Path(workdir)
-                        exec_cwd = p if p.is_absolute() else session.cwd / p
-
-                    # -------------------------------------------------------
-                    # apply_patch: route to Python impl, never subprocess
-                    # -------------------------------------------------------
-                    if command and command[0] == "apply_patch":
-                        patch_text = command[1] if len(command) > 1 else ""
-                        if not patch_text:
-                            result_text = "Error: apply_patch requires patch content"
-                        else:
-                            from bob.tools.apply_patch import apply_patch_command
-                            await emit(ExecStartedEvent(
-                                type="exec_started",
-                                tool_call_id=call_id,
-                                command=command,
-                                cwd=str(exec_cwd),
-                                source=ExecCommandSource.AGENT,
-                                sandbox_mode=session.sandbox_policy.mode,
-                            ))
-                            result_text = await apply_patch_command(patch_text, exec_cwd)
-                            exit_code = 0 if not result_text.startswith("Error") else 1
-                            await emit(ExecCompletedEvent(
-                                type="exec_completed",
-                                tool_call_id=call_id,
-                                exit_code=exit_code,
-                                status=ExecCommandStatus.COMPLETED if exit_code == 0 else ExecCommandStatus.FAILED,
-                                duration_ms=0,
-                            ))
-                        await emit(ToolCallCompletedEvent(
-                            type="tool_call_completed",
-                            tool_call_id=call_id,
-                            tool_name=tool_name,
-                            output=result_text,
-                            error=result_text if result_text.startswith("Error:") else None,
-                        ))
-                        tool_results.append({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": result_text,
-                        })
-                        continue
-
-                    escalation_reason = detect_escalation(command)
-                    approval_needed = escalation_reason is not None or needs_approval(
-                        command,
-                        session.config.ask_for_approval,
-                        session_approved_commands,
-                        trusted_patterns=session.config.trusted_commands,
-                    )
-                    approval_reason = escalation_reason or "Command requires approval per policy"
-
-                    if approval_needed:
-                        await emit(ExecApprovalRequestedEvent(
-                            type="exec_approval_requested",
-                            tool_call_id=call_id,
-                            command=command,
-                            cwd=str(exec_cwd),
-                            reason=approval_reason,
-                            alternatives=[],
-                        ))
-                        decision = await session.get_approval(call_id)
-                        await emit(ExecApprovalResolvedEvent(
-                            type="exec_approval_resolved",
-                            tool_call_id=call_id,
-                            decision=decision,
-                        ))
-                        if decision == ReviewDecision.ABORT:
-                            await emit(TurnInterruptedEvent(
-                                type="turn_interrupted", turn_id=turn_id, graceful=True
-                            ))
-                            return
-                        if decision == ReviewDecision.DENIED:
-                            result_text = "Command denied by user."
-                            await emit(ToolCallCompletedEvent(
-                                type="tool_call_completed",
-                                tool_call_id=call_id,
-                                tool_name=tool_name,
-                                output=result_text,
-                            ))
-                            tool_results.append({
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": result_text,
-                            })
-                            continue
-                        if decision == ReviewDecision.APPROVED_FOR_SESSION:
-                            key = " ".join(command[:2])
-                            session_approved_commands.add(key)
-
-                    # Emit exec started
-                    await emit(ExecStartedEvent(
-                        type="exec_started",
-                        tool_call_id=call_id,
-                        command=command,
-                        cwd=str(exec_cwd),
-                        source=ExecCommandSource.AGENT,
-                        sandbox_mode=session.sandbox_policy.mode,
-                    ))
-
-                    # Execute
-                    from bob.core.exec import execute_command
-
-                    async def on_delta(data: str, stream: str) -> None:
-                        await emit(ExecOutputEvent(
-                            type="exec_output",
-                            tool_call_id=call_id,
-                            stream=stream,
-                            data=data,
-                        ))
-
-                    timeout_ms: int = tc.input.get("timeout", 10_000)
-                    try:
-                        exec_result = await execute_command(
-                            command=command,
-                            cwd=exec_cwd,
-                            sandbox=session._sandbox_runner,
-                            cancel_event=cancel_event,
-                            on_output_delta=on_delta,
-                            timeout_ms=timeout_ms,
-                        )
-                    except Exception as _exec_exc:
-                        # Sandbox block, permission error, or other failure — still
-                        # need a tool result so the context stays valid.
-                        result_text = f"Error: {_exec_exc}"
-                        await emit(ExecCompletedEvent(
-                            type="exec_completed",
-                            tool_call_id=call_id,
-                            exit_code=1,
-                            status=ExecCommandStatus.FAILED,
-                            duration_ms=0,
-                        ))
-                        await emit(ToolCallCompletedEvent(
-                            type="tool_call_completed",
-                            tool_call_id=call_id,
-                            tool_name=tool_name,
-                            output=result_text,
-                            duration_ms=0,
-                            error=result_text,
-                        ))
-                        tool_results.append({
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": result_text,
-                        })
-                        continue
-
-                    status = (
-                        ExecCommandStatus.COMPLETED
-                        if exec_result.exit_code == 0
-                        else ExecCommandStatus.FAILED
-                    )
-                    await emit(ExecCompletedEvent(
-                        type="exec_completed",
-                        tool_call_id=call_id,
-                        exit_code=exec_result.exit_code,
-                        status=status,
-                        duration_ms=exec_result.duration_ms,
-                    ))
-
-                    result_text = exec_result.aggregated_output or exec_result.stdout
-                    if exec_result.timed_out:
-                        result_text = f"[Command timed out]\n{result_text}"
-                    elif exec_result.exit_code != 0:
-                        if result_text.strip():
-                            result_text += f"\n[Exit code: {exec_result.exit_code}]"
-                        else:
-                            result_text = f"[Exit code: {exec_result.exit_code}]"
-
-                    # ON_FAILURE policy: re-request approval after failure
-                    if (
-                        exec_result.exit_code != 0
-                        and session.config.ask_for_approval == AskForApproval.ON_FAILURE
-                    ):
-                        await emit(ExecApprovalRequestedEvent(
-                            type="exec_approval_requested",
-                            tool_call_id=call_id,
-                            command=command,
-                            cwd=str(exec_cwd),
-                            reason=f"Command failed with exit code {exec_result.exit_code}",
-                            alternatives=[],
-                        ))
-
-                # -------------------------------------------------------
-                # All other registered tools
-                # -------------------------------------------------------
-                else:
-                    from bob.core.session import ToolContext
-                    ctx = ToolContext(session)
-                    ctx.on_output_delta = on_output_delta
-                    ctx.on_plan_update = on_plan_update
-                    ctx.thread_manager = session.ensure_thread_manager()
-                    ctx.on_request_user_input = session.request_user_input
-
-                    import time
-                    t0 = time.monotonic()
-                    tool_error: str | None = None
-                    try:
-                        result_text = await session.tool_registry.dispatch(
-                            tool_name, tc.input, ctx
-                        )
-                    except Exception as exc:
-                        result_text = f"Error: {exc}"
-                        tool_error = result_text
-                    duration_ms = int((time.monotonic() - t0) * 1000)
-
-                    await emit(ToolCallCompletedEvent(
-                        type="tool_call_completed",
-                        tool_call_id=call_id,
-                        tool_name=tool_name,
-                        output=result_text,
-                        duration_ms=duration_ms,
-                        error=tool_error,
-                    ))
-
-                tool_results.append({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": result_text,
-                })
+            orchestrator = ToolOrchestrator(
+                session=session,
+                emit=emit,
+                cancel_event=cancel_event,
+                turn_id=turn_id,
+                on_output_delta=on_output_delta,
+                on_plan_update=on_plan_update,
+                session_approved_commands=session_approved_commands,
+                needs_approval_fn=needs_approval,
+                detect_escalation_fn=detect_escalation,
+            )
+            try:
+                tool_results = await orchestrator.execute_calls(tool_calls)
+            except TurnAbortRequested:
+                return
 
             # Record tool results into context and continue loop
             if tool_results:

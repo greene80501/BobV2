@@ -45,7 +45,35 @@ class McpManager:
                 if isinstance(config, dict)
                 else dict(config.env)
             )
-            conn = McpServerConnection(name=name, command=command, env=env)
+            connect_timeout_seconds = (
+                config.get("connect_timeout_seconds", 15.0)
+                if isinstance(config, dict)
+                else getattr(config, "connect_timeout_seconds", 15.0)
+            )
+            call_timeout_seconds = (
+                config.get("call_timeout_seconds", 30.0)
+                if isinstance(config, dict)
+                else getattr(config, "call_timeout_seconds", 30.0)
+            )
+            retry_count = (
+                config.get("retry_count", 1)
+                if isinstance(config, dict)
+                else getattr(config, "retry_count", 1)
+            )
+            max_output_chars = (
+                config.get("max_output_chars", 32000)
+                if isinstance(config, dict)
+                else getattr(config, "max_output_chars", 32000)
+            )
+            conn = McpServerConnection(
+                name=name,
+                command=command,
+                env=env,
+                connect_timeout_seconds=connect_timeout_seconds,
+                call_timeout_seconds=call_timeout_seconds,
+                retry_count=retry_count,
+                max_output_chars=max_output_chars,
+            )
             success = await conn.connect()
             self._connections[name] = conn
             if success:
@@ -122,11 +150,15 @@ class McpManager:
         if "__" not in prefixed_name:
             return f"Error: invalid MCP tool name (expected 'server__tool'): {prefixed_name!r}"
         server_name, tool_name = prefixed_name.split("__", 1)
+        if not server_name or not tool_name:
+            return f"Error: invalid MCP tool name (expected 'server__tool'): {prefixed_name!r}"
         conn = self._connections.get(server_name)
         if not conn:
             return f"Error: MCP server '{server_name}' not found or not connected"
         if not conn.is_connected:
             return f"Error: MCP server '{server_name}' is disconnected"
+        if not isinstance(arguments, dict):
+            return "Error: MCP tool arguments must be an object"
         return await conn.call_tool(tool_name, arguments)
 
     # ------------------------------------------------------------------

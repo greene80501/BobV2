@@ -15,10 +15,24 @@ class McpTool:
 class McpServerConnection:
     """Manages connection to a single MCP server subprocess."""
 
-    def __init__(self, name: str, command: list[str], env: dict[str, str] = None):
+    def __init__(
+        self,
+        name: str,
+        command: list[str],
+        env: dict[str, str] = None,
+        *,
+        connect_timeout_seconds: float = 15.0,
+        call_timeout_seconds: float = 30.0,
+        retry_count: int = 1,
+        max_output_chars: int = 32000,
+    ):
         self.name = name
         self.command = command
         self.env = env or {}
+        self.connect_timeout_seconds = max(1.0, min(float(connect_timeout_seconds), 120.0))
+        self.call_timeout_seconds = max(1.0, min(float(call_timeout_seconds), 300.0))
+        self.retry_count = max(0, min(int(retry_count), 5))
+        self.max_output_chars = max(512, min(int(max_output_chars), 100_000))
         self._session = None
         self._stdio_ctx = None
         self._tools: list[McpTool] = []
@@ -41,12 +55,18 @@ class McpServerConnection:
             )
 
             self._stdio_ctx = stdio_client(server_params)
-            read_stream, write_stream = await self._stdio_ctx.__aenter__()
+            read_stream, write_stream = await asyncio.wait_for(
+                self._stdio_ctx.__aenter__(),
+                timeout=self.connect_timeout_seconds,
+            )
             self._session = ClientSession(read_stream, write_stream)
-            await self._session.__aenter__()
-            await self._session.initialize()
+            await asyncio.wait_for(self._session.__aenter__(), timeout=self.connect_timeout_seconds)
+            await asyncio.wait_for(self._session.initialize(), timeout=self.connect_timeout_seconds)
 
-            tools_result = await self._session.list_tools()
+            tools_result = await asyncio.wait_for(
+                self._session.list_tools(),
+                timeout=self.connect_timeout_seconds,
+            )
             self._tools = [
                 McpTool(
                     name=tool.name,
@@ -89,8 +109,25 @@ class McpServerConnection:
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         if not self._session or not self._connected:
             return "Error: not connected to MCP server"
+        if not isinstance(arguments, dict):
+            return "Error: MCP tool arguments must be an object"
         try:
-            result = await self._session.call_tool(tool_name, arguments)
+            result: Any = None
+            last_exc: Exception | None = None
+            for _attempt in range(self.retry_count + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        self._session.call_tool(tool_name, arguments),
+                        timeout=self.call_timeout_seconds,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    await asyncio.sleep(0.05)
+            if last_exc is not None:
+                raise last_exc
+
             # Extract text content from result
             if hasattr(result, "content"):
                 texts = [
@@ -98,8 +135,17 @@ class McpServerConnection:
                     for item in result.content
                     if hasattr(item, "text")
                 ]
-                return "\n".join(texts)
-            return str(result)
+                output = "\n".join(texts)
+            else:
+                output = str(result)
+            if len(output) > self.max_output_chars:
+                return output[: self.max_output_chars] + "\n... [MCP output truncated]"
+            return output
+        except asyncio.TimeoutError:
+            return (
+                f"Error calling MCP tool '{tool_name}' on server '{self.name}': "
+                f"timed out after {int(self.call_timeout_seconds * 1000)}ms"
+            )
         except Exception as exc:
             return f"Error calling MCP tool '{tool_name}' on server '{self.name}': {exc}"
 

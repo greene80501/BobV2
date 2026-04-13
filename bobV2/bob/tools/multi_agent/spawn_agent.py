@@ -15,6 +15,10 @@ SPAWN_AGENT_SCHEMA = {
             "type": "string",
             "description": "Full task description for the sub-agent.",
         },
+        "task_name": {
+            "type": "string",
+            "description": "Optional stable label for the initial task.",
+        },
         "model": {
             "type": "string",
             "description": "Model override for the sub-agent (optional).",
@@ -35,6 +39,18 @@ SPAWN_AGENT_SCHEMA = {
                 "When provided, the agent's findings are saved and injected into "
                 "future spawns with the same name, giving it persistent memory."
             ),
+        },
+        "parent_agent_ref": {
+            "type": "string",
+            "description": "Optional parent agent reference (id/path/name) to build tree edges.",
+        },
+        "parent_agent_id": {
+            "type": "string",
+            "description": "Backward-compatible alias for parent_agent_ref.",
+        },
+        "role": {
+            "type": "string",
+            "description": "Optional agent role label for metadata and filtering.",
         },
     },
     "required": ["task"],
@@ -59,12 +75,42 @@ async def spawn_agent_handler(tool_input: dict, context: Any) -> str:
     model: str | None = tool_input.get("model")
     cwd: str | None = tool_input.get("cwd")
     template: str | None = tool_input.get("template")
+    task_name: str | None = tool_input.get("task_name")
     name: str | None = tool_input.get("name")
+    parent_agent_id: str | None = tool_input.get("parent_agent_ref") or tool_input.get("parent_agent_id")
+    role: str | None = tool_input.get("role")
+    allow_mutating_tools = True
+    allowed_tools: list[str] | None = None
+    if template:
+        from bob.core.agent_templates import get_template
+
+        tmpl = get_template(template)
+        if tmpl and tmpl.allowed_tools:
+            allowed_tools = sorted(tmpl.allowed_tools)
+        if template in {"explore", "plan", "verify", "review"}:
+            allow_mutating_tools = False
 
     try:
-        agent_id = await thread_manager.spawn(task=task, model=model, cwd=cwd, template=template, name=name)
+        agent_id = await thread_manager.spawn(
+            task=task,
+            model=model,
+            cwd=cwd,
+            template=template,
+            task_name=task_name,
+            name=name,
+            parent_agent_id=parent_agent_id,
+            role=role,
+            allowed_tools=allowed_tools,
+            allow_mutating_tools=allow_mutating_tools,
+        )
         tmpl_note = f" [template={template}]" if template else ""
         name_note = f" [name={name}]" if name else ""
-        return f"Sub-agent spawned (id={agent_id}){tmpl_note}{name_note} for task: {task[:120]}"
+        parent_note = f" [parent={parent_agent_id}]" if parent_agent_id else ""
+        role_note = f" [role={role}]" if role else ""
+        task_note = f" [task_name={task_name}]" if task_name else ""
+        return (
+            f"Sub-agent spawned (id={agent_id}){tmpl_note}{task_note}{name_note}{parent_note}{role_note} "
+            f"for task: {task[:120]}"
+        )
     except Exception as exc:
         return f"Error spawning sub-agent: {exc}"

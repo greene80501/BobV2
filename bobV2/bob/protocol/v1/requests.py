@@ -106,22 +106,30 @@ class ExecTerminateParams(BaseModel):
 class AgentsSpawnParams(BaseModel):
     thread_id: str
     task: str
+    task_name: Optional[str] = None
     model: Optional[str] = None
     cwd: Optional[str] = None
     mode: Optional[str] = None
     name: Optional[str] = None
+    parent_agent_id: Optional[str] = None
+    parent_agent_ref: Optional[str] = None
+    role: Optional[str] = None
 
 
 class AgentsSendParams(BaseModel):
     thread_id: str
-    agent_id: str
+    agent_id: Optional[str] = None
+    agent_ref: Optional[str] = None
     message: str
 
 
 class AgentsWaitParams(BaseModel):
     thread_id: str
-    agent_id: str
+    agent_id: Optional[str] = None
+    agent_ids: list[str] = Field(default_factory=list)
     timeout_seconds: Optional[float] = None
+    any_target: bool = True
+    wait_for_states: list[str] = Field(default_factory=lambda: ["idle", "failed", "closed"])
 
 
 class AgentsCloseParams(BaseModel):
@@ -133,6 +141,71 @@ class AgentsCloseParams(BaseModel):
 class AgentsListParams(BaseModel):
     thread_id: str
     include_completed: bool = False
+
+
+class AgentsAssignParams(BaseModel):
+    thread_id: str
+    agent_id: Optional[str] = None
+    agent_ref: Optional[str] = None
+    task: str
+    task_name: Optional[str] = None
+    interrupt_running: bool = False
+    clear_queue: bool = False
+
+
+class AgentsResumeParams(BaseModel):
+    thread_id: str
+    agent_id: str
+    task: Optional[str] = None
+
+
+class DynamicToolDescriptor(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    source: str = "dynamic"
+    expose_to_model: bool = False
+    discoverable: bool = True
+    is_mutating: bool = True
+    supports_parallel: bool = False
+    requires_network_approval: bool = False
+    keywords: list[str] = Field(default_factory=list)
+    deferred: bool = False
+    timeout_seconds: float = 120.0
+    max_retries: int = 1
+    max_output_chars: int = 32000
+
+
+class DynamicToolsRegisterParams(BaseModel):
+    thread_id: str
+    tools: list[DynamicToolDescriptor] = Field(default_factory=list)
+
+
+class DynamicToolsListParams(BaseModel):
+    thread_id: str
+    include_hidden: bool = True
+    source: Optional[str] = None
+
+
+class DynamicToolsSearchParams(BaseModel):
+    thread_id: str
+    query: str = ""
+    limit: int = 20
+    include_hidden: bool = True
+    sources: list[str] = Field(default_factory=list)
+    auto_enable: bool = False
+
+
+class DynamicToolsEnableParams(BaseModel):
+    thread_id: str
+    tool_names: list[str] = Field(default_factory=list)
+    expose_to_model: bool = True
+
+
+class DynamicToolsRespondParams(BaseModel):
+    thread_id: str
+    tool_call_id: str
+    result: Any
 
 
 class TasksCreateParams(BaseModel):
@@ -170,4 +243,3 @@ class RealtimeReplayParams(BaseModel):
     channels: list[str] = Field(default_factory=list)
     after_cursor: Optional[int] = None
     limit: int = 200
-
