@@ -24,6 +24,7 @@ def register(router) -> None:
                 "agents": True,
                 "tasks": True,
                 "realtime": True,
+                "dynamic_tools": True,
             },
         }
 
@@ -62,4 +63,3 @@ def register(router) -> None:
     router.add("server.capabilities", server_capabilities)
     router.add("bob.config.get", config_get)
     router.add("bob.models.list", models_list)
-

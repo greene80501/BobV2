@@ -35,7 +35,7 @@ async def list_agents_handler(tool_input: dict, context: Any) -> str:
     include_completed: bool = tool_input.get("include_completed", False)
 
     try:
-        agents = await thread_manager.list_agents(
+        agents = thread_manager.list_agents(
             include_completed=include_completed
         )
     except Exception as exc:
@@ -51,12 +51,27 @@ async def list_agents_handler(tool_input: dict, context: Any) -> str:
             agent_id = agent.get("id", "?")
             status = agent.get("status", "unknown")
             task = agent.get("task", "")
+            path = agent.get("path", "?")
+            depth = agent.get("depth", "?")
+            queued = agent.get("queued_tasks", 0)
+            parent_id = agent.get("parent_id")
+            result_preview = agent.get("result_preview")
         else:
             agent_id = getattr(agent, "id", "?")
             status = getattr(agent, "status", "unknown")
             task = getattr(agent, "task", "")
+            path = getattr(agent, "path", "?")
+            depth = getattr(agent, "depth", "?")
+            queued = getattr(agent, "queued_tasks", 0)
+            parent_id = getattr(agent, "parent_id", None)
+            result_preview = getattr(agent, "result_preview", None)
 
         task_preview = (task[:60] + "...") if len(task) > 60 else task
-        lines.append(f"[{agent_id}] {status}: {task_preview}")
+        parent_note = f" parent={parent_id}" if parent_id else ""
+        result_note = f" result={result_preview}" if result_preview else ""
+        lines.append(
+            f"[{agent_id}] status={status} path={path} depth={depth} queued={queued}{parent_note}\n"
+            f"  task={task_preview}{result_note}"
+        )
 
     return "\n".join(lines)

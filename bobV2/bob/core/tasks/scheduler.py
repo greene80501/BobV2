@@ -38,12 +38,58 @@ class CronScheduler:
     async def _loop(self) -> None:
         while not self._stop.is_set():
             now = int(time.time())
-            for task in self.runtime.store.list_tasks(status="completed", limit=500):
+            all_tasks = self.runtime.store.list_tasks(status=None, limit=2000)
+            latest_by_key: dict[str, Any] = {}
+
+            # Keep only the latest task for each cron key.
+            for task in all_tasks:
                 if task.type != "cron_triggered":
                     continue
-                interval = int(task.payload.get("cron_interval_seconds", 0) or 0)
-                next_run = int(task.payload.get("cron_next_run_at", 0) or 0)
-                if interval <= 0 or next_run <= now:
-                    continue
-            await asyncio.sleep(self.poll_interval)
+                payload = task.payload or {}
+                key = str(payload.get("cron_key") or task.id)
+                current = latest_by_key.get(key)
+                if current is None or task.created_at_ts > current.created_at_ts:
+                    latest_by_key[key] = task
 
+            for key, task in latest_by_key.items():
+                payload = dict(task.payload or {})
+                interval = int(payload.get("cron_interval_seconds", 0) or 0)
+                next_run = int(payload.get("cron_next_run_at", 0) or 0)
+                if interval <= 0 or next_run <= 0:
+                    continue
+
+                # If a run is already pending/active for this cron stream, do not enqueue.
+                if task.status in {"queued", "running"}:
+                    continue
+
+                # Only schedule when this stream is due.
+                if next_run > now:
+                    continue
+
+                next_payload = dict(payload)
+                next_payload["cron_key"] = key
+                next_payload["cron_next_run_at"] = now + interval
+
+                try:
+                    created = await self.runtime.create_task(
+                        task_type="cron_triggered",
+                        payload=next_payload,
+                        priority=task.priority,
+                        max_attempts=task.max_attempts,
+                        timeout_seconds=task.timeout_seconds,
+                        run_at_ts=now,
+                    )
+                    self.runtime.store.add_event(
+                        task.id,
+                        "task.cron_scheduled",
+                        {
+                            "cron_key": key,
+                            "spawned_task_id": created.get("id"),
+                            "scheduled_at_ts": now,
+                            "next_run_at_ts": next_payload["cron_next_run_at"],
+                        },
+                    )
+                except Exception:
+                    # Scheduler errors must not stop the loop.
+                    pass
+            await asyncio.sleep(self.poll_interval)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
+import subprocess
 
 from bob.app_server.routes._utils import parse_params
 from bob.protocol.v1.requests import FilesGlobParams, FilesGrepParams, FilesReadParams, FilesWriteParams
@@ -46,6 +48,10 @@ def register(router) -> None:
     async def files_grep(ctx, params: dict):
         p = parse_params(FilesGrepParams, params)
         root = Path(p.root).resolve() if p.root else Path.cwd()
+        rg_matches = _files_grep_with_ripgrep(root, p.pattern, p.case_sensitive)
+        if rg_matches is not None:
+            return {"matches": rg_matches[:1000]}
+
         needle = p.pattern if p.case_sensitive else p.pattern.lower()
         hits: list[dict] = []
         for path in root.rglob("*"):
@@ -68,3 +74,48 @@ def register(router) -> None:
     router.add("files.glob", files_glob)
     router.add("files.grep", files_grep)
 
+
+def _files_grep_with_ripgrep(root: Path, pattern: str, case_sensitive: bool) -> list[dict] | None:
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+
+    cmd = [
+        rg,
+        "--files-with-matches",
+        "--fixed-strings",
+        "--hidden",
+        "--no-ignore",
+        "--color",
+        "never",
+    ]
+    if not case_sensitive:
+        cmd.append("--ignore-case")
+    cmd.extend([pattern, "."])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if proc.returncode > 1:
+        return None
+    if proc.returncode == 1:
+        return []
+
+    hits: list[dict] = []
+    for raw in proc.stdout.splitlines():
+        rel = raw.strip()
+        if not rel:
+            continue
+        abs_path = (root / rel).resolve()
+        hits.append({"path": str(abs_path)})
+    return hits

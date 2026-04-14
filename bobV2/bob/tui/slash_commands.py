@@ -109,7 +109,7 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.ROLLOUT: "print the rollout file path",
     SlashCommand.PS: "list background terminals",
     SlashCommand.STOP: "stop all background terminals",
-    SlashCommand.CLEAR: "clear the terminal and start a new chat",
+    SlashCommand.CLEAR: "clear the terminal, chat history, and context window",
     SlashCommand.PERSONALITY: "choose a communication style for bob",
     SlashCommand.REALTIME: "toggle realtime voice mode (experimental)",
     SlashCommand.SETTINGS: "configure realtime microphone/speaker",
