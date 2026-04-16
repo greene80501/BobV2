@@ -13,6 +13,8 @@ bob is a Python-based AI coding assistant that runs directly in your terminal. I
 
 ## Install
 
+### Windows
+
 From the `bobV2` folder:
 
 ```
@@ -25,11 +27,25 @@ pip install -e .
 > py -3.11 -m pip install -e .
 > ```
 
+### macOS / Linux
+
+From the `bobV2` folder:
+
+```bash
+cd /path/to/bobV2
+pip install -e .
+```
+
+Or if you need to specify Python 3.11:
+```bash
+python3.11 -m pip install -e .
+```
+
 ---
 
 ## Set provider credentials
 
-Examples:
+### Windows
 
 **OpenAI**
 ```powershell
@@ -52,6 +68,35 @@ $env:VERTEXAI_LOCATION = "us-central1"
 $env:GOOGLE_APPLICATION_CREDENTIALS = "C:\path\to\service-account.json"
 ```
 
+### macOS / Linux
+
+**OpenAI**
+```bash
+export OPENAI_API_KEY="sk-proj-..."
+```
+
+**Anthropic**
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+**Gemini (Google AI Studio)**
+```bash
+export GEMINI_API_KEY="..."
+```
+
+**Gemini via Vertex AI**
+```bash
+export VERTEXAI_LOCATION="us-central1"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+```
+
+To make credentials permanent, add them to your shell profile:
+```bash
+echo 'export OPENAI_API_KEY="sk-proj-..."' >> ~/.zshrc  # or ~/.bash_profile
+source ~/.zshrc
+```
+
 You can also put provider-specific settings in `~/.bob/config.toml`.
 
 ---
@@ -62,10 +107,14 @@ You can also put provider-specific settings in `~/.bob/config.toml`.
 bob
 ```
 
-If the `bob` command isn't on your PATH (Windows), run it directly:
-
+**Windows:** If the `bob` command isn't on your PATH, run it directly:
 ```
 C:\Users\green\AppData\Local\Programs\Python\Python311\Scripts\bob.exe
+```
+
+**macOS/Linux:** If the command isn't found, run it directly:
+```bash
+python3.11 -m bob
 ```
 
 ---
