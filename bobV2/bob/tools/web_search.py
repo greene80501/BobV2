@@ -60,9 +60,15 @@ def _search_ddg(query: str, max_results: int) -> tuple[list[dict], str | None]:
     return _normalize_results(results, max_results), ddg_error
 
 
-def _search_brave(query: str, max_results: int, api_key: str) -> tuple[list[dict], str | None]:
+def _get_proxy(context: Any) -> str:
+    session = getattr(context, "_session", None)
+    return getattr(getattr(session, "config", None), "network_proxy", "") or ""
+
+
+def _search_brave(query: str, max_results: int, api_key: str, proxy: str = "") -> tuple[list[dict], str | None]:
     try:
         import requests
+        proxy_kwargs = {"proxies": {"http": proxy, "https": proxy}} if proxy else {}
         resp = requests.get(
             "https://api.search.brave.com/res/v1/web/search",
             params={"q": query, "count": max_results},
@@ -72,6 +78,7 @@ def _search_brave(query: str, max_results: int, api_key: str) -> tuple[list[dict
                 "X-Subscription-Token": api_key,
             },
             timeout=10,
+            **proxy_kwargs,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -87,9 +94,10 @@ def _search_brave(query: str, max_results: int, api_key: str) -> tuple[list[dict
         return [], str(exc)
 
 
-def _search_serpapi(query: str, max_results: int, api_key: str) -> tuple[list[dict], str | None]:
+def _search_serpapi(query: str, max_results: int, api_key: str, proxy: str = "") -> tuple[list[dict], str | None]:
     try:
         import requests
+        proxy_kwargs = {"proxies": {"http": proxy, "https": proxy}} if proxy else {}
         resp = requests.get(
             "https://serpapi.com/search.json",
             params={
@@ -99,6 +107,7 @@ def _search_serpapi(query: str, max_results: int, api_key: str) -> tuple[list[di
                 "num": max_results,
             },
             timeout=10,
+            **proxy_kwargs,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -139,6 +148,7 @@ def _search_ddg_html(query: str, max_results: int) -> tuple[list[dict], str | No
 def _fallback_provider_attempts(query: str, max_results: int, context: Any) -> tuple[list[dict], list[str]]:
     session = getattr(context, "_session", None)
     extra = getattr(getattr(session, "config", None), "extra", {}) or {}
+    proxy = _get_proxy(context)
 
     brave_key = (
         extra.get("brave_search_api_key")
@@ -155,14 +165,14 @@ def _fallback_provider_attempts(query: str, max_results: int, context: Any) -> t
 
     errors: list[str] = []
     if brave_key:
-        results, err = _search_brave(query, max_results, brave_key)
+        results, err = _search_brave(query, max_results, brave_key, proxy=proxy)
         if results:
             return results, ["Brave Search fallback"]
         if err:
             errors.append(f"Brave Search fallback failed: {err}")
 
     if serp_key:
-        results, err = _search_serpapi(query, max_results, serp_key)
+        results, err = _search_serpapi(query, max_results, serp_key, proxy=proxy)
         if results:
             return results, ["SerpAPI fallback"]
         if err:

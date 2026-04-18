@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 from typing import Optional
-from bob.mcp.client import McpServerConnection, McpTool
+from bob.mcp.client import McpResource, McpServerConnection, McpTool
 
 
 class McpManager:
@@ -19,6 +19,7 @@ class McpManager:
         self._configs = mcp_server_configs
         self._connections: dict[str, McpServerConnection] = {}
         self._all_tools: list[McpTool] = []
+        self._all_resources: list[McpResource] = []
         self._started = False
 
     # ------------------------------------------------------------------
@@ -79,6 +80,8 @@ class McpManager:
             if success:
                 tools = await conn.list_tools()
                 self._all_tools.extend(tools)
+                resources = await conn.list_resources()
+                self._all_resources.extend(resources)
             return name, success
 
         tasks = [
@@ -107,6 +110,7 @@ class McpManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._connections.clear()
         self._all_tools.clear()
+        self._all_resources.clear()
         self._started = False
 
     # ------------------------------------------------------------------
@@ -116,6 +120,18 @@ class McpManager:
     def get_all_tools(self) -> list[McpTool]:
         """Return all tools discovered across all connected servers."""
         return list(self._all_tools)
+
+    def get_all_resources(self) -> list[McpResource]:
+        """Return all resources discovered across all connected servers."""
+        return list(self._all_resources)
+
+    async def read_resource(self, server_name: str, uri: str) -> str:
+        conn = self._connections.get(server_name)
+        if not conn:
+            return f"Error: MCP server '{server_name}' not found or not connected"
+        if not conn.is_connected:
+            return f"Error: MCP server '{server_name}' is disconnected"
+        return await conn.read_resource(uri)
 
     def get_tool_specs(self) -> list[dict]:
         """Return tool specs in OpenAI function-calling format.

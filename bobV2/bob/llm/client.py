@@ -11,10 +11,82 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import re
 from typing import Any, AsyncIterator, Optional, Union
 
 logger = logging.getLogger(__name__)
 _ENV_OVERRIDE_LOCK: asyncio.Lock | None = None
+
+_SAFE_TOOL_NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]*$')
+
+
+def _make_tool_name_safe(name: str) -> str:
+    safe = re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+    if not safe or not safe[0].isalpha():
+        safe = 't_' + safe
+    return safe[:64]
+
+
+def _normalize_tools_to_chat_format(tools: list[dict]) -> list[dict]:
+    """Convert flat Responses-API tools to Chat-Completions nested format.
+
+    Flat:   {"type": "function", "name": "...", "description": "...", "parameters": {...}}
+    Nested: {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+    """
+    out = []
+    for t in tools:
+        if "function" not in t and "name" in t:
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {}),
+                },
+            })
+        else:
+            out.append(t)
+    return out
+
+
+def _sanitize_tools(tools: list[dict]) -> tuple[list[dict], dict[str, str]]:
+    """Return (sanitized_tools, safe->original map for any renamed tools).
+
+    Works on nested Chat-Completions format only; call _normalize_tools_to_chat_format first.
+    """
+    name_map: dict[str, str] = {}
+    out = []
+    for t in tools:
+        fn = dict(t.get("function") or {})
+        orig = fn.get("name", "")
+        if orig and not _SAFE_TOOL_NAME_RE.match(orig):
+            safe = _make_tool_name_safe(orig)
+            name_map[safe] = orig
+            fn["name"] = safe
+            t = {**t, "function": fn}
+        out.append(t)
+    return out, name_map
+
+
+def _patch_message_tool_names(messages: list[dict], name_map: dict[str, str]) -> list[dict]:
+    """Replace original tool names in history with their sanitized equivalents."""
+    if not name_map:
+        return messages
+    orig_to_safe = {v: k for k, v in name_map.items()}
+    out = []
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            new_tcs = []
+            for tc in msg["tool_calls"]:
+                fn = dict(tc.get("function") or {})
+                fn_name = fn.get("name", "")
+                if fn_name in orig_to_safe:
+                    fn["name"] = orig_to_safe[fn_name]
+                    tc = {**tc, "function": fn}
+                new_tcs.append(tc)
+            msg = {**msg, "tool_calls": new_tcs}
+        out.append(msg)
+    return out
 
 
 @dataclass
@@ -240,9 +312,11 @@ class LiteLLMClient:
     def _configure_litellm(self) -> None:
         try:
             import litellm
+            import warnings
 
             litellm.drop_params = True
             litellm.suppress_debug_info = True
+            warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
         except ImportError:
             pass
 
@@ -360,6 +434,11 @@ class LiteLLMClient:
             enable_caching=enable_caching,
         )
 
+        # Normalize flat Responses-API format → nested Chat-Completions format, then sanitize names
+        normalized = _normalize_tools_to_chat_format(tools) if tools else tools
+        safe_tools, tool_name_map = _sanitize_tools(normalized) if normalized else (normalized, {})
+        messages = _patch_message_tool_names(messages, tool_name_map)
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -367,8 +446,8 @@ class LiteLLMClient:
             "temperature": temperature,
             **extra_params,
         }
-        if tools:
-            kwargs["tools"] = tools
+        if safe_tools:
+            kwargs["tools"] = safe_tools
             kwargs["tool_choice"] = "auto"
         if max_output_tokens is not None:
             kwargs["max_tokens"] = max_output_tokens
@@ -442,7 +521,9 @@ class LiteLLMClient:
                     raw_args,
                 )
                 parsed = {"_raw": raw_args}
-            yield ToolCallEvent(id=buf["id"], name=buf["name"], input=parsed)
+            # Restore original name if it was sanitized
+            original_name = tool_name_map.get(buf["name"], buf["name"])
+            yield ToolCallEvent(id=buf["id"], name=original_name, input=parsed)
 
         if final_usage is not None:
             yield CompletedEvent(

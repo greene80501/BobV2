@@ -28,6 +28,8 @@ class ProviderProfile:
     base_url_env_vars: tuple[str, ...] = ()
     env_field_map: dict[str, str] = field(default_factory=dict)
     provider_kwargs_map: dict[str, str] = field(default_factory=dict)
+    default_base_url: Optional[str] = None
+    default_extra_headers: dict[str, str] = field(default_factory=dict)
     suggested_models: tuple[str, ...] = ()
     supports_reasoning_effort: bool = False
     supports_thinking_budget: bool = False
@@ -81,6 +83,7 @@ _PROVIDER_ALIASES: dict[str, str] = {
     "ibm_watsonx": "ibm_watsonx",
     "glm_zai": "glm_zai",
     "ollama": "ollama",
+    "kimi": "kimi",
 }
 
 
@@ -97,6 +100,7 @@ _PREFIX_PROVIDER_MAP: dict[str, str] = {
     "openrouter": "openrouter",
     "xai": "xai",
     "ollama": "ollama",
+    "kimi": "kimi",
 }
 
 
@@ -114,6 +118,7 @@ _MODEL_PATTERNS: tuple[tuple[str, str], ...] = (
     ("o4", "openai"),
     ("text-", "openai"),
     ("codex", "openai"),
+    ("kimi-", "kimi"),
 )
 
 
@@ -290,6 +295,21 @@ _PROFILES: dict[str, ProviderProfile] = {
         suggested_models=("ollama/llama3.1",),
         notes="Experimental local-model path through LiteLLM.",
     ),
+    "kimi": ProviderProfile(
+        name="kimi",
+        display_name="Kimi for Coding",
+        support_level=SupportLevel.EXPERIMENTAL,
+        route=ClientRoute.LITELLM_CHAT,
+        api_key_env_vars=("KIMI_API_KEY",),
+        default_base_url="https://api.kimi.com/coding/v1",
+        default_extra_headers={
+            "User-Agent": "claude-code/1.0",
+            "X-Client-Name": "claude-code",
+        },
+        suggested_models=("kimi/kimi-for-coding",),
+        supports_vision=False,
+        notes="Kimi for Coding by Moonshot AI. Requires KIMI_API_KEY from kimi.com/coding (not platform.moonshot.ai). OpenAI-compatible endpoint.",
+    ),
     "unknown": ProviderProfile(
         name="unknown",
         display_name="Unknown",
@@ -385,6 +405,10 @@ def canonicalize_model_name(model: str, provider: str, route: ClientRoute) -> st
     if route == ClientRoute.OPENAI_RESPONSES:
         return bare
 
+    # kimi/ prefix must be remapped to openai/ before the generic early-return
+    if provider == "kimi":
+        return f"openai/{bare}"
+
     if explicit_prefix:
         return model
 
@@ -410,6 +434,9 @@ def canonicalize_model_name(model: str, provider: str, route: ClientRoute) -> st
         return f"openrouter/{bare}"
     if provider == "ollama":
         return f"ollama/{bare}"
+    if provider == "kimi":
+        # Route through LiteLLM's openai-compatible path; base_url overrides the endpoint
+        return f"openai/{bare}"
     return model
 
 
@@ -507,6 +534,10 @@ def resolve_provider_auth(
             base_url = global_base_url
             used_global_fallback = True
 
+    # Apply provider-level default base URL when neither config nor global set one
+    if base_url is None and profile.default_base_url:
+        base_url = profile.default_base_url
+
     env_overrides: dict[str, str] = {}
     for field_name, env_name in profile.env_field_map.items():
         value = provider_cfg.get(field_name) or active_env.get(env_name, "")
@@ -528,6 +559,12 @@ def resolve_provider_auth(
     for key, value in (provider_cfg.get("extra_kwargs") or {}).items():
         if value is not None:
             provider_kwargs[str(key)] = value
+
+    # Inject provider-level default extra headers (user config headers take precedence)
+    if profile.default_extra_headers:
+        merged = dict(profile.default_extra_headers)
+        merged.update(provider_kwargs.get("extra_headers", {}))
+        provider_kwargs["extra_headers"] = merged
 
     missing: list[str] = []
     if profile.api_key_env_vars and not api_key and compat.provider not in ("vertex_ai", "unknown"):

@@ -623,6 +623,20 @@ class CostEstimateEvent(BaseModel):
 
 
 # ===========================================================================
+# IDE integration
+# ===========================================================================
+
+class IDEShowDiffEvent(BaseModel):
+    """Request the connected IDE to open a diff view for the given content."""
+    type: Literal["ide_show_diff"] = "ide_show_diff"
+    # Raw git diff output (unified diff format)
+    diff: str
+    # Optional base ref for context (e.g. "HEAD", "main")
+    base_ref: str = "HEAD"
+    title: str = "git diff"
+
+
+# ===========================================================================
 # Discriminated union of ALL EventMsg variants
 # ===========================================================================
 
@@ -726,6 +740,8 @@ EventMsg = Annotated[
         # Token budget / cost
         TokenBudgetEvent,
         CostEstimateEvent,
+        # IDE integration
+        IDEShowDiffEvent,
     ],
     Field(discriminator="type"),
 ]

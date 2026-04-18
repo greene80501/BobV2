@@ -111,6 +111,15 @@ async def execute_command(
 
     proc = await asyncio.create_subprocess_exec(*launch, **kwargs)
 
+    # Assign the new process to the sandbox job object (Windows only)
+    if sys.platform == "win32":
+        try:
+            from bob.sandbox.windows import WindowsSandbox
+            if isinstance(sandbox, WindowsSandbox):
+                sandbox.get_job_object().assign_process(proc.pid)
+        except Exception:
+            pass
+
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     total_bytes = 0

@@ -1,6 +1,10 @@
 from __future__ import annotations
+import io
+import json
 import shutil
 import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -154,6 +158,83 @@ class PluginsManager:
             )
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Remote marketplace
+    # ------------------------------------------------------------------
+
+    DEFAULT_REGISTRY_URL = "https://raw.githubusercontent.com/bob-plugins/registry/main/registry.json"
+
+    def fetch_registry(self, url: str = "") -> list[dict]:
+        """Download and return the plugin registry as a list of plugin dicts.
+
+        Each entry has at minimum: name, version, description, download_url.
+        Returns empty list on failure.
+        """
+        registry_url = url or self.DEFAULT_REGISTRY_URL
+        try:
+            import urllib.request
+            with urllib.request.urlopen(registry_url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("plugins", [])
+        except Exception:
+            pass
+        return []
+
+    def search_registry(self, query: str, url: str = "") -> list[dict]:
+        """Search the remote registry for plugins matching *query*."""
+        all_plugins = self.fetch_registry(url)
+        if not query:
+            return all_plugins
+        q = query.lower()
+        return [
+            p for p in all_plugins
+            if q in p.get("name", "").lower()
+            or q in p.get("description", "").lower()
+            or q in " ".join(p.get("keywords", [])).lower()
+        ]
+
+    def install_from_url(self, url: str) -> Optional[PluginInfo]:
+        """Download a plugin zip from *url* and install it.
+
+        The zip must contain a top-level directory with a plugin.toml inside.
+        Returns PluginInfo on success, None on failure.
+        """
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                raw = resp.read()
+        except Exception:
+            return None
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                names = zf.namelist()
+                if not names:
+                    return None
+                # Determine the top-level directory in the zip
+                root = names[0].split("/")[0]
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    zf.extractall(tmpdir)
+                    extracted = Path(tmpdir) / root
+                    if not extracted.is_dir():
+                        extracted = Path(tmpdir)
+                    return self.install_from_path(extracted)
+        except Exception:
+            return None
+
+    def install_from_registry(self, name: str, registry_url: str = "") -> Optional[PluginInfo]:
+        """Find *name* in the registry and install it."""
+        plugins = self.fetch_registry(registry_url)
+        for p in plugins:
+            if p.get("name", "").lower() == name.lower():
+                download_url = p.get("download_url", "")
+                if download_url:
+                    return self.install_from_url(download_url)
+        return None
 
     @property
     def plugins_dir(self) -> Path:

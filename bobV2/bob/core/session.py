@@ -106,6 +106,8 @@ class BobSession:
 
         # Multi-agent thread manager (lazy)
         self._thread_manager = None
+        # Team manager (lazy)
+        self._team_manager = None
 
         # Pending user-input futures keyed by request_id
         self._pending_user_inputs: dict[str, asyncio.Future] = {}
@@ -480,6 +482,84 @@ class BobSession:
             is_mutating=False,
             supports_parallel=True,
         )
+        # Computer use tool — only register when the user has explicitly enabled it
+        _computer_use_enabled = bool(
+            self.config.feature_flags.get("computer_use", False)
+            or getattr(self.config, "enable_computer_use", False)
+        )
+        if _computer_use_enabled:
+            from bob.tools.computer_use import (
+                computer_use_handler, COMPUTER_USE_SCHEMA,
+            )
+            _cu_desc = (
+                "Control the user's GUI. The user has explicitly enabled this tool "
+                "via feature_flags.computer_use=true in their config. "
+                "Available actions: screenshot (returns base64 PNG), left_click, "
+                "right_click, double_click, mouse_move, scroll, key (e.g. 'ctrl+c'), "
+                "type (types text), cursor_position. "
+                "Use 'screenshot' first to see the current screen state before clicking."
+            )
+            self.tool_registry.register(
+                "computer_use", _cu_desc, COMPUTER_USE_SCHEMA,
+                computer_use_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="core",
+                keywords=["gui", "screenshot", "click", "mouse", "keyboard", "type"],
+            )
+        # MCP OAuth auth tool
+        from bob.tools.mcp_auth_tool import (
+            mcp_authenticate_handler, MCP_AUTHENTICATE_DESCRIPTION, MCP_AUTHENTICATE_SCHEMA,
+        )
+        self.tool_registry.register(
+            "mcp_authenticate", MCP_AUTHENTICATE_DESCRIPTION, MCP_AUTHENTICATE_SCHEMA,
+            mcp_authenticate_handler,
+            source="mcp",
+        )
+        # Team / swarm tools
+        from bob.tools.team_tools import (
+            team_create_handler, TEAM_CREATE_DESCRIPTION, TEAM_CREATE_SCHEMA,
+            team_spawn_agent_handler, TEAM_SPAWN_AGENT_DESCRIPTION, TEAM_SPAWN_AGENT_SCHEMA,
+            team_list_handler, TEAM_LIST_DESCRIPTION, TEAM_LIST_SCHEMA,
+            team_delete_handler, TEAM_DELETE_DESCRIPTION, TEAM_DELETE_SCHEMA,
+        )
+        self.tool_registry.register(
+            "team_create", TEAM_CREATE_DESCRIPTION, TEAM_CREATE_SCHEMA,
+            team_create_handler,
+        )
+        self.tool_registry.register(
+            "team_spawn_agent", TEAM_SPAWN_AGENT_DESCRIPTION, TEAM_SPAWN_AGENT_SCHEMA,
+            team_spawn_agent_handler,
+        )
+        self.tool_registry.register(
+            "team_list", TEAM_LIST_DESCRIPTION, TEAM_LIST_SCHEMA,
+            team_list_handler,
+            is_mutating=False,
+            supports_parallel=True,
+        )
+        self.tool_registry.register(
+            "team_delete", TEAM_DELETE_DESCRIPTION, TEAM_DELETE_SCHEMA,
+            team_delete_handler,
+        )
+        # MCP resource tools
+        from bob.tools.mcp_resource_tools import (
+            mcp_list_resources_handler, MCP_LIST_RESOURCES_DESCRIPTION, MCP_LIST_RESOURCES_SCHEMA,
+            mcp_read_resource_handler, MCP_READ_RESOURCE_DESCRIPTION, MCP_READ_RESOURCE_SCHEMA,
+        )
+        self.tool_registry.register(
+            "mcp_list_resources", MCP_LIST_RESOURCES_DESCRIPTION, MCP_LIST_RESOURCES_SCHEMA,
+            mcp_list_resources_handler,
+            is_mutating=False,
+            supports_parallel=True,
+            source="mcp",
+        )
+        self.tool_registry.register(
+            "mcp_read_resource", MCP_READ_RESOURCE_DESCRIPTION, MCP_READ_RESOURCE_SCHEMA,
+            mcp_read_resource_handler,
+            is_mutating=False,
+            supports_parallel=True,
+            source="mcp",
+        )
 
     def ensure_thread_manager(self):
         """Lazily create and cache the ThreadManager."""
@@ -487,6 +567,13 @@ class BobSession:
             from bob.core.thread_manager import ThreadManager
             self._thread_manager = ThreadManager(self)
         return self._thread_manager
+
+    def ensure_team_manager(self):
+        """Lazily create and cache the TeamManager."""
+        if self._team_manager is None:
+            from bob.core.team import TeamManager
+            self._team_manager = TeamManager(self)
+        return self._team_manager
 
     async def request_user_input(self, request_id: str, prompt: str, fields: list) -> str:
         """Called by ask_user tool â€” creates a future and waits for UserInputAnswerOp."""
@@ -629,12 +716,18 @@ class BobSession:
 
         from bob.llm.client import LiteLLMClient
 
+        env_overrides = dict(provider_auth.env_overrides)
+        proxy_url = self.config.network_proxy or ""
+        if proxy_url:
+            env_overrides.setdefault("HTTP_PROXY", proxy_url)
+            env_overrides.setdefault("HTTPS_PROXY", proxy_url)
+
         return LiteLLMClient(
             api_key=provider_auth.api_key,
             model=compatibility.canonical_model,
             base_url=provider_auth.base_url,
             provider_kwargs=provider_auth.provider_kwargs,
-            env_overrides=provider_auth.env_overrides,
+            env_overrides=env_overrides,
         )
 
     async def _prewarm_connection(self) -> None:

@@ -141,6 +141,62 @@ def app_server(
 mcp_app = typer.Typer(name="mcp", help="Manage MCP servers")
 app.add_typer(mcp_app, name="mcp")
 
+config_app = typer.Typer(name="config", help="Read and write bob config values")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Config key in dot-notation (e.g. model or providers.openai.api_key)"),
+    value: str = typer.Argument(..., help="Value to set (strings, integers, and true/false booleans are supported)"),
+) -> None:
+    """Set a config value."""
+    from bob.config.editor import set_value
+    try:
+        set_value(key, value)
+        typer.echo(f"  {key} = {value}")
+    except Exception as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+
+@config_app.command("get")
+def config_get(
+    key: str = typer.Argument(..., help="Config key in dot-notation"),
+) -> None:
+    """Get a config value."""
+    from bob.config.editor import get_value
+    result = get_value(key)
+    if result:
+        typer.echo(result)
+    else:
+        typer.echo(f"(not set)", err=True)
+        raise typer.Exit(1)
+
+
+@config_app.command("unset")
+def config_unset(
+    key: str = typer.Argument(..., help="Config key in dot-notation"),
+) -> None:
+    """Remove a config key."""
+    from bob.config.editor import unset_value
+    if unset_value(key):
+        typer.echo(f"  removed {key}")
+    else:
+        typer.echo(f"  (key not found: {key})", err=True)
+
+
+@config_app.command("list")
+def config_list_cmd() -> None:
+    """List all config values."""
+    from bob.config.editor import list_values
+    rows = list_values()
+    if not rows:
+        typer.echo("  (config file is empty or not found)")
+        return
+    for key, val in rows:
+        typer.echo(f"  {key} = {val}")
+
 
 @mcp_app.command("add")
 def mcp_add(
@@ -148,12 +204,19 @@ def mcp_add(
     command: list[str] = typer.Argument(..., help="Command and args"),
 ) -> None:
     """Add an MCP server to config."""
-    # Loading config to know the config file location
-    from bob.config.loader import load_config
-
-    config = load_config()
-    typer.echo(f"Adding MCP server '{name}': {' '.join(command)}")
-    typer.echo("(Config file update not yet implemented — edit ~/.bob/config.toml manually.)")
+    from bob.config.editor import _load_raw, _save_raw
+    try:
+        data = _load_raw()
+        servers = data.setdefault("mcp_servers", {})
+        servers[name] = {"command": list(command)}
+        _save_raw(data)
+        typer.echo(f"  Added MCP server '{name}': {' '.join(command)}")
+    except ImportError:
+        typer.echo("  Error: tomli_w is required. Run: pip install tomli_w", err=True)
+        raise typer.Exit(1)
+    except Exception as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
 
 
 @mcp_app.command("list")
@@ -189,6 +252,87 @@ def export_schemas() -> None:
 
     out = export_jsonschemas(Path(__file__).resolve().parents[1] / "protocol" / "v1" / "schemas")
     typer.echo(f"Exported {len(out)} schema files")
+
+
+plugin_app = typer.Typer(name="plugin", help="Manage bob plugins")
+app.add_typer(plugin_app, name="plugin")
+
+
+def _get_plugins_manager():
+    import os
+    from pathlib import Path as _Path
+    plugins_dir = _Path(os.environ.get("BOB_HOME", _Path.home() / ".bob")) / "plugins"
+    from bob.plugins.manager import PluginsManager
+    return PluginsManager(plugins_dir)
+
+
+@plugin_app.command("list")
+def plugin_list() -> None:
+    """List installed plugins."""
+    pm = _get_plugins_manager()
+    plugins = pm.list_plugins()
+    if not plugins:
+        typer.echo("  No plugins installed.")
+        return
+    for p in plugins:
+        status = "" if p.enabled else " [disabled]"
+        typer.echo(f"  {p.name}@{p.version}{status} — {p.description}")
+
+
+@plugin_app.command("install")
+def plugin_install(
+    source: str = typer.Argument(..., help="Plugin name (from registry), URL, or local path"),
+    registry_url: str = typer.Option("", "--registry", help="Custom registry URL"),
+) -> None:
+    """Install a plugin from the registry, a URL, or a local path."""
+    from pathlib import Path as _Path
+    pm = _get_plugins_manager()
+    info = None
+
+    local = _Path(source)
+    if local.exists():
+        info = pm.install_from_path(local)
+    elif source.startswith("http://") or source.startswith("https://"):
+        typer.echo(f"  Downloading {source}…")
+        info = pm.install_from_url(source)
+    else:
+        typer.echo(f"  Looking up '{source}' in registry…")
+        info = pm.install_from_registry(source, registry_url)
+
+    if info:
+        typer.echo(f"  Installed {info.name}@{info.version}")
+    else:
+        typer.echo(f"  Failed to install '{source}'", err=True)
+        raise typer.Exit(1)
+
+
+@plugin_app.command("uninstall")
+def plugin_uninstall(
+    name: str = typer.Argument(..., help="Plugin name to remove"),
+) -> None:
+    """Uninstall a plugin."""
+    pm = _get_plugins_manager()
+    if pm.uninstall(name):
+        typer.echo(f"  Removed {name}")
+    else:
+        typer.echo(f"  Plugin '{name}' not found", err=True)
+        raise typer.Exit(1)
+
+
+@plugin_app.command("search")
+def plugin_search(
+    query: str = typer.Argument(..., help="Search term"),
+    registry_url: str = typer.Option("", "--registry", help="Custom registry URL"),
+) -> None:
+    """Search the plugin registry."""
+    pm = _get_plugins_manager()
+    typer.echo(f"  Searching for '{query}'…")
+    results = pm.search_registry(query, registry_url)
+    if not results:
+        typer.echo("  No results found.")
+        return
+    for p in results:
+        typer.echo(f"  {p.get('name', '?')}@{p.get('version', '?')} — {p.get('description', '')}")
 
 
 def cli_main() -> None:

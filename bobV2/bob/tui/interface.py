@@ -53,6 +53,72 @@ from bob.tui.slash_commands import (
 _con = Console(highlight=False, soft_wrap=True)
 
 
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+def _try_paste_clipboard_image() -> str:
+    """Grab a clipboard image using platform-native commands (no Pillow needed).
+
+    Returns the saved temp file path on success, or empty string.
+    Mirrors Claude Code's imagePaste.ts approach exactly.
+    """
+    import subprocess
+    import tempfile
+
+    tmp = os.path.join(tempfile.gettempdir(), "bob_paste_latest.png")
+
+    if sys.platform == "win32":
+        # PowerShell Get-Clipboard -Format Image saves bitmap/PNG from clipboard
+        tmp_ps = tmp.replace("\\", "\\\\")
+        ps_cmd = (
+            f"$img = Get-Clipboard -Format Image; "
+            f"if ($img -ne $null) {{"
+            f"  $img.Save('{tmp_ps}', [System.Drawing.Imaging.ImageFormat]::Png); "
+            f"  Write-Output 'ok'"
+            f"}}"
+        )
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "ok" in r.stdout and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                return tmp
+        except Exception:
+            pass
+
+    elif sys.platform == "darwin":
+        script = "\n".join([
+            f'set png_data to (the clipboard as \u00abclass PNGf\u00bb)',
+            f'set fp to open for access POSIX file "{tmp}" with write permission',
+            f'write png_data to fp',
+            f'close access fp',
+        ])
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                return tmp
+        except Exception:
+            pass
+
+    else:  # Linux (X11 or Wayland)
+        for cmd in [
+            f'xclip -selection clipboard -t image/png -o > "{tmp}"',
+            f'wl-paste --type image/png > "{tmp}"',
+        ]:
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+                if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                    return tmp
+            except Exception:
+                pass
+
+    return ""
+
+
 # ── ANSI helpers — ALL output inside patch_stdout uses these ──────────────────
 
 _R   = "\033[0m"    # reset
@@ -991,6 +1057,8 @@ class Interface:
         self._in_code_block = False
         self._code_block_lang: Optional[str] = None
         self._code_block_content = ""
+        # Pre-fill text for the next prompt (set by /paste)
+        self._next_prompt_default: str = ""
         # Word-wrap buffer for streaming text
         self._wrap_buffer = ""
         self._wrap_column = 0
@@ -2170,6 +2238,16 @@ class Interface:
                     for line in out.splitlines():
                         _p(f"  {self._colorize_diff_line(line)}")
                     _p()
+                    # Also emit IDEShowDiffEvent so IDE integrations can open a diff view
+                    try:
+                        from bob.protocol.events import Event, IDEShowDiffEvent
+                        import uuid
+                        await self._session._emit(Event(
+                            id=str(uuid.uuid4()),
+                            msg=IDEShowDiffEvent(diff=out, base_ref="HEAD", title="git diff HEAD"),
+                        ))
+                    except Exception:
+                        pass
                 else:
                     _p(_d("  (no changes)"))
             except Exception as e:
@@ -2244,11 +2322,13 @@ class Interface:
 
         elif cmd == SlashCommand.INIT:
             try:
-                from bob.instructions.loader import create_agents_md
-                path = create_agents_md(Path.cwd())
+                from bob.instructions.loader import generate_agents_md
+                _p(f"  {_d('generating AGENTS.md...')}")
+                path = await generate_agents_md(Path.cwd(), self._session)
                 _p(f"  {_d(f'created {path}')}")
             except Exception as e:
-                _p(f"  {_r('✗')} {e}")
+                _p(f"  {_r('x')} {e}")
+
 
         elif cmd == SlashCommand.RESUME:
             try:
@@ -3370,6 +3450,36 @@ class Interface:
                 buf.insert_text("/")
                 if buf.text == "/" and buf.cursor_position == 1:
                     buf.start_completion(select_first=False)
+
+            @kb.add(Keys.BracketedPaste)
+            def _(event):
+                """Handle Ctrl+V / right-click paste.
+
+                prompt_toolkit enables bracketed paste mode automatically.
+                When the user pastes an image, the terminal sends an empty
+                bracketed paste sequence — we detect that and pull the image
+                from the clipboard using platform-native commands (same
+                approach as Claude Code's imagePaste.ts).
+                """
+                pasted: str = event.data or ""
+
+                # Case 1: pasted text looks like an image file path
+                stripped = pasted.strip().strip('"').strip("'")
+                if stripped.lower().endswith(_IMAGE_EXTENSIONS) and os.path.exists(stripped):
+                    event.current_buffer.insert_text(f"@{stripped} ")
+                    return
+
+                # Case 2: empty paste = image on clipboard (Ctrl+V / right-click)
+                if not pasted.strip():
+                    image_path = _try_paste_clipboard_image()
+                    if image_path:
+                        event.current_buffer.insert_text(f"@{image_path} ")
+                        return
+
+                # Case 3: normal text paste
+                if pasted:
+                    event.current_buffer.insert_text(pasted)
+
             
             session = PromptSession(
                 history=_history,
@@ -3423,8 +3533,10 @@ class Interface:
                     # _turn_started fires the moment TurnStartedEvent arrives in
                     # the event consumer, cancelling the ❯ before any stray
                     # prompt character is committed to screen.
+                    _default = self._next_prompt_default
+                    self._next_prompt_default = ""
                     input_task    = asyncio.ensure_future(
-                        ps.prompt_async(self._prompt_str)
+                        ps.prompt_async(self._prompt_str, default=_default)
                     )
                     wake_tasks = [
                         asyncio.ensure_future(self._turn_started.wait()),

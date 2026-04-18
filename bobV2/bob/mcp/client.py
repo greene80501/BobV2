@@ -12,6 +12,15 @@ class McpTool:
     server_name: str
 
 
+@dataclass
+class McpResource:
+    uri: str
+    name: str
+    description: str
+    mime_type: str
+    server_name: str
+
+
 class McpServerConnection:
     """Manages connection to a single MCP server subprocess."""
 
@@ -36,6 +45,7 @@ class McpServerConnection:
         self._session = None
         self._stdio_ctx = None
         self._tools: list[McpTool] = []
+        self._resources: list[McpResource] = []
         self._connected = False
 
     async def connect(self) -> bool:
@@ -77,6 +87,25 @@ class McpServerConnection:
                 for tool in tools_result.tools
             ]
 
+            # Fetch resources (optional — servers may not support this)
+            try:
+                resources_result = await asyncio.wait_for(
+                    self._session.list_resources(),
+                    timeout=self.connect_timeout_seconds,
+                )
+                self._resources = [
+                    McpResource(
+                        uri=str(r.uri),
+                        name=r.name or str(r.uri),
+                        description=r.description or "",
+                        mime_type=r.mimeType or "text/plain",
+                        server_name=self.name,
+                    )
+                    for r in (resources_result.resources or [])
+                ]
+            except Exception:
+                self._resources = []
+
             self._connected = True
             return True
 
@@ -105,6 +134,32 @@ class McpServerConnection:
 
     async def list_tools(self) -> list[McpTool]:
         return list(self._tools)
+
+    async def list_resources(self) -> list[McpResource]:
+        return list(self._resources)
+
+    async def read_resource(self, uri: str) -> str:
+        if not self._session or not self._connected:
+            return "Error: not connected to MCP server"
+        try:
+            result = await asyncio.wait_for(
+                self._session.read_resource(uri),
+                timeout=self.call_timeout_seconds,
+            )
+            texts: list[str] = []
+            for item in getattr(result, "contents", []):
+                if hasattr(item, "text"):
+                    texts.append(item.text)
+                elif hasattr(item, "blob"):
+                    texts.append(f"[binary blob: {len(item.blob)} bytes]")
+            output = "\n".join(texts)
+            if len(output) > self.max_output_chars:
+                return output[: self.max_output_chars] + "\n... [MCP resource truncated]"
+            return output or "(empty resource)"
+        except asyncio.TimeoutError:
+            return f"Error reading MCP resource '{uri}': timed out"
+        except Exception as exc:
+            return f"Error reading MCP resource '{uri}': {exc}"
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         if not self._session or not self._connected:

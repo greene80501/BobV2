@@ -1,1681 +1,1014 @@
-# BOB — Your AI-Powered Development Partner
-### Complete Implementation Plan — Exact Codex Parity in Python
+# BOB — Complete Technical Reference
+
+> Full architecture, tools, features, slash commands, TUI, config, and internals.
 
 ---
 
-## Overview
+## Architecture Overview
 
-Bob is a **pixel-perfect Python rewrite of OpenAI Codex CLI** with exactly two modifications:
-1. Written in **Python 3.11+** instead of Rust
-2. Named **`bob`** instead of `codex`
-
-Everything else — every tool, every slash command, every event, every TUI widget, every protocol type, every behavior — is an exact copy. The model is `gpt-5.1-codex-mini` via the OpenAI SDK using the **Responses API** (the same API Codex uses).
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              bob process                                │
+│                                                                         │
+│  ┌──────────┐    ┌──────────────┐    ┌──────────────────────────────┐  │
+│  │  CLI /   │    │  BobSession  │    │       LLM Client             │  │
+│  │  TUI     │───▶│  (session.py)│───▶│  LiteLLMClient (LiteLLM)    │  │
+│  │          │    │              │    │  BobClient (OpenAI Responses) │  │
+│  └──────────┘    └──────┬───────┘    └──────────────────────────────┘  │
+│                         │                                               │
+│          ┌──────────────┼──────────────┐                               │
+│          ▼              ▼              ▼                               │
+│  ┌──────────────┐ ┌──────────┐ ┌─────────────┐                        │
+│  │ ToolRegistry │ │ Context  │ │  Sandbox    │                        │
+│  │  (tools/)    │ │ Manager  │ │  Runner     │                        │
+│  └──────┬───────┘ └──────────┘ └─────────────┘                        │
+│         │                                                               │
+│  ┌──────┴──────────────────────────────────────────┐                   │
+│  │                  Tool Handlers                   │                   │
+│  │  shell · read_file · write_file · edit_file      │                   │
+│  │  web_fetch · web_search · spawn_agent · ...      │                   │
+│  └─────────────────────────────────────────────────┘                   │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │
+│  │  MCP Manager │  │ Plugin Mgr   │  │  Analytics   │                 │
+│  │  (mcp/)      │  │ (plugins/)   │  │  (analytics/)│                 │
+│  └──────────────┘  └──────────────┘  └──────────────┘                 │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  App Server (JSON-RPC 2.0 over stdio or WebSocket)               │  │
+│  │  Routes: agents · config · exec · files · tasks · turns · ...    │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Tech Stack
 
-| Concern | Choice | Replaces (Codex Rust) |
-|---|---|---|
-| Language | Python 3.11+ | Rust 2024 edition |
-| LLM | `openai` SDK, `gpt-5.1-codex-mini`, Responses API | OpenAI Responses API |
-| TUI | `textual` | Ratatui + crossterm |
-| CLI | `typer` | clap |
-| Async runtime | `asyncio` | Tokio |
-| Config parsing | `tomllib` (stdlib) | TOML crate |
-| Data models | `pydantic` v2 | serde / serde_json |
-| SQLite | `aiosqlite` | rusqlite / sqlx |
-| File I/O | `aiofiles` | Tokio fs |
-| MCP | `mcp` Python SDK | rmcp crate |
-| Subprocess | `asyncio.create_subprocess_exec` | Tokio process |
-| Fuzzy match | `rapidfuzz` | codex-utils-fuzzy-match |
+| Concern | Library | Notes |
+|---------|---------|-------|
+| Language | Python 3.11+ | Required minimum |
+| TUI | `prompt_toolkit` | Input, key bindings, history, autocomplete |
+| CLI | `typer` | `bob`, `bob exec`, `bob app-server`, `bob config`, `bob mcp`, `bob plugin` |
+| LLM (primary) | `openai` SDK | OpenAI Responses API for GPT-5/o-series/codex models |
+| LLM (multi-provider) | `litellm` | All other providers via chat completions |
+| Data models | `pydantic` v2 | Config, protocol events, MCP types |
+| Config | `tomllib` (stdlib) + `tomli_w` | Read/write `~/.bob/config.toml` |
+| SQLite | `aiosqlite` | Session persistence, rollout storage, analytics |
+| Async | `asyncio` | All I/O, event loops, subprocess management |
+| MCP | `mcp` Python SDK | Model Context Protocol server connections |
+| Fuzzy match | `rapidfuzz` | Slash command autocomplete |
+| Screenshots | `mss` + `Pillow` | Computer use tool (optional) |
+| GUI automation | `pyautogui` | Computer use tool (optional) |
 
 ---
 
-## Entry Points (CLI)
+## Entry Points
 
+### Interactive TUI
 ```
-bob                              # Interactive TUI (primary entry point)
-bob "initial prompt"             # TUI with initial message pre-sent
-bob --resume SESSION_ID          # Resume session into TUI
-bob --model gpt-5.1-codex-mini   # Override model at launch
-bob --sandbox workspace-write    # Override sandbox mode
-bob --approval on-request        # Override approval policy
-bob -C /path/to/dir              # Override working directory
+bob                              # Launch TUI
+bob -p "initial prompt"          # Launch TUI with message pre-queued
+bob --resume SESSION_ID          # Resume session
+bob --model MODEL                # Override model
+bob --sandbox MODE               # Override sandbox
+bob --approval POLICY            # Override approval policy
+bob -C /path                     # Override working directory
+```
 
-bob exec PROMPT                  # Headless non-interactive mode
-bob exec --resume SESSION_ID     # Headless resume
-bob exec --resume --last         # Headless resume most recent session
-bob exec --json PROMPT           # Headless with JSONL output
+### Headless (non-interactive)
+```
+bob exec PROMPT
+bob exec --last PROMPT           # Resume most recent session
+bob exec --resume SESSION_ID
+bob exec --json PROMPT           # JSONL event output
 bob exec --ephemeral PROMPT      # No session persistence
-bob exec --full-auto PROMPT      # workspace-write + on-request auto
-bob exec --yolo PROMPT           # danger-full-access + never (DANGEROUS)
-bob exec -i image.png PROMPT     # Attach image(s) to prompt
-bob exec -o out.txt PROMPT       # Write last message to file
-bob exec --output-schema s.json  # Constrain final output to JSON schema
+bob exec --full-auto PROMPT      # Auto-approve everything
+bob exec --yolo PROMPT           # Bypass all approvals and sandbox
+bob exec -o output.txt PROMPT    # Save last message to file
+```
 
-bob app-server                   # JSON-RPC 2.0 server (WebSocket)
-bob app-server --stdio           # JSON-RPC 2.0 server (stdin/stdout, VS Code default)
+### App Server (IDE integration)
+```
+bob app-server --stdio           # stdin/stdout JSON-RPC 2.0
+bob app-server --port 8765       # WebSocket JSON-RPC 2.0
+```
 
-bob mcp add NAME CMD [ARGS...]   # Add MCP server to config
-bob mcp list                     # List configured MCP servers
-bob mcp remove NAME              # Remove MCP server
+### Config CLI
+```
+bob config set KEY VALUE
+bob config get KEY
+bob config unset KEY
+bob config list
+```
 
-bob completion bash               # Print bash completion script
-bob completion zsh                # Print zsh completion script
+### MCP CLI
+```
+bob mcp add NAME COMMAND [ARGS]
+bob mcp list
+```
+
+### Plugin CLI
+```
+bob plugin list
+bob plugin install SOURCE
+bob plugin uninstall NAME
+bob plugin search QUERY
 ```
 
 ---
 
-## TUI UX — Exact Codex Behavior
+## Session Lifecycle
 
-**`bob` launches directly into the interactive chat.** No subcommand needed.
+```
+bob start
+  └─ load_config()                    # ~/.bob/config.toml + env vars + CLI overrides
+  └─ BobSession.__init__()
+      ├─ _make_client(model)          # route to LiteLLMClient or BobClient
+      ├─ register all tools           # ToolRegistry.register(...)
+      ├─ start MCP servers            # McpManager.start()
+      ├─ load skills                  # SkillManager.discover()
+      ├─ load hooks                   # HookRunner setup
+      └─ start analytics              # AnalyticsDB, AnalyticsTracker
+  └─ run_interface()                  # prompt_toolkit TUI loop
+      └─ on user input:
+          └─ session.submit(UserTurnOp)
+              └─ execute_turn()
+                  ├─ build system prompt
+                  ├─ get tool_specs from ToolRegistry
+                  ├─ normalize tools: flat → chat-completions format
+                  ├─ sanitize tool names to ^[a-zA-Z][a-zA-Z0-9_-]*$
+                  ├─ stream_turn() → LLM
+                  ├─ dispatch tool calls → ToolRegistry
+                  ├─ auto-compact if near context limit
+                  └─ persist to rollout DB
+```
 
-Inside the TUI:
-- **Plain text** → sends to model (streaming response)
-- **`/command`** → executes slash command (fuzzy autocomplete popup opens instantly)
-- **`!command`** → runs a shell command directly via `Op::RunUserShellCommand`
+---
 
-### Keyboard Shortcuts
+## LLM Client Routing
+
+```
+Model string                          Route
+──────────────────────────────────────────────────────────────
+gpt-5.1-codex-mini                    OpenAI Responses API (BobClient)
+gpt-5.x, o1, o3, o4, codex-*         OpenAI Responses API (BobClient)
+gpt-4o, gpt-4o-mini, gpt-4-*         LiteLLM chat (openai/)
+anthropic/claude-*                    LiteLLM chat (anthropic/)
+gemini/gemini-*                       LiteLLM chat (gemini/)
+vertex_ai/gemini-*                    LiteLLM chat (vertex_ai/)
+azure/<deployment>                    LiteLLM chat (azure/)
+kimi/kimi-for-coding                  LiteLLM → https://api.kimi.com/coding/v1
+openrouter/*                          LiteLLM chat (openrouter/)
+groq/*, mistral/*, xai/*             LiteLLM chat
+together_ai/*                         LiteLLM chat
+ollama/*                              LiteLLM chat (local)
+```
+
+**Tool format pipeline** (in `llm/client.py _stream_once`):
+1. `_normalize_tools_to_chat_format()` — flat Responses-API → nested Chat-Completions
+2. `_sanitize_tools()` — coerce names to `^[a-zA-Z][a-zA-Z0-9_-]*$`
+3. `_patch_message_tool_names()` — apply same remap to history
+4. On ToolCallEvent yield — restore original names from reverse map
+
+**Kimi for Coding special handling** (`llm/compatibility.py`):
+- Provider profile auto-sets `base_url = https://api.kimi.com/coding/v1`
+- Auto-injects headers: `User-Agent: claude-code/1.0`, `X-Client-Name: claude-code`
+- Canonical model: `openai/kimi-for-coding` (routes via LiteLLM OpenAI path)
+- API key: `KIMI_API_KEY` env var (from kimi.com/coding, NOT platform.moonshot.ai)
+
+---
+
+## Supported Providers
+
+| Provider | Model prefix | Env var | Notes |
+|----------|-------------|---------|-------|
+| OpenAI | `gpt-*`, `o1/o3/o4`, `codex-*` | `OPENAI_API_KEY` | GPT-5/codex → Responses API |
+| Anthropic | `anthropic/claude-*` | `ANTHROPIC_API_KEY` | Prompt caching supported |
+| Gemini | `gemini/gemini-*` | `GEMINI_API_KEY` | Auto-prefixes bare `gemini-*` |
+| Vertex AI | `vertex_ai/gemini-*` | `VERTEXAI_LOCATION` + GCP creds | |
+| Azure OpenAI | `azure/<deployment>` | `AZURE_API_KEY` + `AZURE_API_BASE` | |
+| Kimi for Coding | `kimi/kimi-for-coding` | `KIMI_API_KEY` | Spoof claude-code headers |
+| OpenRouter | `openrouter/*` | `OPENROUTER_API_KEY` | 200+ models |
+| Groq | `groq/*` | `GROQ_API_KEY` | |
+| Mistral | `mistral/*` | `MISTRAL_API_KEY` | |
+| xAI (Grok) | `xai/*` | `XAI_API_KEY` | |
+| Together AI | `together_ai/*` | `TOGETHERAI_API_KEY` | |
+| Ollama | `ollama/*` | none | Local models |
+
+---
+
+## Complete Tool Reference
+
+### File Operations
+
+| Tool | File | Description |
+|------|------|-------------|
+| `read_file` | `tools/read_file.py` | Read file contents, optional line range |
+| `write_file` | `tools/write_file.py` | Create or overwrite a file |
+| `edit_file` | `tools/edit_file.py` | Targeted old→new string replacement |
+| `list_dir` | `tools/list_dir.py` | Directory listing with metadata |
+| `glob_files` | `tools/glob_files.py` | Find files by glob pattern |
+| `grep_files` | `tools/grep_files.py` | Regex search across file contents |
+| `apply_patch` | `tools/apply_patch.py` | Apply unified diff patches |
+
+### Shell Execution
+
+| Tool | File | Description |
+|------|------|-------------|
+| `shell` | `tools/shell.py` | Execute shell commands (PowerShell/bash/zsh) |
+| `js_repl` | `tools/js_repl.py` | Execute JavaScript via Node.js |
+
+### Web
+
+| Tool | File | Description |
+|------|------|-------------|
+| `web_fetch` | `tools/web_fetch.py` | Fetch and extract content from a URL |
+| `web_search` | `tools/web_search.py` | Search the web (Brave API / SerpAPI fallback) |
+
+### Multi-Agent
+
+| Tool | File | Description |
+|------|------|-------------|
+| `spawn_agent` | `tools/multi_agent/spawn_agent.py` | Spawn a sub-agent with a task |
+| `assign_task` | `tools/multi_agent/assign_task.py` | Assign a task to an existing agent |
+| `send_message` | `tools/multi_agent/send_message.py` | Send a message to an agent |
+| `wait_agent` | `tools/multi_agent/wait_agent.py` | Block until an agent finishes |
+| `list_agents` | `tools/multi_agent/list_agents.py` | List all running agent threads |
+| `close_agent` | `tools/multi_agent/close_agent.py` | Terminate an agent thread |
+| `resume_agent` | `tools/multi_agent/resume_agent.py` | Resume a paused agent |
+
+### Team Management
+
+| Tool | File | Description |
+|------|------|-------------|
+| `team_create` | `tools/team_tools.py` | Create a named team with shared instructions |
+| `team_spawn_agent` | `tools/team_tools.py` | Spawn an agent under a team's context |
+| `team_list` | `tools/team_tools.py` | List all teams |
+| `team_delete` | `tools/team_tools.py` | Delete a team |
+
+`TeamManager` lives in `core/team.py`. A `Team` dataclass holds: `name`, `description`, `instructions`, `member_ids`. Spawning a team agent prepends team instructions to the task prompt.
+
+### Task Tracking
+
+| Tool | File | Description |
+|------|------|-------------|
+| `task_create` | `tools/task_create.py` | Create a tracked async shell task |
+| `task_update` | `tools/task_update.py` | Update task status or notes |
+| `task_get` | `tools/task_get.py` | Get details for a single task |
+| `task_list` | `tools/task_list.py` | List tasks, filterable by status |
+| `task_output` | `tools/task_output.py` | Read captured stdout/stderr |
+| `task_stop` | `tools/task_stop.py` | Kill a running task |
+
+Tasks persist to SQLite via `core/task_db.py`. Workers run in `core/tasks/worker.py`. Queue in `core/tasks/queue.py`.
+
+### Jupyter Notebooks
+
+| Tool | File | Description |
+|------|------|-------------|
+| `notebook_read` | `tools/notebook_read.py` | Read .ipynb as formatted text with outputs |
+| `notebook_edit` | `tools/notebook_edit.py` | Edit specific cells in a notebook |
+
+### Git / Worktree
+
+| Tool | File | Description |
+|------|------|-------------|
+| `enter_worktree` | `tools/git_worktree.py` | Create isolated git worktree branch |
+| `exit_worktree` | `tools/git_worktree.py` | Merge/discard worktree and return |
+
+### MCP
+
+| Tool | File | Description |
+|------|------|-------------|
+| `mcp_list_resources` | `tools/mcp_resource_tools.py` | List resources from MCP servers |
+| `mcp_read_resource` | `tools/mcp_resource_tools.py` | Read a resource by URI |
+| `mcp_authenticate` | `tools/mcp_auth_tool.py` | OAuth 2.0 PKCE auth flow for MCP server |
+
+### IDE / LSP
+
+| Tool | File | Description |
+|------|------|-------------|
+| `lsp_diagnostics` | `tools/lsp_tools.py` | Get language server diagnostics |
+| `lsp_hover` | `tools/lsp_tools.py` | Hover info for a symbol |
+| `lsp_definition` | `tools/lsp_tools.py` | Go to definition |
+| `lsp_references` | `tools/lsp_tools.py` | Find all references |
+| `lsp_rename` | `tools/lsp_tools.py` | Rename a symbol project-wide |
+| `ide_get_active_file` | `tools/ide_bridge.py` | Currently open file in IDE |
+| `ide_get_open_files` | `tools/ide_bridge.py` | All open files in IDE |
+| `ide_get_selection` | `tools/ide_bridge.py` | Current text selection |
+| `ide_get_diagnostics` | `tools/ide_bridge.py` | IDE error/warning list |
+
+### Planning & Control Flow
+
+| Tool | File | Description |
+|------|------|-------------|
+| `update_plan` | `tools/update_plan.py` | Create/update visible plan checklist |
+| `todo_write` | `tools/todo_write.py` | Manage todos in `.bob-todos.json` |
+| `enter_plan_mode` | `tools/plan_mode.py` | Switch to read-only Plan mode |
+| `exit_plan_mode` | `tools/plan_mode.py` | Return to normal mode |
+
+### Utilities
+
+| Tool | File | Description |
+|------|------|-------------|
+| `view_image` | `tools/view_image.py` | View a local image file |
+| `request_user_input` | `tools/request_user_input.py` | Pause and prompt the user |
+| `tool_search` | `tools/tool_search.py` | Keyword-search the tool registry |
+| `sleep` | `tools/sleep_tool.py` | Pause execution N seconds |
+| `cron_create` | `tools/cron_tools.py` | Schedule a recurring task |
+| `cron_delete` | `tools/cron_tools.py` | Delete a scheduled task |
+| `cron_list` | `tools/cron_tools.py` | List scheduled tasks |
+
+### Computer Use (requires `feature_flags.computer_use = true`)
+
+| Tool | File | Action |
+|------|------|--------|
+| `computer_use` | `tools/computer_use.py` | `screenshot`, `left_click`, `right_click`, `double_click`, `mouse_move`, `scroll`, `key`, `type`, `cursor_position` |
+
+Screenshot pipeline: `mss` screen grab → PIL resize to 640px max width → JPEG quality 15 → base64. Result is ~5-10 KB (~2000-4000 tokens). Requires:
+```
+pip install mss pyautogui
+```
+
+---
+
+## Slash Commands (60+)
+
+Defined in `tui/slash_commands.py` as `SlashCommand(str, Enum)`.
+
+### Model & Reasoning
+| Command | Args | Description |
+|---------|------|-------------|
+| `/model` | filter | Open model picker; type to filter |
+| `/fast` | on/off | Toggle fast inference mode |
+| `/effort` | low/medium/high | Set reasoning effort |
+| `/think` | [tokens] | Set thinking token budget for next turn |
+
+### Session Management
+| Command | Args | Description |
+|---------|------|-------------|
+| `/new` | | Start a fresh session |
+| `/resume` | | Open session picker |
+| `/fork` | | Fork current session to new thread |
+| `/rename` | [name] | Rename current session |
+| `/compact` | | Summarize history, free context |
+| `/rewind` | [N] | Undo last N turns (default 1) |
+| `/clear` | | Clear terminal and full context |
+
+### Git & Code
+| Command | Args | Description |
+|---------|------|-------------|
+| `/diff` | | Show git diff; emits `IDEShowDiffEvent` |
+| `/review` | [focus] | Review current changes for issues |
+| `/commit` | | Generate commit message and commit staged files |
+| `/branch` | name | Create and checkout new branch |
+| `/init` | | Generate AGENTS.md for current project |
+
+### Context
+| Command | Args | Description |
+|---------|------|-------------|
+| `/mention` | | @ file picker |
+| `/context` | url/path | Add URL or file as context for next message |
+| `/export` | [filename] | Export conversation to Markdown file |
+| `/summary` | | Summarize what was done this session |
+
+### Output & Style
+| Command | Args | Description |
+|---------|------|-------------|
+| `/output-style` | brief/normal/verbose | Response verbosity |
+| `/brief` | | Alias: output-style brief |
+| `/personality` | | Choose communication style |
+| `/theme` | | Syntax highlight theme picker |
+| `/statusline` | | Configure status line items |
+| `/title` | | Configure terminal title items |
+
+### Multi-Agent
+| Command | Args | Description |
+|---------|------|-------------|
+| `/agent` | | Switch active agent thread |
+| `/subagents` | | Manage agent threads |
+| `/collab` | | Change collaboration mode |
+
+### Tools & Extensions
+| Command | Args | Description |
+|---------|------|-------------|
+| `/skills` | | Browse/activate skills |
+| `/hooks` | | List configured hooks |
+| `/mcp` | | List MCP tools from connected servers |
+| `/apps` | | Manage apps |
+| `/plugins` | | Browse/install plugins |
+
+### Info & Debug
+| Command | Args | Description |
+|---------|------|-------------|
+| `/status` | | Model, session ID, token usage |
+| `/cost` | | Estimated token cost this session |
+| `/usage` | | Token breakdown for last turn |
+| `/ps` | | List background terminals |
+| `/stop` | | Stop all background terminals |
+| `/doctor` | | System health checks |
+| `/debug-config` | | Show config layers and sources |
+| `/rollout` | | Print rollout file path |
+| `/help` | | All available commands |
+
+### Approvals & Sandbox
+| Command | Args | Description |
+|---------|------|-------------|
+| `/approvals` | | Configure approval policy |
+| `/permissions` | | Alias for approvals |
+| `/setup-default-sandbox` | | Set up elevated sandbox |
+| `/sandbox-add-read-dir` | path | Allow sandbox to read a path |
+| `/experimental` | | Toggle experimental features |
+
+### Planning
+| Command | Args | Description |
+|---------|------|-------------|
+| `/plan` | | Enter Plan mode (read-only tools only) |
+
+### Tasks
+| Command | Args | Description |
+|---------|------|-------------|
+| `/tasks` | [status] | List tasks (all/running/done/failed) |
+
+### Input
+| Command | Args | Description |
+|---------|------|-------------|
+| `/vi` | | Toggle vi keybinding mode |
+
+### Other
+| Command | Args | Description |
+|---------|------|-------------|
+| `/realtime` | | Toggle voice/realtime mode (experimental) |
+| `/settings` | | Configure microphone/speaker |
+| `/feedback` | | Send logs to maintainers |
+| `/logout` | | Log out |
+| `/debug-m-drop` | | Drop all memories (debug) |
+| `/debug-m-update` | | Force memory update (debug) |
+| `/quit` / `/exit` | | Exit bob |
+
+**Available during active turn** (subset usable while model is running):
+`/diff`, `/copy`, `/rename`, `/mention`, `/skills`, `/status`, `/debug-config`, `/ps`, `/stop`, `/mcp`, `/apps`, `/plugins`, `/feedback`, `/quit`, `/exit`, `/rollout`, `/realtime`, `/settings`, `/collab`, `/agent`, `/subagents`
+
+---
+
+## TUI Interface
+
+All TUI logic in `tui/interface.py`. Built on `prompt_toolkit`.
+
+### Screen Layout
+
+```
+┌────────────────────────────────────────────────────┐
+│  Welcome banner (startup only)                      │
+│    System info: model · workspace · directory       │
+│    ASCII art logo                                   │
+│    Recent Activity (last 3 git commits)             │
+│    Quick Commands panel                             │
+├────────────────────────────────────────────────────┤
+│  Conversation history (scrollable)                  │
+│    • User turns                                     │
+│    • Assistant streaming text (live delta)          │
+│    • Tool call results                              │
+│    • Reasoning/thinking blocks                      │
+│    • Error messages with source file:line context   │
+├────────────────────────────────────────────────────┤
+│  Spinner + active tool label (while running)        │
+│    "● Thinking…" / "● Running shell…"               │
+│    "🌐 Searching…" / "🌐 Fetching…"                 │
+├────────────────────────────────────────────────────┤
+│  ❯ Input prompt                                     │
+│    Tab: slash command autocomplete                  │
+│    @: file mention autocomplete                    │
+│    Up/Down: input history                           │
+│    Vi mode: toggle with /vi                         │
+├────────────────────────────────────────────────────┤
+│  Status line                                        │
+│    model · N in  N out · $cost · N% ctx · Nms      │
+└────────────────────────────────────────────────────┘
+```
+
+### Key Bindings
 
 | Key | Action |
-|---|---|
+|-----|--------|
 | `Enter` | Submit message |
-| `Shift+Enter` | Newline in composer |
-| `Ctrl+C` / `Ctrl+G` | Interrupt current turn |
-| `Ctrl+D` | Quit |
-| `PgUp` / `PgDn` | Scroll chat history |
-| `Ctrl+T` | Toggle transcript overlay |
-| `Ctrl+L` | Clear (same as `/clear`) |
-| `Tab` | Autocomplete slash command |
-| `Esc` | Dismiss popup / cancel |
-| `Up` arrow (in composer) | Previous message in history |
+| `Tab` | Autocomplete slash command or @ mention |
+| `Up / Down` | Input history navigation |
+| `Ctrl+V` / right-click | Paste text or clipboard image |
+| `Ctrl+C` | Interrupt running turn |
+| `Ctrl+C` (idle, twice) | Exit |
+| `Ctrl+R` | Reverse history search |
+| `Escape` | Cancel autocomplete |
+| `!cmd` prefix | Direct shell passthrough |
 
----
+### Clipboard Image Paste
 
-## All Slash Commands (Exact Codex List)
+Uses `Keys.BracketedPaste` (terminal bracketed paste mode, fired by Ctrl+V and right-click):
 
-Typed as `/command` in composer. Popup appears on `/`. Ordered by frequency (matches Codex `SlashCommand` enum order exactly).
+1. Pasted text ends with image extension + path exists → inserts `@/path/to/image`
+2. Paste is empty (clipboard held an image) → runs platform clipboard reader:
+   - **Windows**: `PowerShell Get-Clipboard -Format Image` → PNG to temp file
+   - **macOS**: `osascript` → PNG to temp file
+   - **Linux**: `xclip -selection clipboard -t image/png` or `wl-paste --type image/png`
+3. Image found → saves to `%TEMP%/bob_paste_XXXX.png`, inserts `@path`
+4. Otherwise → inserts pasted text normally
 
-| Command | Description | Available During Task? | Args |
-|---|---|---|---|
-| `/model` | Choose model and reasoning effort | No | |
-| `/fast` | Toggle Fast mode (2X plan usage) | No | optional: on/off |
-| `/approvals` | Choose what bob is allowed to do | No | |
-| `/permissions` | Choose what bob is allowed to do (alias) | No | |
-| `/setup-default-sandbox` | Set up elevated agent sandbox | No | |
-| `/sandbox-add-read-dir` | Let sandbox read a directory | No | `<absolute_path>` |
-| `/experimental` | Toggle experimental features | No | |
-| `/skills` | Use skills to improve how bob performs tasks | Yes | |
-| `/review` | Review current changes and find issues | No | optional: args |
-| `/rename` | Rename the current thread | Yes | `<name>` |
-| `/new` | Start a new chat during a conversation | No | |
-| `/resume` | Resume a saved chat | No | |
-| `/fork` | Fork the current chat | No | |
-| `/init` | Create an AGENTS.md file | No | |
-| `/compact` | Summarize conversation to prevent hitting context limit | No | |
-| `/plan` | Switch to Plan mode | No | optional: description |
-| `/collab` | Change collaboration mode | Yes | |
-| `/agent` | Switch the active agent thread | Yes | |
-| `/diff` | Show git diff (including untracked files) | Yes | |
-| `/copy` | Copy latest bob output to clipboard | Yes | |
-| `/mention` | Mention a file (attach to next message) | Yes | |
-| `/status` | Show current session configuration and token usage | Yes | |
-| `/debug-config` | Show config layers and requirement sources | Yes | |
-| `/title` | Configure terminal title items | No | |
-| `/statusline` | Configure status line items | No | |
-| `/theme` | Choose syntax highlighting theme | No | |
-| `/mcp` | List configured MCP tools | Yes | |
-| `/apps` | Manage apps / connectors | Yes | |
-| `/plugins` | Browse plugins | Yes | |
-| `/logout` | Log out of bob | No | |
-| `/quit` / `/exit` | Exit bob | Yes | |
-| `/feedback` | Send logs to maintainers | Yes | |
-| `/rollout` | Print the rollout file path | Yes | (debug only) |
-| `/ps` | List background terminals | Yes | |
-| `/stop` / `/clean` | Stop all background terminals | Yes | |
-| `/clear` | Clear terminal and start a new chat | No | |
-| `/personality` | Choose a communication style | No | |
-| `/realtime` | Toggle realtime voice mode (experimental) | Yes | |
-| `/settings` | Configure realtime microphone/speaker | Yes | |
-| `/subagents` | Switch the active agent thread (alias for `/agent`) | Yes | |
-| `/debug-m-drop` | Drop all memories (debug) | No | |
-| `/debug-m-update` | Update memories (debug) | No | |
+### Autocomplete
 
-Commands supporting inline args: `/review`, `/rename`, `/plan`, `/fast`, `/sandbox-add-read-dir`
+Slash commands: fuzzy-matched via `rapidfuzz`. Prefix matches scored higher than fuzzy matches.
 
----
+File mentions: triggered by `@`. Scans cwd using glob. Shows filename + relative path.
 
-## Project Structure
+### Status Line
 
+After every completed turn:
 ```
-bob/
-├── pyproject.toml
-├── BOB_PLAN.md
-├── AGENTS.md
-│
-└── bob/
-    ├── __init__.py
-    ├── __main__.py                        # python -m bob
-    │
-    ├── cli/
-    │   ├── __init__.py
-    │   ├── main.py                        # typer app — `bob` → TUI; subcommands
-    │   └── exec_cmd.py                    # `bob exec` headless runner
-    │
-    ├── protocol/
-    │   ├── __init__.py
-    │   ├── ops.py                         # ALL Op variants (see full list below)
-    │   ├── events.py                      # ALL EventMsg variants (see full list below)
-    │   ├── config_types.py                # AskForApproval, SandboxPolicy, Personality, etc.
-    │   ├── items.py                       # ResponseItem, UserInput, TurnItem, ContentItem
-    │   ├── plan_types.py                  # UpdatePlanArgs, PlanItemArg, StepStatus
-    │   └── review_types.py               # ReviewRequest, ReviewTarget, ReviewFinding
-    │
-    ├── config/
-    │   ├── __init__.py
-    │   ├── schema.py                      # BobConfig full Pydantic model
-    │   └── loader.py                      # 4-layer TOML merge (defaults→user→project→CLI)
-    │
-    ├── core/
-    │   ├── __init__.py
-    │   ├── session.py                     # BobSession: sq + eq + agent loop
-    │   ├── codex_thread.py                # CodexThread: wraps session per thread
-    │   ├── thread_manager.py              # ThreadManager: all active threads + lifecycle
-    │   ├── turn.py                        # Single turn: prompt → stream → tools → repeat
-    │   ├── context_manager.py             # History list + token counting + truncation
-    │   ├── compact.py                     # Compaction algorithm (summarize → replace history)
-    │   ├── rollout_reconstruction.py      # Resume/fork history rebuild from JSONL
-    │   ├── exec.py                        # execute_command() with streaming + sandbox + cap
-    │   ├── exec_policy.py                 # Trusted commands, execpolicy evaluation
-    │   ├── environment_context.py         # OS/cwd/shell/time environment injection
-    │   └── agent/
-    │       ├── __init__.py
-    │       ├── control.py                 # AgentControl (cancel token, interrupt)
-    │       └── review.py                  # Review mode handler
-    │
-    ├── client/
-    │   ├── __init__.py
-    │   └── openai_client.py               # AsyncOpenAI Responses API wrapper + streaming
-    │
-    ├── tools/
-    │   ├── __init__.py
-    │   ├── registry.py                    # ToolRegistry: register, dispatch, get_specs
-    │   ├── shell.py                       # shell / local_shell tool handler
-    │   ├── apply_patch.py                 # apply_patch tool + custom format parser
-    │   ├── apply_patch_instructions.md    # Injected into system prompt
-    │   ├── update_plan.py                 # update_plan tool handler
-    │   ├── web_search.py                  # web_search tool handler
-    │   ├── view_image.py                  # view_image tool handler
-    │   ├── list_dir.py                    # list_dir tool handler (experimental)
-    │   ├── request_user_input.py          # request_user_input tool handler
-    │   ├── request_permissions.py         # request_permissions tool handler
-    │   └── multi_agent/
-    │       ├── __init__.py
-    │       ├── spawn_agent.py             # spawn_agent tool (v2)
-    │       ├── send_message.py            # send_message tool (v2)
-    │       ├── assign_task.py             # assign_task tool (v2)
-    │       ├── wait_agent.py              # wait_agent tool (v2)
-    │       ├── close_agent.py             # close_agent tool (v2)
-    │       └── list_agents.py             # list_agents tool (v2)
-    │
-    ├── sandbox/
-    │   ├── __init__.py                    # get_sandbox_runner(policy) → SandboxRunner
-    │   ├── base.py                        # SandboxRunner ABC
-    │   ├── macos.py                       # SeatbeltSandbox (sandbox-exec)
-    │   ├── linux.py                       # BubblewrapSandbox (bwrap) + Landlock fallback
-    │   └── windows.py                     # RestrictedTokenSandbox (pywin32) / noop
-    │
-    ├── rollout/
-    │   ├── __init__.py
-    │   ├── recorder.py                    # Async JSONL writer
-    │   ├── state_db.py                    # aiosqlite: threads table + migrations
-    │   └── session_index.py               # Thread name→ID→path index
-    │
-    ├── mcp/
-    │   ├── __init__.py
-    │   ├── client.py                      # McpServerConnection: subprocess + mcp SDK
-    │   ├── manager.py                     # McpManager: lifecycle + reconnect
-    │   └── server.py                      # Bob-as-MCP-server (stdio)
-    │
-    ├── memories/
-    │   ├── __init__.py
-    │   ├── storage.py                     # SQLite + markdown file memory store
-    │   ├── phase1.py                      # Extraction: rollout → raw_memories.md
-    │   └── phase2.py                      # Consolidation: raw → summary
-    │
-    ├── skills/
-    │   ├── __init__.py
-    │   ├── manager.py                     # SkillsManager: discover + cache
-    │   └── watcher.py                     # SkillsWatcher: fs watch for changes
-    │
-    ├── plugins/
-    │   ├── __init__.py
-    │   └── manager.py                     # PluginsManager: install/list/uninstall
-    │
-    ├── hooks/
-    │   ├── __init__.py
-    │   └── runner.py                      # Hook execution (pre/post tool-use, session-start)
-    │
-    ├── instructions/
-    │   ├── __init__.py
-    │   └── loader.py                      # AGENTS.md walk-up + scoping rules
-    │
-    ├── prompts/
-    │   └── system.md                      # Base system prompt (bob's guidelines)
-    │
-    ├── app_server/
-    │   ├── __init__.py
-    │   ├── server.py                      # JSON-RPC 2.0 WebSocket + stdio transport
-    │   ├── protocol_v2.py                 # All v2 request/response types (Pydantic)
-    │   └── message_processor.py           # Route JSON-RPC methods → ThreadManager ops
-    │
-    └── tui/
-        ├── __init__.py
-        ├── app.py                         # BobApp(textual.App) — main application
-        ├── chat_widget.py                 # ChatWidget: history cells + active streaming cell
-        ├── composer.py                    # ComposerWidget: input, slash detection, ! prefix
-        ├── slash_commands.py              # SlashCommand enum + descriptions + fuzzy match
-        ├── command_popup.py               # Autocomplete popup (appears on /)
-        ├── approval_widget.py             # ExecApproval modal (y/n/a/d)
-        ├── patch_approval_widget.py       # PatchApproval modal (diff display)
-        ├── plan_widget.py                 # Plan checklist panel (update_plan rendering)
-        ├── resume_picker.py               # Session picker (resume + fork, paginated 25/page)
-        ├── model_picker.py                # Model picker (/model)
-        ├── approval_picker.py             # Approval mode picker (/approvals)
-        ├── sandbox_picker.py              # Sandbox mode picker (/permissions)
-        ├── personality_picker.py          # Personality picker (/personality)
-        ├── theme_picker.py                # Theme picker (/theme)
-        ├── collab_picker.py               # Collaboration mode picker (/collab)
-        ├── mcp_list_widget.py             # MCP tools display (/mcp)
-        ├── status_widget.py               # Status display (/status)
-        ├── elicitation_widget.py          # MCP elicitation request modal
-        ├── user_input_widget.py           # request_user_input tool modal
-        ├── markdown_render.py             # Markdown → Textual rich text
-        ├── diff_render.py                 # Patch diff display with syntax highlight
-        └── footer.py                      # Status bar: model | sandbox | approval | tokens
+kimi/kimi-for-coding  ·  7,199 in  46 out  ·  $0.0021  ·  1% ctx  ·  2657ms
 ```
 
----
+Configurable items: model, tokens, cost, context %, latency. Configure with `/statusline`.
 
-## Full Protocol Types
+### Approval Prompt
 
-### ALL Ops (`bob/protocol/ops.py`)
-
-Pydantic v2 discriminated union on `"type"` field:
-
-```python
-# Core turn ops
-class UserTurnOp(BaseModel):
-    type: Literal["user_turn"]
-    items: list[UserInput]
-    cwd: Path
-    approval_policy: AskForApproval
-    approvals_reviewer: Optional[ApprovalsReviewer] = None
-    sandbox_policy: SandboxPolicy
-    model: str
-    effort: Optional[ReasoningEffortConfig] = None
-    summary: Optional[ReasoningSummaryConfig] = None
-    service_tier: Optional[Optional[ServiceTier]] = None
-    final_output_json_schema: Optional[dict] = None
-    collaboration_mode: Optional[CollaborationMode] = None
-    personality: Optional[Personality] = None
-
-class InterruptOp(BaseModel):
-    type: Literal["interrupt"]
-
-class CleanBackgroundTerminalsOp(BaseModel):
-    type: Literal["clean_background_terminals"]
-
-# Approvals
-class ExecApprovalOp(BaseModel):
-    type: Literal["exec_approval"]
-    id: str
-    turn_id: Optional[str] = None
-    decision: ReviewDecision
-
-class PatchApprovalOp(BaseModel):
-    type: Literal["patch_approval"]
-    id: str
-    decision: ReviewDecision
-
-class ResolveElicitationOp(BaseModel):
-    type: Literal["resolve_elicitation"]
-    server_name: str
-    request_id: Union[str, int]
-    decision: ElicitationAction
-    content: Optional[dict] = None
-
-class UserInputAnswerOp(BaseModel):
-    type: Literal["user_input_answer"]
-    id: str
-    response: RequestUserInputResponse
-
-class RequestPermissionsResponseOp(BaseModel):
-    type: Literal["request_permissions_response"]
-    id: str
-    response: RequestPermissionsResponse
-
-class DynamicToolResponseOp(BaseModel):
-    type: Literal["dynamic_tool_response"]
-    id: str
-    response: DynamicToolResponse
-
-# Context management
-class OverrideTurnContextOp(BaseModel):
-    type: Literal["override_turn_context"]
-    cwd: Optional[Path] = None
-    approval_policy: Optional[AskForApproval] = None
-    approvals_reviewer: Optional[ApprovalsReviewer] = None
-    sandbox_policy: Optional[SandboxPolicy] = None
-    model: Optional[str] = None
-    effort: Optional[ReasoningEffortConfig] = None
-    summary: Optional[ReasoningSummaryConfig] = None
-    service_tier: Optional[Optional[ServiceTier]] = None
-    collaboration_mode: Optional[CollaborationMode] = None
-    personality: Optional[Personality] = None
-
-class CompactOp(BaseModel):
-    type: Literal["compact"]
-
-class AddToHistoryOp(BaseModel):
-    type: Literal["add_to_history"]
-    text: str
-
-# Session control
-class SetThreadNameOp(BaseModel):
-    type: Literal["set_thread_name"]
-    name: str
-
-class UndoOp(BaseModel):
-    type: Literal["undo"]
-
-class ThreadRollbackOp(BaseModel):
-    type: Literal["thread_rollback"]
-    num_turns: int
-
-class ShutdownOp(BaseModel):
-    type: Literal["shutdown"]
-
-# Review
-class ReviewOp(BaseModel):
-    type: Literal["review"]
-    review_request: ReviewRequest
-
-# Shell passthrough
-class RunUserShellCommandOp(BaseModel):
-    type: Literal["run_user_shell_command"]
-    command: str  # raw string after '!'
-
-# Queries
-class ListModelsOp(BaseModel):
-    type: Literal["list_models"]
-
-class ListMcpToolsOp(BaseModel):
-    type: Literal["list_mcp_tools"]
-
-class RefreshMcpServersOp(BaseModel):
-    type: Literal["refresh_mcp_servers"]
-    config: dict  # mcp_servers + mcp_oauth_credentials_store_mode
-
-class ReloadUserConfigOp(BaseModel):
-    type: Literal["reload_user_config"]
-
-class ListSkillsOp(BaseModel):
-    type: Literal["list_skills"]
-    cwds: list[Path] = []
-    force_reload: bool = False
-
-class GetHistoryEntryRequestOp(BaseModel):
-    type: Literal["get_history_entry_request"]
-    offset: int
-    log_id: int
-
-# Memory
-class DropMemoriesOp(BaseModel):
-    type: Literal["drop_memories"]
-
-class UpdateMemoriesOp(BaseModel):
-    type: Literal["update_memories"]
-
-# Multi-agent
-class InterAgentCommunicationOp(BaseModel):
-    type: Literal["inter_agent_communication"]
-    communication: InterAgentCommunication
-
-# Realtime voice
-class RealtimeConversationStartOp(BaseModel):
-    type: Literal["realtime_conversation_start"]
-    prompt: str
-    session_id: Optional[str] = None
-
-class RealtimeConversationAudioOp(BaseModel):
-    type: Literal["realtime_conversation_audio"]
-    frame: RealtimeAudioFrame
-
-class RealtimeConversationTextOp(BaseModel):
-    type: Literal["realtime_conversation_text"]
-    text: str
-
-class RealtimeConversationCloseOp(BaseModel):
-    type: Literal["realtime_conversation_close"]
+Interrupts any turn requiring shell approval:
 ```
+  Approval required
+  Command: $ rm -rf ./dist
+  CWD:     /project
 
-### ALL EventMsg Variants (`bob/protocol/events.py`)
-
-```python
-# Errors / warnings
-ErrorEvent, WarningEvent
-
-# Turn lifecycle
-TurnStartedEvent       # turn_id, model_context_window, collaboration_mode_kind
-TurnCompleteEvent      # turn_id
-TurnAbortedEvent       # turn_id, reason
-TokenCountEvent        # input_tokens, output_tokens, total_tokens (all Optional)
-
-# Agent text output
-AgentMessageEvent           # message, turn_id
-AgentMessageDeltaEvent      # delta, turn_id
-AgentReasoningEvent         # reasoning text
-AgentReasoningDeltaEvent    # reasoning delta
-AgentReasoningRawContentEvent       # raw chain-of-thought
-AgentReasoningRawContentDeltaEvent  # raw delta
-AgentReasoningSectionBreakEvent     # new reasoning section starts
-
-# User message echo
-UserMessageEvent      # echoes what was sent to model
-
-# Plan
-PlanUpdateEvent       # UpdatePlanArgs (steps list with statuses)
-PlanDeltaEvent        # incremental plan delta
-
-# Session
-SessionConfiguredEvent     # session_id, thread_id, model, sandbox_policy, etc.
-ThreadNameUpdatedEvent     # new_name
-ModelRerouteEvent          # from_model, to_model
-
-# Shell execution
-ExecCommandBeginEvent      # call_id, process_id, turn_id, command, cwd, parsed_cmd, source
-ExecCommandOutputDeltaEvent # call_id, data, stream (stdout|stderr)
-ExecCommandEndEvent        # call_id, exit_code, duration, stdout, stderr, aggregated_output, status
-TerminalInteractionEvent   # stdin_sent, stdout_observed
-
-# Approvals
-ExecApprovalRequestEvent         # call_id, turn_id, command, cwd, justification
-ApplyPatchApprovalRequestEvent   # call_id, turn_id, changes (list of FileChange)
-GuardianAssessmentEvent          # structured risk assessment for guardian approval flow
-RequestPermissionsEvent          # id, permissions_requested
-RequestUserInputEvent            # id, prompt, fields
-DynamicToolCallRequest           # id, tool_name, input
-DynamicToolCallResponseEvent     # id, result
-ElicitationRequestEvent          # server_name, request_id, message, fields
-
-# Patch
-PatchApplyBeginEvent     # call_id, changes
-PatchApplyEndEvent       # call_id, success, error
-
-# MCP
-McpStartupUpdateEvent     # server_name, status
-McpStartupCompleteEvent   # summary of all server statuses
-McpToolCallBeginEvent     # server_name, tool_name, call_id
-McpToolCallEndEvent       # call_id, result_summary
-McpListToolsResponseEvent # tools: list[McpToolSpec]
-
-# Web search / image gen
-WebSearchBeginEvent    # query, call_id
-WebSearchEndEvent      # call_id, results_count
-ImageGenerationBeginEvent  # prompt, call_id
-ImageGenerationEndEvent    # call_id, image_path
-
-# Skills
-ListSkillsResponseEvent    # entries: list[SkillsListEntry]
-SkillsUpdateAvailableEvent # signal to reload
-
-# Memory
-# (memory updates delivered via agent messages)
-
-# Review mode
-EnteredReviewModeEvent     # review_request
-ExitedReviewModeEvent      # result: Optional[ReviewOutputEvent]
-
-# Context
-ContextCompactedEvent      # summary_preview
-ThreadRolledBackEvent      # num_turns
-
-# Multi-agent collab
-CollabAgentSpawnBeginEvent, CollabAgentSpawnEndEvent
-CollabAgentInteractionBeginEvent, CollabAgentInteractionEndEvent
-CollabWaitingBeginEvent, CollabWaitingEndEvent
-CollabCloseBeginEvent, CollabCloseEndEvent
-CollabResumeBeginEvent, CollabResumeEndEvent
-
-# Undo
-UndoStartedEvent, UndoCompletedEvent
-
-# Image viewing
-ViewImageToolCallEvent    # image_path, call_id
-
-# Hooks
-HookStartedEvent    # hook_name, hook_type, scope
-HookCompletedEvent  # hook_name, status
-
-# History
-GetHistoryEntryResponseEvent   # entry, offset, log_id
-
-# Realtime voice
-RealtimeConversationStartedEvent   # session_id, version
-RealtimeConversationRealtimeEvent  # payload (various realtime sub-events)
-RealtimeConversationClosedEvent    # reason
-
-# Stream errors
-StreamErrorEvent    # message, retry_count
-
-# Misc
-BackgroundEventEvent    # message (notifications from background tasks)
-DeprecationNoticeEvent  # message
-RawResponseItemEvent    # raw item (debug)
-ItemStartedEvent, ItemCompletedEvent  # fine-grained item lifecycle
-TurnDiffEvent           # diff summary for a turn
-ShutdownCompleteEvent   # session shutting down
+  y approve   a approve-all   n reject   d abort turn
 ```
-
----
-
-## All Tools (Exact Codex Parity)
-
-### Always-Available Tools
-
-| Tool name | Handler | Description | Parallel |
-|---|---|---|---|
-| `shell` / `local_shell` | ShellHandler | Execute shell commands in sandbox | Yes |
-| `apply_patch` | ApplyPatchHandler | Apply custom patch format to files | No |
-| `update_plan` | UpdatePlanHandler | Create/update task plan checklist in TUI | No |
-
-### Feature-Gated Tools
-
-| Tool | Condition | Description |
-|---|---|---|
-| `web_search` | `web_search_mode != Disabled` | Search the web |
-| `view_image` | always | View local images (attach to context) |
-| `list_dir` | experimental flag | List directory contents |
-| `request_user_input` | `plan` collab mode or feature flag | Ask user a question |
-| `request_permissions` | `request_permissions_tool` feature | Request runtime permission grants |
-| `js_repl` / `js_repl_reset` | `js_repl_enabled` feature | Execute JavaScript in REPL |
-| `image_generation` | `image_gen_tool` feature | Generate images |
-| `list_mcp_resources` | MCP resources present | List MCP server resources |
-| `read_mcp_resource` | MCP resources present | Read MCP resource |
-| `tool_search` | `search_tool` + app_tools | Search available tools |
-| `tool_suggest` | `tool_suggest` + discoverable tools | Suggest tools |
-
-### Multi-Agent Tools (v2)
-
-| Tool | Description |
-|---|---|
-| `spawn_agent` | Spawn a sub-agent with a task and config |
-| `send_message` | Send message to another agent |
-| `assign_task` | Assign a task to a sub-agent |
-| `wait_agent` | Wait for sub-agent to complete |
-| `close_agent` | Close a sub-agent thread |
-| `list_agents` | List all active agent threads |
-
-### MCP Tools
-All tools from configured MCP servers are dynamically registered at startup with prefix `{server_name}__{tool_name}`.
-
----
-
-## apply_patch Tool — Custom Format (Critical)
-
-Claude is instructed to use `apply_patch` as a shell command. The patch is the second argument:
-
-```
-shell {"command": ["apply_patch", "*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** End Patch\n"]}
-```
-
-### Grammar:
-```
-Patch   := "*** Begin Patch" NEWLINE { FileOp } "*** End Patch" NEWLINE
-FileOp  := AddFile | DeleteFile | UpdateFile
-AddFile := "*** Add File: " path NEWLINE { "+" line NEWLINE }
-DeleteFile := "*** Delete File: " path NEWLINE
-UpdateFile := "*** Update File: " path NEWLINE [ "*** Move to: " newpath NEWLINE ] { Hunk }
-Hunk    := "@@" [ header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
-HunkLine := (" " | "+" | "-") text NEWLINE
-```
-
-### Rules:
-- Context: 3 lines above and below each change
-- Use `@@ class Foo` / `@@ def bar` for disambiguation if 3-line context is not unique
-- Paths are ALWAYS relative, NEVER absolute
-- New file lines must be prefixed with `+` even for `Add File`
-
-### Python Implementation:
-`bob/tools/apply_patch.py` — parse the custom format and apply to disk. Dispatched when shell command `argv[0] == "apply_patch"`.
-
-The full instruction text is in `bob/tools/apply_patch_instructions.md` and injected into every system prompt.
-
----
-
-## update_plan Tool
-
-Called by the model (not the user) to track task progress. Renders a live checklist above the chat in the TUI.
-
-```python
-class StepStatus(str, Enum):
-    pending = "pending"
-    in_progress = "in_progress"
-    completed = "completed"
-
-class PlanItemArg(BaseModel):
-    step: str
-    status: StepStatus
-
-class UpdatePlanArgs(BaseModel):
-    explanation: Optional[str] = None
-    plan: list[PlanItemArg]
-```
-
-The TUI's `PlanWidget` re-renders every time `PlanUpdateEvent` arrives. Only one `in_progress` step at a time.
 
 ---
 
 ## Config System
 
-### File locations (lowest → highest priority):
-1. Built-in defaults
-2. `~/.bob/config.toml` — user config
-3. `.bob/config.toml` — project config (walk up from cwd)
-4. CLI flags (model, sandbox, approval, cwd)
-5. `Op::OverrideTurnContext` — runtime session overrides
+### File location
+- **Windows**: `%USERPROFILE%\.bob\config.toml`
+- **macOS/Linux**: `~/.bob/config.toml`
 
-### Full BobConfig Schema (`bob/config/schema.py`):
+### Full Schema (`config/schema.py`)
 
-```python
-class BobConfig(BaseModel):
-    model: str = "gpt-5.1-codex-mini"
-    sandbox_mode: SandboxMode = SandboxMode.WORKSPACE_WRITE
-    approval_policy: AskForApproval = AskForApproval.ON_REQUEST
-    approvals_reviewer: ApprovalsReviewer = ApprovalsReviewer.USER
-    personality: Personality = Personality.NONE
-    collaboration_mode: Optional[CollaborationMode] = None
-    
-    # Paths
-    bob_home: Path = Path.home() / ".bob"
-    
-    # Provider
-    api_key_env: str = "OPENAI_API_KEY"
-    base_url: str = "https://api.openai.com/v1"
-    
-    # Reasoning
-    reasoning_effort: Optional[ReasoningEffort] = None
-    reasoning_summary: Optional[ReasoningSummary] = None
-    
-    # Features
-    web_search_mode: WebSearchMode = WebSearchMode.DISABLED
-    web_search_config: Optional[WebSearchToolConfig] = None
-    memories_enabled: bool = True
-    js_repl_enabled: bool = False
-    image_gen_tool: bool = False
-    request_user_input: bool = False
-    request_permissions_tool: bool = False
-    multi_agent_v2: bool = True
-    collab_tools: bool = False
-    experimental: bool = False
-    
-    # Windows-specific
-    windows_sandbox_level: WindowsSandboxLevel = WindowsSandboxLevel.LOOSE
-    windows_sandbox_private_desktop: bool = False
-    
-    # MCP
-    mcp_servers: dict[str, McpServerConfig] = {}
-    
-    # Notify
-    notify_on_complete: Optional[str] = None  # script path
-    
-    # History
-    history_enabled: bool = True
-    
-    # Service tier
-    service_tier: Optional[ServiceTier] = None
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `model` | str | `gpt-5.1-codex-mini` | Active model |
+| `api_key` | str | None | Global fallback API key |
+| `base_url` | str | `https://api.openai.com/v1` | Global base URL |
+| `providers` | dict | {} | Per-provider config |
+| `prompt_caching` | bool | true | Anthropic `cache_control` headers |
+| `reasoning_effort` | enum | medium | low / medium / high |
+| `thinking_budget_tokens` | int | 0 | Extended thinking (0=off) |
+| `personality` | enum | pragmatic | Communication style |
+| `output_style` | enum | normal | brief / normal / verbose |
+| `ask_for_approval` | enum | unless-trusted | never / unless-trusted / on-request |
+| `trusted_commands` | list | [] | Shell command patterns never requiring approval |
+| `sandbox_mode` | enum | workspace-write | disabled / workspace-write / workspace-write-no-exec |
+| `network_proxy` | str | "" | HTTP proxy for all outbound requests |
+| `web_search_mode` | enum | disabled | disabled / auto / always |
+| `mcp_servers` | dict | {} | MCP server definitions |
+| `mcp_auth_tokens` | dict | {} | Per-server OAuth tokens |
+| `hooks` | list | [] | Event hook definitions |
+| `max_context_turns` | int | 50 | Rolling history window |
+| `auto_compact_threshold_tokens` | int | 0 | Auto-compact trigger token count |
+| `enable_reactive_compaction` | bool | true | Mid-stream compaction on overflow |
+| `enable_mid_turn_compaction` | bool | true | Compact during tool-heavy turns |
+| `compact_max_retries` | int | 3 | Max compact+retry attempts per turn |
+| `persist_sessions` | bool | true | Save sessions to SQLite |
+| `rollout_dir` | path | None | Override rollout DB directory |
+| `enable_skills` | bool | true | Auto-discover .md skill files |
+| `skill_paths` | list | [] | Extra skill search directories |
+| `enable_memories` | bool | true | Per-project memory system |
+| `memories_path` | path | None | Override memories directory |
+| `feature_flags` | dict | {} | Named experimental feature toggles |
+| `no_color` | bool | false | Disable ANSI colors |
+| `theme` | str | dark | Syntax highlight theme |
+| `show_token_usage` | bool | false | Show after each turn |
+| `show_cost` | bool | false | Show cost after each turn |
+| `stream_responses` | bool | true | Live streaming vs fully-buffered |
+| `exec_timeout_seconds` | int | 120 | Shell command timeout |
+| `shell` | str | None | Override default shell |
+| `patch_preview_lines` | int | 20 | Max diff lines in approval prompt |
+| `windows_sandbox_level` | enum | disabled | Windows Job Object sandbox level |
+
+### ProviderConfig fields
+
+```toml
+[providers.kimi]
+api_key = "sk-kimi-..."           # API key
+base_url = "..."                  # Override base URL
+headers = { X-My-Header = "..." } # Extra HTTP headers → extra_headers kwarg
+env = { MY_VAR = "value" }        # Env vars set during API calls
+extra_kwargs = { timeout = 30 }   # Arbitrary LiteLLM kwargs
 ```
 
-### Key Config Types:
+### Config loading order (later wins)
 
-```python
-class AskForApproval(str, Enum):
-    UNLESS_TRUSTED = "untrusted"
-    ON_FAILURE = "on-failure"
-    ON_REQUEST = "on-request"
-    NEVER = "never"
-    # Granular variant: separate class with bool fields
-
-class SandboxMode(str, Enum):
-    READ_ONLY = "read-only"
-    WORKSPACE_WRITE = "workspace-write"
-    DANGER_FULL_ACCESS = "danger-full-access"
-
-class ReviewDecision(str, Enum):
-    APPROVED = "approved"
-    APPROVED_FOR_SESSION = "approved_for_session"
-    DENIED = "denied"
-    ABORT = "abort"
-
-class Personality(str, Enum):
-    NONE = "none"
-    FRIENDLY = "friendly"
-    PRAGMATIC = "pragmatic"
-
-class ReasoningEffort(str, Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-class WebSearchMode(str, Enum):
-    DISABLED = "disabled"
-    CACHED = "cached"
-    LIVE = "live"
-
-class ApprovalsReviewer(str, Enum):
-    USER = "user"
-    GUARDIAN_SUBAGENT = "guardian_subagent"
-
-class CollaborationModeKind(str, Enum):
-    DEFAULT = "default"
-    PLAN = "plan"
-    PAIR_PROGRAMMING = "pair_programming"
-    EXECUTE = "execute"
-```
+1. `BobConfig` Pydantic defaults
+2. `~/.bob/config.toml`
+3. `./bob.toml` in cwd
+4. `AGENTS.md` workspace overrides
+5. CLI flags (`--model`, `--sandbox`, `--approval`)
+6. Environment variables (`OPENAI_API_KEY`, `KIMI_API_KEY`, etc.)
 
 ---
 
-## System Prompt Construction
+## Sandbox System
 
-Assembled per-session, updated as settings change. Composed of layers:
+### Modes
 
-### 1. Base Instructions (`bob/prompts/system.md`)
-```
-You are a coding agent running in the bob CLI, Your AI-Powered Development Partner.
-You are expected to be precise, safe, and helpful.
-
-Your capabilities:
-- Receive user prompts and other context provided by the harness
-- Communicate by streaming responses and making/updating plans
-- Emit function calls to run terminal commands and apply patches
-
-[Personality guidelines — concise, direct, friendly by default]
-[AGENTS.md spec — how to interpret project instruction files]
-[Preamble message guidelines]
-[Planning guidelines — when/how to use update_plan]
-[Task execution guidelines]
-[Shell command guidelines]
-[apply_patch instructions — full custom format grammar]
-[Final answer formatting guidelines]
-```
-
-### 2. Environment Context (injected per-turn, updated when changed)
-```
-OS: Windows 11 / macOS 14 / Ubuntu 22.04
-CWD: /home/user/myproject
-Shell: bash / zsh / powershell
-Home: /home/user
-Time: 2025-04-04T12:30:00Z
-Git: main (3 uncommitted changes)
-```
-
-### 3. Permissions Context (injected when sandbox/approval changes)
-```
-Sandbox: workspace-write
-  Writable: /home/user/myproject, /tmp
-  Network: disabled
-Approvals: on-request (will ask before running commands)
-```
-
-### 4. AGENTS.md content (concatenated, global→project priority)
-
-### 5. Memory content (from `~/.bob/memories/raw_memories.md`, max 5000 tokens)
-
-### 6. Collaboration mode instructions (injected when mode changes mid-session)
-
----
-
-## Conversation History Format (OpenAI Responses API)
-
-Bob uses the **Responses API**, not Chat Completions. The `input` field takes a flat list of items:
-
-```python
-# API call shape
-response = await client.responses.create(
-    model="gpt-5.1-codex-mini",
-    instructions=system_prompt,   # separate from input
-    input=history,                 # list of ResponseInputItem
-    tools=tool_specs,
-    stream=True,
-)
-
-# History item types:
-# User message
-{"role": "user", "content": [{"type": "input_text", "text": "..."}]}
-# User message with image
-{"role": "user", "content": [{"type": "input_image", "image_url": "..."}]}
-
-# Assistant text + tool calls
-{"role": "assistant", "content": [
-    {"type": "output_text", "text": "..."},
-    {"type": "tool_use", "id": "call_abc", "name": "shell", "input": {"command": ["ls"]}}
-]}
-
-# Tool result (immediately after the assistant message that called it)
-{"role": "tool", "tool_call_id": "call_abc", "content": "file1.py\nfile2.py"}
-
-# Developer instructions (environment context updates, injected inline)
-{"role": "developer", "content": [{"type": "input_text", "text": "CWD changed to: ..."}]}
-```
-
-**History is maintained as `list[dict]` in `ContextManager`.** Serialized as `{"type":"response_item",...}` lines in rollout JSONL.
-
----
-
-## Shell Execution
-
-### Constants (from Codex source, exact values)
-- **Default timeout:** 10,000 ms (10 seconds)
-- **Output byte cap:** same as `DEFAULT_OUTPUT_BYTES_CAP` from pty utils (prevents OOM)
-- **Max output delta events:** 10,000 per exec call (live stream capped; aggregate unlimited)
-- **IO drain timeout after kill:** 2,000 ms
-- **Read chunk size:** 8,192 bytes
-- **Exit codes:** timeout → 124, SIGKILL → 137 (128 + 9)
-
-### Execution Flow
-```python
-async def execute_command(params: ExecParams) -> ExecResult:
-    # 1. Wrap command with sandbox runner (seatbelt/bwrap/restricted-token)
-    wrapped = sandbox.wrap_command(params.command, params.cwd)
-    
-    # 2. Spawn subprocess with asyncio
-    proc = await asyncio.create_subprocess_exec(
-        *wrapped, cwd=params.cwd, env=params.env,
-        stdout=PIPE, stderr=PIPE,
-        start_new_session=True,  # new process group for group kill
-    )
-    
-    # 3. Stream stdout/stderr with output cap
-    # Emit ExecCommandOutputDeltaEvent for each chunk (max 10k events)
-    # Aggregate full output (capped at EXEC_OUTPUT_MAX_BYTES)
-    
-    # 4. Enforce timeout — kill process GROUP on expiry
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=10.0)
-    except asyncio.TimeoutError:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        # drain IO with 2s timeout
-        exit_code = 124  # conventional timeout code
-    
-    return ExecResult(stdout, stderr, aggregated, exit_code, duration_ms)
-```
-
-### Capture Policies
-- `ShellTool` — historical output cap + timeout (default for model-invoked commands)
-- `FullBuffer` — no cap, no timeout (for internal trusted tools)
-
----
-
-## Sandboxing
+| Mode | What it allows |
+|------|---------------|
+| `disabled` | Unrestricted |
+| `workspace-write` | Write inside cwd; reads anywhere |
+| `workspace-write-no-exec` | Write inside cwd; no external binary exec |
 
 ### Platform Implementations
 
-**macOS — SeatbeltSandbox**
-```python
-def wrap_command(self, cmd, policy):
-    profile = self._generate_seatbelt_profile(policy)
-    profile_path = write_temp_file(profile)
-    return ["/usr/bin/sandbox-exec", "-f", profile_path] + cmd
-```
+**Windows** (`sandbox/windows.py`):
+- `WindowsJobObject` class using ctypes (no pywin32 required)
+- `CreateJobObjectW` → `SetInformationJobObject(KILL_ON_JOB_CLOSE | ACTIVE_PROCESS_LIMIT=32)`
+- `AssignProcessToJobObject` called in `core/exec.py` after each subprocess spawn
+- All child processes killed when job object is closed (session exit)
 
-**Linux — BubblewrapSandbox** (falls back to NoSandbox if bwrap not found)
-```python
-def wrap_command(self, cmd, policy):
-    args = ["bwrap"]
-    if policy.mode == "read-only":
-        args += ["--ro-bind", "/", "/"]
-    elif policy.mode == "workspace-write":
-        args += ["--ro-bind", "/", "/", "--bind", str(policy.cwd), str(policy.cwd), "--bind", "/tmp", "/tmp"]
-    else:  # danger-full-access
-        args += ["--dev-bind", "/", "/"]
-    if not policy.network_access:
-        args += ["--unshare-net"]
-    return args + ["--"] + cmd
-```
+**macOS** (`sandbox/macos.py`):
+- `sandbox-exec` with generated Scheme policy file
+- Allows `file-write*` only inside cwd
 
-**Windows — RestrictedTokenSandbox** (pywin32, noop fallback with warning)
+**Linux** (`sandbox/linux.py`):
+- `bwrap` (bubblewrap) with bind mounts
+- `--ro-bind / /` + `--bind CWD CWD`
 
 ---
 
-## Session Persistence & Rollout
+## Context Management
 
-### File layout
+### Rolling History (`core/context_manager.py`)
+
+Maintains list of conversation items with per-item token estimates. Drops oldest turns when over `max_context_turns`.
+
+### Compaction (`core/compact.py`)
+
+Triggered by:
+1. `/compact` (manual)
+2. `auto_compact_threshold_tokens` exceeded
+3. `enable_reactive_compaction` — fires in `_stream_once` on context overflow error
+4. `enable_mid_turn_compaction` — fires mid-turn when tool results push near limit
+
+Compaction flow:
+1. Send history to LLM: "Summarize this conversation preserving all technical details"
+2. Replace full history with `[SUMMARY: ...]` + most-recent N turns
+3. Retry original turn with compacted context
+
+### Budget math (`core/context_budget.py`)
+
 ```
-~/.bob/
-├── config.toml
-├── state.sqlite             # threads + memories tables
-├── AGENTS.md                # user-level instructions
-└── sessions/
-    ├── 2025-04-04T12-30-00-{uuid}.jsonl
-    └── ...
+effective_limit = model_context_window × 0.85
+compact_trigger = effective_limit - 8000
 ```
 
-### JSONL Line Types
-```jsonl
-{"type":"session_meta","session_id":"...","model":"...","created_at":"...","cwd":"..."}
-{"type":"turn_started","turn_id":"..."}
-{"type":"user_message","items":[...]}
-{"type":"response_item","item":{...}}                    // history item
-{"type":"turn_context","turn_id":"...","model":"...","cwd":"...","sandbox_policy":"..."}
-{"type":"compacted","message":"summary...","replacement_history":[...]}
-{"type":"thread_rolled_back","num_turns":1}
-{"type":"turn_complete","turn_id":"..."}
-{"type":"turn_aborted","turn_id":"...","reason":"..."}
-{"type":"session_ended","reason":"..."}
+---
+
+## MCP (Model Context Protocol)
+
+### Connection flow
+
+```
+McpManager.start()
+  └─ for each mcp_servers entry:
+      └─ McpClient.connect()
+          ├─ spawn subprocess (stdio transport)
+          ├─ mcp.ClientSession.initialize()
+          ├─ list_tools() → register each as ToolRegistry entry
+          └─ list_resources() → store as McpResource list
 ```
 
-Writer opens in **append mode**. Crash-safe — resume skips incomplete final line.
-
-### Rollout Reconstruction Algorithm (Resume / Fork)
-
-**Scan NEWEST→OLDEST** to find the latest surviving compaction + metadata, then **replay OLDEST→NEWEST** for only the surviving tail:
+### McpResource dataclass
 
 ```python
-def reconstruct_history(rollout_items: list) -> ReconstructionResult:
-    # Phase 1: scan backward
-    base_history = None
-    pending_rollbacks = 0
-    rollout_suffix = rollout_items
-    
-    for i, item in enumerate(reversed(rollout_items)):
-        if item.type == "compacted" and item.replacement_history:
-            base_history = item.replacement_history
-            rollout_suffix = rollout_items[len(rollout_items)-i:]  # items after this
-            break
-        if item.type == "thread_rolled_back":
-            pending_rollbacks += item.num_turns
-        if item.type == "turn_started":
-            if segment_has_user_message and pending_rollbacks > 0:
-                pending_rollbacks -= 1  # skip this turn
-    
-    # Phase 2: replay suffix forward
-    history = base_history or []
-    for item in rollout_suffix:
-        if item.type == "response_item":
-            history.append(item.item)
-        elif item.type == "compacted" and item.replacement_history:
-            history = item.replacement_history
-        elif item.type == "thread_rolled_back":
-            history = drop_last_n_user_turns(history, item.num_turns)
-    
-    return ReconstructionResult(history=history, previous_settings=...)
+@dataclass
+class McpResource:
+    uri: str
+    name: str
+    description: str
+    mime_type: str
+    server_name: str
 ```
 
-**Fork:** create new JSONL, write `{"type":"session_meta",...,"forked_from":"old_session_id"}`, replay reconstructed history as `response_item` lines, continue appending new turns.
+### MCP OAuth (`mcp/oauth.py`)
+
+1. `_pkce_pair()` → SHA256 code verifier + base64url challenge
+2. Open browser to `{authorization_url}?code_challenge=...&state=...`
+3. `_wait_for_callback(state)` → asyncio HTTP server on port 7890, waits for redirect
+4. `_exchange_code(code, verifier)` → POST to token endpoint
+5. Token saved to `config.mcp_auth_tokens[server_name]` + `~/.bob/config.toml`
+
+### Config example
+
+```toml
+[mcp_servers.filesystem]
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
+
+[mcp_servers.github]
+command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_..." }
+```
 
 ---
 
-## Compact Algorithm
+## Plugin System
 
-Triggered by `/compact` slash command or automatically when history exceeds 85% of context window.
+`plugins/manager.py` — manages `~/.bob/plugins/`
 
-```
-1. Build compaction prompt: current history + system prompt asking for CONTEXT CHECKPOINT COMPACTION
-   Prompt text: "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary 
-   for another LLM that will resume the task. Include: Current progress and key decisions made,
-   Important context/constraints/user preferences, What remains to be done (clear next steps),
-   Any critical data/examples/references needed to continue. Be concise, structured."
-
-2. Stream response from model (no tools, no sandbox — pure text generation)
-
-3. Format summary: SUMMARY_PREFIX + "\n" + model_response
-
-4. Select user messages (newest first, up to 20,000 tokens budget):
-   selected = []
-   remaining = 20_000
-   for msg in reversed(user_messages_from_history):
-       if not is_summary_message(msg):  # skip previous compaction summaries
-           tokens = approx_tokens(msg)   # len // 4
-           if tokens <= remaining:
-               selected.insert(0, msg)
-               remaining -= tokens
-   
-5. Build new_history:
-   new_history = [as_user_message(m) for m in selected] + [as_user_message(summary)]
-
-6. Write to rollout: {"type":"compacted","message":summary,"replacement_history":new_history}
-
-7. Replace in-memory history with new_history
-
-8. Recompute token counts
-
-9. Emit: "Heads up: Long threads and multiple compactions can cause the model to be less 
-   accurate. Start a new thread when possible to keep threads small and targeted."
+Each plugin is a directory with `plugin.json`:
+```json
+{ "name": "my-plugin", "version": "1.0.0", "description": "...", "enabled": true }
 ```
 
-**Token counting:** Use `usage.input_tokens` returned by API after each call. Pre-call estimate: `len(text) // 4`. Trigger at 85% of model's context window.
+### Registry format (remote JSON)
 
----
-
-## Memory System (Two-Phase Pipeline)
-
-### Layout
-```
-~/.bob/memories/
-  ├── rollout_summaries/     # Phase 1 output: per-rollout extracted memories
-  └── raw_memories.md        # Phase 2 output: consolidated memory file
+```json
+[
+  { "name": "plugin-name", "version": "1.0.0", "description": "...", "url": "https://..." }
+]
 ```
 
-### Phase 1 — Extraction
-- Runs at session start in background
-- Model: `gpt-5.1-codex-mini`, reasoning: Low
-- Context: up to 70% of model context window (max ~150k tokens)
-- Concurrency: max 8 simultaneous jobs
-- Job lease: 3600 seconds
-- For each unprocessed rollout JSONL: extract key memories → write to `rollout_summaries/`
+### Install sources
 
-### Phase 2 — Consolidation
-- Model: `gpt-5.1-codex-mini` (or higher if configured), reasoning: Medium
-- Reads all files from `rollout_summaries/`
-- Consolidates into single `raw_memories.md`
-- Injected into system prompt (max 5000 tokens)
-
-### Control
-- `Op::UpdateMemories` — trigger manual pipeline run
-- `Op::DropMemories` — delete all memory files and DB rows
-- `/debug-m-update` — debug trigger
-- `/debug-m-drop` — debug drop
+- Local path: `bob plugin install ./my-plugin`
+- URL (zip): `bob plugin install https://example.com/plugin.zip`
+- Registry: `bob plugin install my-plugin` (looks up `DEFAULT_REGISTRY_URL`)
 
 ---
 
 ## Skills System
 
-Skills are modular capabilities discovered from the filesystem.
+Skills are Markdown files in `~/.bob/skills/` or `.bob/skills/` (workspace).
 
-### Discovery Paths (by scope)
-- **User scope:** `~/.bob/skills/`
-- **Repo scope:** `.bob/skills/` (in repo)
-- **System scope:** bundled with bob
+### Frontmatter format
 
-### Skill Metadata (from `skill.toml` in each skill dir)
-```toml
-name = "my-skill"
-description = "What this skill does"
-
-[interface]
-display_name = "My Skill"
-short_description = "Short version"
-default_prompt = "Run my skill on the current project"
-brand_color = "#FF0000"
-
-[[dependencies.tools]]
-type = "mcp"
-value = "my-mcp-server"
-command = "npx my-mcp-server"
-```
-
-### Flow
-1. `Op::ListSkills` with optional cwds → `EventMsg::ListSkillsResponseEvent`
-2. Skills show in `/skills` picker overlay
-3. Selecting a skill: injects `default_prompt` into composer or sends directly
-4. `EventMsg::SkillsUpdateAvailableEvent` when skill files change (file watcher)
-
+```yaml
 ---
-
-## Review Mode
-
-`/review` or `Op::Review` starts a dedicated review session.
-
-### Review Targets
-```python
-class ReviewTarget(str, Enum):
-    UNCOMMITTED_CHANGES = "uncommitted_changes"   # git diff (staged + unstaged + untracked)
-    BASE_BRANCH = "base_branch"                    # against a specific branch
-    COMMIT = "commit"                              # specific commit SHA
-    CUSTOM = "custom"                              # arbitrary instructions
-
-class ReviewRequest(BaseModel):
-    target: ReviewTarget
-    branch: Optional[str] = None        # for BASE_BRANCH
-    sha: Optional[str] = None           # for COMMIT
-    title: Optional[str] = None         # for COMMIT (human label)
-    instructions: Optional[str] = None  # for CUSTOM
-    user_facing_hint: Optional[str] = None
-```
-
-### Review Output
-```python
-class ReviewFinding(BaseModel):
-    title: str
-    body: str
-    confidence_score: float  # 0.0-1.0
-    priority: int
-    file_path: Path
-    line_start: int
-    line_end: int
-
-class ReviewOutputEvent(BaseModel):
-    findings: list[ReviewFinding]
-    overall_correctness: str
-    overall_explanation: str
-    overall_confidence_score: float
-```
-
-Events: `EnteredReviewModeEvent` → (agent runs review) → `ExitedReviewModeEvent` with findings.
-
+name: code-review
+description: Focused code review skill
+triggers: [review, analyze, check]
 ---
-
-## Multi-Agent System (v2)
-
-### Thread Lifecycle
-```python
-class ThreadManager:
-    threads: dict[ThreadId, CodexThread]
-    
-    async def create_thread(self, config: BobConfig, session_source: SessionSource) -> NewThread: ...
-    async def fork_thread(self, source_id: ThreadId, fork_snapshot: ForkSnapshot) -> NewThread: ...
-    async def shutdown_all(self, timeout_ms: int = 5000) -> ThreadShutdownReport: ...
-    async def submit(self, thread_id: ThreadId, op: Op) -> str: ...  # returns submission_id
+When reviewing code, focus on: security, performance, readability...
 ```
 
-### Fork Snapshot Modes
-```python
-class ForkSnapshot:
-    INTERRUPTED = "interrupted"   # interrupt mid-turn and fork there
-
-class ForkBeforeNthUserMessage(BaseModel):
-    n: int  # 0-indexed: fork before nth user message
-```
-
-### v2 Multi-Agent Tools
-- **spawn_agent:** create new CodexThread with task, config overrides, initial prompt
-- **send_message:** send a message to another thread (logged in both thread histories)
-- **assign_task:** give a thread a specific task; wait for acknowledgment
-- **wait_agent:** block until a thread's current turn completes
-- **close_agent:** gracefully shut down a thread
-- **list_agents:** return list of active threads with their statuses
-
-Spawn depth limit: **5** (configurable). Circular spawning is detected and blocked.
-
-### Inter-Agent Communication
-```python
-class InterAgentCommunication(BaseModel):
-    author: AgentPath         # who sent it
-    recipient: AgentPath      # who it's addressed to
-    other_recipients: list[AgentPath]  # CC list
-    content: str
-    trigger_turn: bool        # whether to start a new turn in recipient
-```
+Active skill content is appended to the system prompt. Activate with `/skills`.
 
 ---
 
 ## Hooks System
 
-Hooks run shell commands or prompts in response to agent lifecycle events.
+`hooks/` — shell commands triggered on session events.
 
-### Hook Events
-| Event | When |
-|---|---|
-| `session_start` | When session initializes |
-| `pre_tool_use` | Before each tool call |
-| `post_tool_use` | After each tool call |
-| `user_prompt_submit` | When user submits a message |
-| `stop` | When agent turn ends |
+### Config
 
-### Hook Config (in `~/.bob/config.toml`)
 ```toml
 [[hooks]]
-event = "pre_tool_use"
-command = ["my-script.sh"]
-mode = "sync"    # sync | async
-scope = "turn"   # turn | thread
+event = "pre_tool_call"
+command = "echo tool: $BOB_TOOL_NAME"
+match_tool = "shell"
+timeout_seconds = 5
+blocking = false
+
+[[hooks]]
+event = "session_start"
+command = "./scripts/on-start.sh"
+blocking = true
+timeout_seconds = 10
 ```
 
-### Execution Modes
-- **sync:** blocks tool execution until hook completes; exit code non-zero → block tool
-- **async:** fires and forgets; doesn't block
+### Available events
 
-Hooks emit `HookStartedEvent` and `HookCompletedEvent`.
+`session_start`, `session_end`, `turn_start`, `turn_end`, `pre_tool_call`, `post_tool_call`, `user_message`
 
 ---
 
-## App Server Protocol (JSON-RPC 2.0)
+## Analytics
 
-### Transport
-- `bob app-server` → WebSocket on configurable port
-- `bob app-server --stdio` → stdin/stdout (default for VS Code extension)
+`analytics/db.py` — SQLite at `~/.bob/analytics.db`
 
-### v2 Methods
-```
-thread/start           → TurnStartParams → TurnStartResponse
-turn/steer             → TurnSteerParams (approve, interrupt, etc.)
-turn/status            → TurnStatusParams → TurnStatus
-threads/list           → ThreadLoadedListParams → ThreadLoadedListResponse
-threads/resume         → ThreadResumeParams
-threads/fork           → ThreadForkParams
-config/get             → ConfigGetResponse
-config/update          → ConfigUpdateParams
-plugins/list           → PluginListResponse
-plugins/install        → PluginInstallParams → PluginInstallResponse
-plugins/uninstall      → PluginUninstallParams
-skills/list            → SkillsListResponse
-mcp/servers/list       → McpServersListResponse
-feedback/upload        → FeedbackUploadParams
-rate-limits/get        → RateLimitsResponse
-```
+Tracks per turn:
+- Session ID, timestamp
+- Model, provider
+- Input tokens, output tokens, cached tokens, cost
+- Latency
+- Tool names called
 
-### Event Streaming
-The server pushes events as JSON-RPC notifications:
-```json
-{"jsonrpc": "2.0", "method": "event", "params": {"thread_id": "...", "event": {...}}}
-```
+`analytics/tracker.py` — event collector during turn, batch-writes on completion.
 
 ---
 
-## AGENTS.md System
+## App Server (JSON-RPC 2.0)
 
-### Loading Order (global → project, concatenated)
-```
-~/.bob/AGENTS.md          ← lowest priority (global)
-{repo_root}/AGENTS.md
-{parent_of_cwd}/AGENTS.md
-{cwd}/AGENTS.md            ← highest priority (project)
-```
+`app_server/server.py` — WebSocket (`--port 8765`) or stdio (`--stdio`) transport.
 
-### Scoping Rules (injected into system prompt)
-- Each AGENTS.md applies to all files within its directory tree
-- More-nested files take precedence over parent files
-- Direct user instructions override all AGENTS.md instructions
-- Files bob touches in a patch must comply with any in-scope AGENTS.md
+Used by IDE extensions (VS Code, JetBrains) to communicate with bob.
 
-### `/init` Command
-Creates `AGENTS.md` in the current directory with starter template:
-```markdown
-# Project Instructions for Bob
+### Routes
 
-## Code Style
-- [Add your conventions here]
+| Prefix | File | Purpose |
+|--------|------|---------|
+| `agents/` | `routes/agents.py` | Agent thread management |
+| `config/` | `routes/config.py` | Read/write config values |
+| `exec/` | `routes/exec.py` | Non-interactive execution |
+| `files/` | `routes/files.py` | File operations |
+| `tasks/` | `routes/tasks.py` | Task tracking CRUD |
+| `threads/` | `routes/threads.py` | Session/thread management |
+| `turns/` | `routes/turns.py` | Submit turns, stream events |
+| `review/` | `routes/review.py` | Code review trigger |
+| `realtime/` | `routes/realtime.py` | Voice/realtime mode |
+| `dynamic_tools/` | `routes/dynamic_tools.py` | Register tools at runtime |
 
-## Project Structure
-- [Describe key directories]
+### Protocol Events (`protocol/events.py`)
 
-## Testing
-- [How to run tests]
-
-## Notes
-- [Any other context for the AI]
-```
+| Event | Description |
+|-------|-------------|
+| `TextDeltaEvent` | Streaming text chunk from model |
+| `ReasoningDeltaEvent` | Thinking/reasoning chunk |
+| `ToolCallEvent` | Model invoked a tool (name + input) |
+| `ToolResultEvent` | Tool returned a result |
+| `TurnCompleteEvent` | Turn finished with usage stats |
+| `ErrorEvent` | Error during turn |
+| `ApprovalRequestEvent` | Shell command needs user approval |
+| `IDEShowDiffEvent` | Signal IDE to open diff view |
+| `StreamErrorEvent` | Transient streaming error (retry info) |
 
 ---
 
-## TUI Layout
+## Session Persistence (Rollout)
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ bob                                    gpt-5.1-codex-mini│  ← Header
-├─────────────────────────────────────────────────────────┤
-│ ▸ Step 1: Explore repo structure          ✓ completed   │  ← PlanWidget (when plan active)
-│ ▸ Step 2: Edit config.py                  ⟳ in_progress │
-│ ▸ Step 3: Run tests                       ○ pending     │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  You  create a hello world script                       │
-│                                                         │  ← ChatWidget (scrollable)
-│  Bob  Sure! Let me create that for you.                 │
-│  ┌─ shell ────────────────────────────────────────────┐ │
-│  │ $ python hello.py                                  │ │
-│  │ Hello, World!                                      │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  ┌─ /re ─────────────────────────────────────────────┐  │  ← CommandPopup (on /)
-│  │  /resume    resume a saved chat                   │  │
-│  │  /review    review current changes                │  │
-│  │  /rename    rename the current thread             │  │
-│  └───────────────────────────────────────────────────┘  │
-│  > /re█                                                  │  ← ComposerWidget
-├─────────────────────────────────────────────────────────┤
-│  workspace-write │ on-request │ gpt-5.1-codex-mini │ 4k │  ← Footer
-└─────────────────────────────────────────────────────────┘
+SQLite at `~/.bob/rollouts/rollout.db` (or `rollout_dir` config).
+
+Each session stores:
+- UUID session ID + title
+- cwd, model at creation
+- Full conversation history (JSON blob)
+- Creation time + last-active time
+- Activity metadata (tool call counts, etc.)
+
+`/resume` → loads picker from DB sorted by last-active.
+`bob exec --last` → queries most-recent session.
+`bob exec --resume SESSION_ID` → direct resume.
+
+---
+
+## Memory System
+
+Per-project persistent memory at `~/.bob/memories/` (or `memories_path`).
+
+Each memory is a `.md` file with YAML frontmatter:
+```yaml
+---
+name: project-context
+description: Core project architecture decisions
+type: project
+---
+This project uses FastAPI + SQLite. Auth is JWT-based.
 ```
 
-### Chat History Cells
+`MEMORY.md` in the memories directory is an index — loaded at session start as additional context.
 
-The `ChatWidget` uses two cell types:
-- **Committed cells** (`HistoryCell`) — finalized, immutable
-- **Active cell** — current in-flight turn, mutates in place during streaming
+Types: `user`, `feedback`, `project`, `reference`.
 
-**In-flight coalescing:** Multiple consecutive tool calls in the same turn are grouped into one visual block (not separate cells).
+---
 
-**Transcript overlay** (`Ctrl+T`) — shows committed cells + live tail of active cell.
+## Feature Flags
 
-### Approval Modal (ExecApprovalRequestEvent)
-```
-┌─ Approval Required ───────────────────────────────────────┐
-│                                                           │
-│  Bob wants to run:                                        │
-│  $ rm -rf ./dist                                          │
-│                                                           │
-│  In: /home/user/myproject                                 │
-│  Risk: file deletion (workspace-write sandbox)            │
-│                                                           │
-│  [y] Approve  [n] Deny  [a] Always Allow  [d] Deny & Stop │
-└───────────────────────────────────────────────────────────┘
+Set in `config.toml`:
+```toml
+[feature_flags]
+computer_use = true     # Enable computer_use tool
 ```
 
-`[a]` = `ReviewDecision.APPROVED_FOR_SESSION` (never ask again this session)
-`[d]` = `ReviewDecision.ABORT` (stop turn entirely)
-
-### Patch Approval Modal (ApplyPatchApprovalRequestEvent)
-Shows full colored diff of files being changed. Same y/n/a/d keys.
-
-### Session Picker (for /resume and /fork)
-- Paginated: **25 per page**, lazy load when cursor reaches bottom 5
-- Sorted: newest first
-- Columns: thread name, relative path, creation date, model
-- Keys: `↑↓` navigate, `Enter` select (resume), `f` switch to fork mode, `Esc` cancel
-- Fuzzy search: type to filter
+| Flag | Effect |
+|------|--------|
+| `computer_use` | Registers `computer_use` tool with full GUI automation schema |
 
 ---
 
-## Implementation Phases
-
-### Phase 1 — Foundation (2 weeks)
-**Goal:** `bob` launches TUI, sends a message, Claude streams a response.
-
-**Build:**
-- `pyproject.toml` (all deps)
-- `bob/protocol/ops.py` — ALL Op variants as Pydantic models
-- `bob/protocol/events.py` — ALL EventMsg variants as Pydantic models
-- `bob/protocol/config_types.py` — all enums
-- `bob/config/schema.py` + `loader.py`
-- `bob/client/openai_client.py` — Responses API streaming wrapper
-- `bob/core/session.py` — `BobSession`: `asyncio.Queue[Submission]` + `asyncio.Queue[Event]` + agent loop task
-- `bob/core/turn.py` — single turn: build input → stream → emit events (no tools)
-- `bob/core/context_manager.py` — `ContextManager`: history list + `record_items()` + `raw_items()`
-- `bob/tui/app.py` — minimal `BobApp`: header + chat + composer + footer
-- `bob/tui/chat_widget.py` — streaming text display (committed + active cell)
-- `bob/tui/composer.py` — plain text input only (no slash detection yet)
-- `bob/tui/footer.py` — status bar
-- `bob/cli/main.py` — `bob` → launches TUI; basic flag parsing
-- `bob/prompts/system.md` — base system prompt
-
-**Done when:** `bob` opens TUI, you type "hello", gpt-5.1-codex-mini streams a response.
-
----
-
-### Phase 2 — Tool System + Shell + Approval (2 weeks)
-**Goal:** Agent executes shell commands, applies patches, approval modals work.
-
-**Build:**
-- `bob/tools/registry.py` — `ToolRegistry`
-- `bob/tools/shell.py` — `shell` tool: dispatches to `execute_command()`
-- `bob/tools/apply_patch.py` — custom patch format parser + applier
-- `bob/tools/apply_patch_instructions.md` — injected into system prompt
-- `bob/tools/update_plan.py` — `update_plan` tool → emits `PlanUpdateEvent`
-- `bob/tools/view_image.py` — `view_image` tool
-- `bob/core/exec.py` — `execute_command()`: subprocess, streaming, output cap, timeout, process group kill
-- `bob/core/turn.py` — extend with tool call loop: stream → execute tools → stream again
-- `bob/sandbox/` — all 4 sandbox implementations
-- `bob/tui/approval_widget.py` — exec approval modal (y/n/a/d)
-- `bob/tui/patch_approval_widget.py` — patch approval modal with diff display
-- `bob/tui/plan_widget.py` — plan checklist panel
-- `bob/tui/diff_render.py` — colored diff display
-- Approval pause/resume: `asyncio.Future` per `call_id`; resolved by `ExecApprovalOp`/`PatchApprovalOp`
-- `bob exec PROMPT` — headless mode; stdin approval; `--json` JSONL output
-- Interrupt: `asyncio.Event` cancel → process group kill → drain 2s → emit `TurnAbortedEvent`
-
-**Done when:** Bob executes shell commands in TUI with approval modals; `bob exec` works.
-
----
-
-### Phase 3 — Slash Commands + Session Persistence (2 weeks)
-**Goal:** Full slash command system; sessions saved and resumable.
-
-**Build:**
-- `bob/tui/slash_commands.py` — `SlashCommand` enum (ALL commands from exact list above)
-- `bob/tui/command_popup.py` — fuzzy autocomplete popup (appears on `/`, filters as you type)
-- `bob/tui/composer.py` — slash detection, `!` prefix for shell passthrough, up-arrow history
-- `bob/tui/resume_picker.py` — paginated session picker (25/page, lazy load, fork mode)
-- `bob/tui/model_picker.py` — model picker for `/model`
-- `bob/tui/approval_picker.py` — approval mode picker for `/approvals`
-- `bob/tui/sandbox_picker.py` — sandbox mode picker for `/permissions`
-- `bob/rollout/recorder.py` — async JSONL writer (all line types)
-- `bob/rollout/state_db.py` — aiosqlite: threads table, migrations
-- `bob/rollout/session_index.py` — name→id→path index
-- `bob/core/rollout_reconstruction.py` — resume/fork algorithm
-- Implement all core slash commands: `/new`, `/resume`, `/fork`, `/clear`, `/quit`, `/exit`, `/status`, `/diff`, `/rename`, `/compact`, `/ps`, `/stop`, `/debug-config`, `/rollout`
-
-**Done when:** `/resume` shows picker; sessions survive restarts; `/fork` creates branched session.
-
----
-
-### Phase 4 — TUI Polish + Remaining Slash Commands (1 week)
-**Goal:** TUI looks and feels exactly like Codex.
-
-**Build:**
-- `bob/tui/markdown_render.py` — markdown → Textual rich text (code blocks, bold, inline code)
-- `bob/tui/personality_picker.py` — for `/personality`
-- `bob/tui/theme_picker.py` — for `/theme` (syntax highlight themes)
-- `bob/tui/collab_picker.py` — for `/collab` and `/plan`
-- `bob/tui/mcp_list_widget.py` — for `/mcp` tool listing
-- `bob/tui/status_widget.py` — for `/status` (session info + token counts)
-- `bob/tui/elicitation_widget.py` — MCP elicitation modal
-- `bob/tui/user_input_widget.py` — `request_user_input` tool modal
-- `/copy` — clipboard copy of last response
-- `/mention` — file picker to attach file content to next message
-- `/init` — create AGENTS.md with template
-- `/diff` — `git diff --stat` display in chat
-- `/experimental` — toggle experimental feature flags
-- Transcript overlay (`Ctrl+T`)
-
-**Done when:** Every slash command works; TUI is visually complete; keyboard shortcuts all work.
-
----
-
-### Phase 5 — AGENTS.md + Instructions + Config Layers (1 week)
-**Goal:** Project-level instructions and full config system.
-
-**Build:**
-- `bob/instructions/loader.py` — walk up from cwd loading AGENTS.md files + scoping rules
-- `bob/core/environment_context.py` — build per-turn environment context (OS/cwd/shell/time/git)
-- `bob/config/loader.py` — 4-layer merge with `tomllib`
-- `bob/core/turn.py` — inject AGENTS.md + env context + permissions context into prompt
-- `Op::OverrideTurnContext` — runtime session overrides (model switch, sandbox change, etc.)
-- `/init` — create AGENTS.md with template
-- Environment context delta injection (only re-inject when changed)
-
-**Done when:** AGENTS.md files load per-project; `/model` switches model mid-session; env context updates between turns.
-
----
-
-### Phase 6 — MCP Integration (1 week)
-**Goal:** Bob connects to MCP servers; MCP tools available to model; bob runs as MCP server.
-
-**Build:**
-- `bob/mcp/client.py` — `McpServerConnection`: spawn subprocess, `mcp.ClientSession`, list/call tools
-- `bob/mcp/manager.py` — `McpManager`: lifecycle, tool registry bridge, exponential backoff reconnect
-- `bob/mcp/server.py` — bob-as-MCP-server (stdio transport)
-- Register MCP tools into `ToolRegistry` (prefixed `{server}__{tool}`)
-- `/mcp` slash command → `McpListWidget` showing all tools + server statuses
-- MCP elicitation: `ElicitationRequestEvent` → `ElicitationWidget` modal → `ResolveElicitationOp`
-- `Op::ListMcpTools`, `Op::RefreshMcpServers`, `Op::ReloadUserConfig`
-- `bob mcp add/list/remove` CLI subcommands
-- `McpStartupUpdateEvent` + `McpStartupCompleteEvent` displayed in footer during startup
-
-**Done when:** Configured MCP servers' tools appear in model's tool list; bob runs as MCP server.
-
----
-
-### Phase 7 — Multi-Agent + Review (1 week)
-**Goal:** Sub-agent spawning; review mode; inter-agent communication.
-
-**Build:**
-- `bob/core/thread_manager.py` — `ThreadManager`: dict of `CodexThread`, fork, shutdown
-- `bob/tools/multi_agent/` — all 6 v2 multi-agent tools
-- `bob/core/agent/review.py` — review mode handler
-- `/review` slash command → `Op::Review` → `EnteredReviewModeEvent` → agent runs → `ExitedReviewModeEvent`
-- `/agent` / `/subagents` slash command — show thread picker, switch active thread
-- `/ps` — list all active threads with status
-- `/stop` — kill all background threads
-- Spawn depth limit (5)
-- `CollabAgent*Event` series emitted to TUI during multi-agent operations
-- `Op::InterAgentCommunication` — cross-thread messages in history
-
-**Done when:** Orchestrator agents spawn sub-agents; `/review` works; thread switching works in TUI.
-
----
-
-### Phase 8 — Memory System + App Server (1 week)
-**Goal:** Cross-session memories; JSON-RPC IDE integration.
-
-**Build:**
-- `bob/memories/phase1.py` — extraction pipeline (background, 8 concurrent)
-- `bob/memories/phase2.py` — consolidation pipeline
-- `bob/memories/storage.py` — SQLite + markdown file access
-- Inject `raw_memories.md` into system prompt (max 5000 tokens)
-- `Op::UpdateMemories`, `Op::DropMemories`, `/debug-m-update`, `/debug-m-drop`
-- `bob/app_server/server.py` — JSON-RPC 2.0 WebSocket + stdio
-- `bob/app_server/protocol_v2.py` — all v2 request/response Pydantic types
-- `bob/app_server/message_processor.py` — route methods to ThreadManager
-- `bob app-server` / `bob app-server --stdio` entry points
-
-**Done when:** Memories persist and appear in context; VS Code extension can connect via app-server.
-
----
-
-### Phase 9 — Hooks + Skills + Plugins + Realtime (1 week)
-**Goal:** Full feature parity with Codex.
-
-**Build:**
-- `bob/hooks/runner.py` — hook execution (sync/async, pre/post tool-use, session-start)
-- Hook config parsing + `HookStartedEvent` + `HookCompletedEvent`
-- `bob/skills/manager.py` — skill discovery from `~/.bob/skills/`, `.bob/skills/`
-- `bob/skills/watcher.py` — file watcher for skill changes
-- `/skills` slash command → skills picker overlay
-- `Op::ListSkills`, `EventMsg::ListSkillsResponseEvent`, `EventMsg::SkillsUpdateAvailableEvent`
-- `bob/plugins/manager.py` — plugin install/list/uninstall
-- `/plugins` slash command
-- `/realtime`, `/settings` slash commands (voice mode UI)
-- `Op::Undo` / `Op::ThreadRollback` — undo support
-- `EventMsg::UndoStartedEvent` + `EventMsg::UndoCompletedEvent`
-
-**Done when:** Hooks run; skills discoverable; plugins installable; undo works.
-
----
-
-### Phase 10 — Context Management + Polish + Tests (1 week)
-**Goal:** Robust context handling; full test suite; complete polish.
-
-**Build:**
-- Auto-compaction: check token count after each turn; trigger compact at 85%
-- API retry: exponential backoff on stream errors; trim oldest on ContextWindowExceeded
-- `bob/core/exec_policy.py` — trusted commands (safe commands list); execpolicy evaluation
-- Shell completions: `bob completion bash|zsh`
-- Rate limit tracking: `TokenCountEvent` → footer display
-- `EventMsg::ModelRerouteEvent` — display when model is silently switched
-- `EventMsg::DeprecationNoticeEvent` — display deprecation warnings
-- `EventMsg::BackgroundEventEvent` — display background notifications
-- Full test suite:
-  - `tests/unit/` — protocol serialization, config loading, apply_patch parsing, sandbox wrapping
-  - `tests/integration/` — agent loop with mock client, approval flow, session resume
-  - `tests/e2e/` — Textual Pilot API for TUI automation
-
-**Done when:** All tests pass; context never overflows; complete feature parity with Codex.
-
----
-
-## Phase Timeline
-
-| Phase | Duration | Milestone |
-|---|---|---|
-| 1 — Foundation | 2 weeks | TUI opens, Claude streams response |
-| 2 — Tools + Shell | 2 weeks | Shell execution, apply_patch, approval modals |
-| 3 — Slash + Sessions | 2 weeks | `/resume`, `/fork`, all sessions persist |
-| 4 — TUI Polish | 1 week | Markdown, all slash commands, exact Codex feel |
-| 5 — Instructions + Config | 1 week | AGENTS.md, env context, runtime overrides |
-| 6 — MCP | 1 week | External tool servers, bob as MCP server |
-| 7 — Multi-Agent + Review | 1 week | Sub-agents, `/review`, thread switching |
-| 8 — Memory + App Server | 1 week | Cross-session memory, VS Code integration |
-| 9 — Hooks + Skills + Plugins | 1 week | Full feature set |
-| 10 — Polish + Tests | 1 week | All tests pass, complete parity |
-| **Total** | **~13 weeks** | **Exact Codex parity in Python** |
-
----
-
-## Dependencies (`pyproject.toml`)
+## Network Proxy
 
 ```toml
-[project]
-name = "bob"
-version = "0.1.0"
-description = "bob — Your AI-Powered Development Partner"
-requires-python = ">=3.11"
-
-dependencies = [
-    "openai>=1.30.0",          # Responses API + streaming
-    "textual>=0.80.0",         # TUI framework
-    "typer>=0.12.0",           # CLI
-    "rich>=13.0.0",            # Terminal formatting
-    "pydantic>=2.0.0",         # Data models + validation
-    "aiosqlite>=0.20.0",       # Async SQLite
-    "aiofiles>=23.0.0",        # Async file I/O
-    "mcp>=1.0.0",              # MCP Python SDK
-    "rapidfuzz>=3.0.0",        # Fuzzy matching for slash command autocomplete
-    "pyperclip>=1.8.0",        # Clipboard (/copy command)
-    "watchfiles>=0.21.0",      # File watcher (skills watcher)
-    "tomllib; python_version < '3.11'",  # TOML parser (stdlib in 3.11+)
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "pytest-cov",
-    "textual[dev]>=0.80.0",    # Textual Pilot API for e2e tests
-]
-windows = [
-    "pywin32>=306",            # Windows restricted token sandbox
-]
-
-[project.scripts]
-bob = "bob.cli.main:app"
+network_proxy = "http://proxy.corp:8080"
 ```
+
+Applied as:
+- `HTTP_PROXY` + `HTTPS_PROXY` env vars during LiteLLM API calls
+- `proxies=` kwarg in `httpx.AsyncClient` for `web_fetch`
+- `proxy=` arg for `web_search` provider calls
 
 ---
 
-## Codex Reference Files
+## Cross-Platform Notes
 
-When implementing, use these Rust files as ground truth:
+| Feature | Windows | macOS | Linux |
+|---------|---------|-------|-------|
+| Default shell | PowerShell / cmd.exe | zsh | bash |
+| Sandbox backend | Job Objects (ctypes) | `sandbox-exec` | `bwrap` |
+| Clipboard image | `Get-Clipboard -Format Image` | `osascript` | `xclip` / `wl-paste` |
+| Config dir | `%USERPROFILE%\.bob\` | `~/.bob/` | `~/.bob/` |
+| UTF-8 mode | Re-exec with `-X utf8` on startup | Native UTF-8 | Native UTF-8 |
+| Path separator | `\` (normalized to `/` internally) | `/` | `/` |
+| bob executable | `Scripts\bob.exe` | `bin/bob` | `bin/bob` |
 
-| Bob module | Codex reference |
-|---|---|
-| `bob/protocol/ops.py` + `events.py` | `protocol/src/protocol.rs` |
-| `bob/tui/slash_commands.py` | `tui/src/slash_command.rs` |
-| `bob/tui/command_popup.py` | `tui/src/bottom_pane/command_popup.rs` |
-| `bob/tui/composer.py` | `tui/src/bottom_pane/chat_composer.rs` |
-| `bob/tui/app.py` | `tui/src/app.rs` |
-| `bob/tui/chat_widget.py` | `tui/src/chatwidget.rs` |
-| `bob/tui/resume_picker.py` | `tui/src/resume_picker.rs` |
-| `bob/core/session.py` | `core/src/codex.rs` |
-| `bob/core/turn.py` | `core/src/codex.rs` (agent loop) |
-| `bob/core/exec.py` | `core/src/exec.rs` |
-| `bob/core/compact.py` | `core/src/compact.rs` |
-| `bob/core/rollout_reconstruction.py` | `core/src/codex/rollout_reconstruction.rs` |
-| `bob/core/thread_manager.py` | `core/src/thread_manager.rs` |
-| `bob/core/context_manager.py` | `core/src/context_manager/` |
-| `bob/core/environment_context.py` | `core/src/context_manager/updates.rs` |
-| `bob/tools/apply_patch.py` | `apply-patch/` crate |
-| `bob/tools/apply_patch_instructions.md` | `apply-patch/apply_patch_tool_instructions.md` |
-| `bob/prompts/system.md` | `core/prompt.md` |
-| `bob/rollout/recorder.py` | `core/src/rollout/` |
-| `bob/sandbox/macos.py` | `sandboxing/src/macos.rs` |
-| `bob/sandbox/linux.py` | `linux-sandbox/` |
-| `bob/memories/` | `core/src/memories/` |
-| `bob/skills/manager.py` | `core/src/skills/` |
-| `bob/hooks/runner.py` | `hooks/` crate |
-| `bob/app_server/protocol_v2.py` | `app-server-protocol/src/protocol/v2.rs` |
-| `bob/app_server/server.py` | `app-server/src/` |
-| `bob/core/agent/review.py` | `core/src/agent/` (review handling) |
+---
+
+## Directory Structure
+
+```
+bob_v2_new_code_geb/
+├── BOB_PLAN.md                   ← this file (full technical reference)
+├── bobV2/
+│   ├── README.md                 ← setup & usage guide
+│   ├── pyproject.toml            ← package definition, dependencies
+│   └── bob/
+│       ├── __main__.py           ← python -m bob entry point
+│       ├── analytics/
+│       │   ├── db.py             ← SQLite analytics store
+│       │   └── tracker.py        ← per-turn event collector
+│       ├── app_server/
+│       │   ├── server.py         ← JSON-RPC 2.0 WebSocket/stdio server
+│       │   ├── router.py         ← route dispatcher
+│       │   ├── schemas.py        ← request/response Pydantic models
+│       │   └── routes/           ← agents, config, exec, files, tasks, turns, ...
+│       ├── cli/
+│       │   ├── main.py           ← typer app (bob, exec, app-server, config, mcp, plugin)
+│       │   └── exec_cmd.py       ← headless non-interactive runner
+│       ├── client/
+│       │   └── openai_client.py  ← BobClient (OpenAI Responses API, tool streaming)
+│       ├── config/
+│       │   ├── schema.py         ← BobConfig Pydantic model (full settings)
+│       │   ├── loader.py         ← config loading + env var merge
+│       │   ├── editor.py         ← bob config set/get/unset/list (dot-notation)
+│       │   └── theme.py          ← syntax theme definitions
+│       ├── core/
+│       │   ├── session.py        ← BobSession: orchestrator, tool registration, client init
+│       │   ├── turn.py           ← single turn: stream → tool dispatch → persist
+│       │   ├── context_manager.py← rolling history, token budget tracking
+│       │   ├── compact.py        ← context compaction (manual + auto + reactive)
+│       │   ├── context_budget.py ← token math helpers
+│       │   ├── exec.py           ← subprocess creation + sandbox assignment
+│       │   ├── exec_policy.py    ← approval policy evaluation
+│       │   ├── network_policy.py ← network domain approval
+│       │   ├── team.py           ← TeamManager, Team dataclass
+│       │   ├── thread_manager.py ← multi-agent thread lifecycle
+│       │   ├── tool_orchestrator.py ← parallel tool dispatch
+│       │   ├── agents/
+│       │   │   ├── manager.py    ← AgentManager
+│       │   │   ├── supervisor.py ← DAG parallel supervisor
+│       │   │   └── modes.py      ← collaboration modes
+│       │   └── tasks/
+│       │       ├── worker.py     ← async task worker
+│       │       ├── queue.py      ← task queue
+│       │       ├── models.py     ← Task dataclass
+│       │       ├── executors.py  ← task executors
+│       │       └── scheduler.py  ← cron scheduler
+│       ├── hooks/                ← hook runner (pre/post tool, session events)
+│       ├── instructions/
+│       │   └── loader.py         ← system prompt builder, /init AGENTS.md generator
+│       ├── llm/
+│       │   ├── client.py         ← LiteLLMClient: streaming, tool normalization, sanitization
+│       │   ├── compatibility.py  ← ProviderProfile, routing, auth resolution, Kimi support
+│       │   └── catalog.py        ← model catalog (capabilities DB)
+│       ├── mcp/
+│       │   ├── client.py         ← McpClient (tools + resources, stdio transport)
+│       │   ├── manager.py        ← McpManager (multi-server orchestration)
+│       │   └── oauth.py          ← PKCE OAuth 2.0 flow for MCP auth
+│       ├── memories/             ← per-project memory read/write
+│       ├── migrations/           ← SQLite schema migrations
+│       ├── plugins/
+│       │   └── manager.py        ← PluginsManager (install/uninstall/registry/search)
+│       ├── protocol/
+│       │   ├── events.py         ← all event types incl. IDEShowDiffEvent (Pydantic)
+│       │   ├── ops.py            ← operation types (UserTurnOp, OverrideTurnContextOp, ...)
+│       │   └── items.py          ← content item types (TextUserInput, ImageUserInput, ...)
+│       ├── rollout/              ← session persistence (SQLite rollout.db)
+│       ├── sandbox/
+│       │   ├── base.py           ← SandboxRunner ABC
+│       │   ├── windows.py        ← WindowsSandbox + WindowsJobObject (ctypes)
+│       │   ├── macos.py          ← MacOSSandbox (sandbox-exec)
+│       │   └── linux.py          ← LinuxSandbox (bwrap)
+│       ├── skills/               ← SkillManager, skill discovery + loading
+│       ├── tools/
+│       │   ├── registry.py       ← ToolRegistry: register/dispatch/search/validate
+│       │   ├── computer_use.py   ← screenshot+GUI automation (mss + pyautogui)
+│       │   ├── multi_agent/      ← spawn/assign/send/wait/list/close/resume agents
+│       │   ├── team_tools.py     ← team_create/spawn/list/delete
+│       │   ├── mcp_resource_tools.py ← mcp_list_resources, mcp_read_resource
+│       │   ├── mcp_auth_tool.py  ← mcp_authenticate (PKCE OAuth)
+│       │   ├── read_file.py      ← file reader with line range support
+│       │   ├── write_file.py     ← full file write/create
+│       │   ├── edit_file.py      ← targeted string replacement
+│       │   ├── shell.py          ← shell execution + streaming output
+│       │   ├── web_fetch.py      ← URL fetch + content extraction
+│       │   ├── web_search.py     ← web search (Brave/SerpAPI)
+│       │   ├── task_*.py         ← task create/update/get/list/output/stop
+│       │   ├── cron_tools.py     ← cron_create/delete/list
+│       │   └── ...               ← all other tool handlers
+│       └── tui/
+│           ├── interface.py      ← prompt_toolkit TUI: layout, key bindings, rendering
+│           └── slash_commands.py ← SlashCommand enum, COMMAND_DESCRIPTIONS, fuzzy_match_commands
+```

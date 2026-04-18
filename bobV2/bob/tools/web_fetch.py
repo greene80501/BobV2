@@ -30,6 +30,11 @@ WEB_FETCH_SCHEMA = {
 MAX_LENGTH = 50_000
 
 
+def _get_proxy(context: Any) -> str:
+    session = getattr(context, "_session", None)
+    return getattr(getattr(session, "config", None), "network_proxy", "") or ""
+
+
 async def web_fetch_handler(tool_input: dict, context: Any) -> str:
     url: str = tool_input.get("url", "")
     if not url:
@@ -43,8 +48,11 @@ async def web_fetch_handler(tool_input: dict, context: Any) -> str:
     except ImportError:
         return "Error: httpx is not installed. Run: pip install httpx"
 
+    proxy_url = _get_proxy(context)
+    proxy_kwargs = {"proxies": proxy_url} if proxy_url else {}
+
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30, **proxy_kwargs) as client:
             response = await client.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
