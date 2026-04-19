@@ -53,83 +53,17 @@ from bob.tui.slash_commands import (
 _con = Console(highlight=False, soft_wrap=True)
 
 
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-
-
-def _try_paste_clipboard_image() -> str:
-    """Grab a clipboard image using platform-native commands (no Pillow needed).
-
-    Returns the saved temp file path on success, or empty string.
-    Mirrors Claude Code's imagePaste.ts approach exactly.
-    """
-    import subprocess
-    import tempfile
-
-    tmp = os.path.join(tempfile.gettempdir(), "bob_paste_latest.png")
-
-    if sys.platform == "win32":
-        # PowerShell Get-Clipboard -Format Image saves bitmap/PNG from clipboard
-        tmp_ps = tmp.replace("\\", "\\\\")
-        ps_cmd = (
-            f"$img = Get-Clipboard -Format Image; "
-            f"if ($img -ne $null) {{"
-            f"  $img.Save('{tmp_ps}', [System.Drawing.Imaging.ImageFormat]::Png); "
-            f"  Write-Output 'ok'"
-            f"}}"
-        )
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=5,
-            )
-            if "ok" in r.stdout and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                return tmp
-        except Exception:
-            pass
-
-    elif sys.platform == "darwin":
-        script = "\n".join([
-            f'set png_data to (the clipboard as \u00abclass PNGf\u00bb)',
-            f'set fp to open for access POSIX file "{tmp}" with write permission',
-            f'write png_data to fp',
-            f'close access fp',
-        ])
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                return tmp
-        except Exception:
-            pass
-
-    else:  # Linux (X11 or Wayland)
-        for cmd in [
-            f'xclip -selection clipboard -t image/png -o > "{tmp}"',
-            f'wl-paste --type image/png > "{tmp}"',
-        ]:
-            try:
-                r = subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
-                if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                    return tmp
-            except Exception:
-                pass
-
-    return ""
-
-
 # ── ANSI helpers — ALL output inside patch_stdout uses these ──────────────────
 
-_R   = "\033[0m"    # reset
-_DIM = "\033[2m"    # dim
-_BLD = "\033[1m"    # bold
-_RED = ""   # red
-_GRN = ""   # green
-_YLW = ""   # yellow
-_CYN = ""   # cyan
-_PRP = "" # purple (#a46eff)
-_BLU = ""   # blue (#0f62fe)
+_R   = "\033[0m"                     # reset
+_DIM = "\033[2m"                     # dim
+_BLD = "\033[1m"                     # bold
+_RED = "\033[38;2;255;85;85m"        # red
+_GRN = "\033[38;2;80;200;120m"       # green
+_YLW = "\033[38;2;255;195;0m"        # yellow
+_CYN = "\033[38;2;0;200;220m"        # cyan
+_PRP = "\033[38;2;164;110;255m"      # purple (#a46eff)
+_BLU = "\033[38;2;21;98;254m"        # blue  (#1562fe)
 
 
 def _d(s: str) -> str:   return f"{_DIM}{s}{_R}"
@@ -455,8 +389,18 @@ def _parse_ansi_text_art(
 
 
 def _unwrap_shell_printf_art(source: str) -> str:
-    """Extract the quoted payload from a shell `printf "..."` art file."""
+    """Extract the quoted payload from a shell `printf "..."` art file.
+
+    Handles files that begin with a shebang (#!/usr/bin/env sh) by stripping
+    any leading comment/shebang lines before searching for the printf call.
+    """
     stripped = source.replace("\ufeff", "").strip()
+    # Drop shebang / comment lines so the regex can anchor to printf
+    if stripped.startswith("#"):
+        lines = stripped.splitlines()
+        stripped = "\n".join(
+            ln for ln in lines if not ln.startswith("#")
+        ).strip()
     match = re.match(
         r'^\s*printf\s+(?P<quote>["\'])(?P<body>.*)(?P=quote)\s*;?\s*$',
         stripped,
@@ -657,11 +601,17 @@ def _render_ascii_art_lines(
                 if fg is None and bg is None:
                     parts.append(reset)
                 else:
+                    # Always emit BOTH fg and bg so neither bleeds from the
+                    # previous cell — this eliminates the gray-stripe artifact.
                     codes: list[str] = []
                     if fg is not None:
                         codes.append(f"38;2;{fg[0]};{fg[1]};{fg[2]}")
+                    else:
+                        codes.append("39")   # default foreground
                     if bg is not None:
                         codes.append(f"48;2;{bg[0]};{bg[1]};{bg[2]}")
+                    else:
+                        codes.append("49")   # default background
                     parts.append(f"\033[{';'.join(codes)}m")
                 current_style = style
             parts.append(ch)
@@ -1057,8 +1007,6 @@ class Interface:
         self._in_code_block = False
         self._code_block_lang: Optional[str] = None
         self._code_block_content = ""
-        # Pre-fill text for the next prompt (set by /paste)
-        self._next_prompt_default: str = ""
         # Word-wrap buffer for streaming text
         self._wrap_buffer = ""
         self._wrap_column = 0
@@ -1067,11 +1015,34 @@ class Interface:
         self._stream_last_flush: float = 0.0
         self._tool_call_inputs: dict[str, dict] = {}
 
-    # ── Dynamic prompt ────────────────────────────────────────────────────────
+    # ── Dynamic prompt & footer toolbar ──────────────────────────────────────
 
     def _prompt_str(self) -> ANSI:
-        """❯ — never shown while task is running (main loop guards this)."""
-        return ANSI("❯ ")
+        """Left edge of the bordered input box."""
+        BLUE = "\033[38;2;21;98;254m"
+        RST  = "\033[0m"
+        return ANSI(f"│ {BLUE}❯{RST} ")
+
+    def _input_rprompt(self) -> ANSI:
+        """Right-side hint shown on the input line."""
+        return ANSI("\033[2m→ Enter to send \033[0m")
+
+    def _print_input_box_top(self) -> None:
+        """Print the top border of the input box + hints line (into scrollback)."""
+        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
+        DIM    = "\033[2m"
+        RST    = "\033[0m"
+        box_w  = term_w - 2
+        hints  = f"{DIM}^C exit · /help · /new{RST}"
+        top    = "╭" + "─" * box_w + "╮"
+        _p(hints)
+        _p(top)
+
+    def _footer_toolbar(self) -> ANSI:
+        """Bottom toolbar shown while ❯ prompt is active — token counts."""
+        in_t  = self._total_input_tokens
+        out_t = self._total_output_tokens
+        return ANSI(f"\033[2m in: {in_t:,} · out: {out_t:,}\033[0m")
 
     async def _save_config(self):
         """Save current config to ~/.bob/config.toml"""
@@ -1184,136 +1155,162 @@ class Interface:
         lines = _render_ascii_art_lines(scaled, color=not self._config.no_color)
         return lines, welcome
 
-    # ── Header — Claude Code-style welcome panel ──────────────────────────────
+    # ── Header ────────────────────────────────────────────────────────────────
 
     def _print_header(self) -> None:
         """Print the welcome header directly to sys.__stdout__ before patch_stdout."""
-        bob_version = "0.1.0"
-        try:
-            from bob import __version__
-            bob_version = __version__
-        except Exception:
-            bob_version = "0.1.0"
+        from bob import __version__
 
-        term_size = shutil.get_terminal_size((120, 24))
-        term_w = term_size.columns
-        term_h = term_size.lines
-        inner_w = term_w - 4 # excluding the very outer frame chars (│  │)
-
-        # ANSI helpers
-        RST   = "\033[0m"
-        DIM   = "\033[2m"
-        BOLD  = "\033[1m"
+        # ── Color shorthands ──────────────────────────────────────────────
+        RST       = "\033[0m"
+        DIM       = "\033[2m"
+        BOLD      = "\033[1m"
+        CYAN_BOLD = "\033[1;38;2;0;200;220m"
+        GREEN     = "\033[38;2;80;200;120m"
+        YELLOW    = "\033[38;2;255;195;0m"
 
         def vlen(s: str) -> int:
-            import re
             return len(re.sub(r"\033\[[0-9;]*m", "", s))
 
-        def center(s: str, w: int) -> str:
+        def pad_r(s: str, w: int) -> str:
+            """Right-pad *s* to *w* visible columns."""
             v = vlen(s)
-            if v >= w: return s
+            return s + " " * max(0, w - v)
+
+        def center_in(s: str, w: int) -> str:
+            """Center *s* within *w* visible columns."""
+            v = vlen(s)
+            if v >= w:
+                return s
             pl = (w - v) // 2
-            pr = w - v - pl
-            return " " * pl + s + " " * pr
+            return " " * pl + s + " " * (w - v - pl)
 
-        def rpad(s: str, w: int) -> str:
-            v = vlen(s)
-            return s if v >= w else s + " " * (w - v)
+        term_w = max(100, shutil.get_terminal_size((120, 24)).columns)
+        inner_w = term_w - 2  # space between │ … │
 
-        import os
-        import pathlib
-        model = self._config.model or "unknown"
-        sandbox = self._config.sandbox_mode.value if self._config.sandbox_mode else "none"
+        # ── Metadata ──────────────────────────────────────────────────────
+        model   = self._config.model or "unknown"
         cwd_str = str(self._config.exec_cwd or os.getcwd())
-        
-        # Abbreviate home
         try:
-            home = str(pathlib.Path.home())
+            home = str(Path.home())
             if cwd_str.startswith(home):
                 cwd_str = "~" + cwd_str[len(home):]
-            if len(cwd_str) > 23:
-                cwd_str = "..." + cwd_str[-20:]
+        except Exception:
+            pass
+        exec_cwd = str(self._config.exec_cwd or Path.cwd())
+
+        # ── Recent git commits ────────────────────────────────────────────
+        recent_commits: list[tuple[str, str, str]] = []
+        try:
+            r = subprocess.run(
+                ["git", "log", "--oneline", "--format=%h|%ar|%s", "-3"],
+                capture_output=True, text=True, cwd=exec_cwd, timeout=2,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.strip().splitlines():
+                    parts = line.split("|", 2)
+                    if len(parts) == 3:
+                        recent_commits.append((parts[0], parts[1], parts[2]))
         except Exception:
             pass
 
-        info_rows = [
-            f"  {BOLD}System Info{RST}",
-            f"  {DIM}Model:    {model}{RST}",
-            f"  {DIM}Workspace: {sandbox}{RST}",
-            f"  {DIM}System:    Bob v2{RST}",
-            f"  {DIM}Directory: {cwd_str}{RST}",
-        ]
+        # ── Load and fit Bob art ──────────────────────────────────────────
+        art = _load_tui_bob_art() or _load_uploaded_ascii_art()
+        cropped = _crop_ascii_art(art) if art else tuple()
 
-        right_rows = self._recent_session_rows(DIM, BOLD, RST)
-        right_rows.extend([
+        # ── Column geometry ───────────────────────────────────────────────
+        left_w   = 40
+        right_w  = 34
+        sep      = " │ "          # visible separator between columns
+        sep_vis  = 3              # visual width of sep
+        center_w = max(20, inner_w - left_w - right_w - 2 * sep_vis)
+
+        # Fit art into the centre column
+        art_lines: list[str] = []
+        if cropped:
+            fitted    = _fit_ascii_art(cropped, max_width=center_w, max_height=18)
+            art_lines = _render_ascii_art_lines(fitted, color=not self._config.no_color)
+
+        # ── LEFT column ───────────────────────────────────────────────────
+        disp_cwd = cwd_str
+        max_path = left_w - 15
+        if len(disp_cwd) > max_path:
+            disp_cwd = "..." + disp_cwd[-(max_path - 3):]
+
+        left: list[str] = [
+            f" {CYAN_BOLD}System Info{RST}",
+            f"  {BOLD}bob{RST} v{__version__}",
+            f"  {DIM}Model:{RST} {model}",
+            f"  {DIM}Workspace:{RST} {disp_cwd}",
+            f"  {DIM}System:{RST} Bob V2",
+            f"  {DIM}Directory:{RST} {disp_cwd}",
             "",
-            f"  {BOLD}Quick Commands{RST}",
-            f"  {DIM}• /help   - View all commands{RST}",
-            f"  {DIM}• /resume - Continue last session{RST}",
-            f"  {DIM}• /new    - Start fresh session{RST}",
-        ])
+            f" {CYAN_BOLD}Recent Sessions{RST}",
+        ]
+        for h, t, msg in recent_commits:
+            prefix_len = len(h) + len(t) + 4  # "  {h} {t} "
+            max_msg = left_w - prefix_len - 1
+            if max_msg < 5:
+                max_msg = 10
+            trunc = (msg[:max_msg - 3] + "...") if len(msg) > max_msg else msg
+            left.append(f"  {YELLOW}{h}{RST} {DIM}{t}{RST} {trunc}")
 
-        left_rows = [""] + info_rows + [""]
-        right_rows = right_rows
-        LEFT_W = max(vlen(row) for row in left_rows)
-        RIGHT_W = max(vlen(row) for row in right_rows)
-        min_center_w = 24
-        if inner_w < LEFT_W + RIGHT_W + min_center_w + 6:
-            stack_width = max(24, min(50, inner_w))
-            stack_height = max(14, min(26, term_h - len(info_rows) - len(right_rows) - 8))
-            character_lines, welcome_line = self._build_header_character(stack_width, stack_height)
-            body_rows = [center(welcome_line, inner_w), ""]
-            if character_lines:
-                body_rows.extend(center(row, inner_w) for row in character_lines)
-                body_rows.append("")
-            body_rows.extend(info_rows)
-            body_rows.append("")
-            body_rows.extend(right_rows)
+        # ── CENTER column ─────────────────────────────────────────────────
+        center: list[str] = [
+            center_in(f"\033[1;38;2;80;80;255mWelcome to IBM Bob!{RST}", center_w),
+            "",
+        ]
+        for al in art_lines:
+            center.append(center_in(al, center_w))
+        center.append("")
+        center.append(center_in(f"\033[1;38;2;140;80;255mYour AI coding assistant{RST}", center_w))
 
-            title  = f"bob v{bob_version}"
-            ndash  = max(0, term_w - 5 - len(title) - 2)
-            top    = f"╭─── {title} {'─' * ndash}╮"
-            bot    = "╰" + "─" * (term_w - 2) + "╯"
+        # ── RIGHT column ──────────────────────────────────────────────────
+        quick_cmds = [
+            ("/help",    "View all commands"),
+            ("/new",     "Start new session"),
+            ("/resume",  "Continue last session"),
+            ("/model",   "Switch AI model"),
+            ("/compact", "Compress context"),
+            ("/cost",    "View costs"),
+            ("/diff",    "Review pending changes"),
+            ("/status",  "Review Status"),
+            ("/quit",    "Exit bob"),
+        ]
+        right: list[str] = [f"{CYAN_BOLD}Quick Commands{RST}"]
+        for cmd, desc in quick_cmds:
+            right.append(f" {GREEN}{cmd:<10}{RST}{DIM}{desc}{RST}")
 
-            import sys
-            out = sys.__stdout__
-            out.write("\n" + top + "\n")
-            for row in body_rows:
-                out.write(f"│ {rpad(row, inner_w)} │\n")
-            out.write(bot + "\n\n")
-            out.flush()
-            return
+        # ── Equalise row counts ───────────────────────────────────────────
+        n = max(len(left), len(center), len(right))
+        left   += [""] * (n - len(left))
+        center += [""] * (n - len(center))
+        right  += [""] * (n - len(right))
 
-        CENTER_W = inner_w - LEFT_W - RIGHT_W - 6
-        art_target_width = min(max(20, CENTER_W), 52)
-        center_height_budget = max(14, min(26, term_h - 8))
-        character_lines, welcome_line = self._build_header_character(art_target_width, center_height_budget)
-
-        center_rows = [center(welcome_line, CENTER_W), ""]
-        if character_lines:
-            center_rows.extend(center(row, CENTER_W) for row in character_lines)
-
-        row_count = max(len(left_rows), len(center_rows), len(right_rows))
-        while len(left_rows) < row_count:
-            left_rows.append("")
-        while len(center_rows) < row_count:
-            center_rows.append("")
-        while len(right_rows) < row_count:
-            right_rows.append("")
-
-        title  = f"bob v{bob_version}"
-        ndash  = max(0, term_w - 5 - len(title) - 2)
-        top    = f"╭─── {title} {'─' * ndash}╮"
-        bot    = "╰" + "─" * (term_w - 2) + "╯"
-
-        import sys
         out = sys.__stdout__
-        out.write("\n" + top + "\n")
 
-        for left, center_row, right in zip(left_rows, center_rows, right_rows):
-            out.write(f"│ {rpad(left, LEFT_W)}   {rpad(center_row, CENTER_W)}   {rpad(right, RIGHT_W)} │\n")
+        # ── Top border ────────────────────────────────────────────────────
+        out.write(f"┌{'─' * inner_w}┐\n")
 
-        out.write(bot + "\n\n")
+        # ── Content rows ──────────────────────────────────────────────────
+        for i in range(n):
+            lc = pad_r(left[i],   left_w)
+            cc = pad_r(center[i], center_w)
+            rc = pad_r(right[i],  right_w)
+            out.write(f"│{lc}{sep}{cc}{sep}{rc}│\n")
+
+        # ── Footer separator ──────────────────────────────────────────────
+        out.write(f"├{'─' * inner_w}┤\n")
+
+        # ── Footer: model left, tokens right ──────────────────────────────
+        fl   = f" {DIM}Model: {model}{RST}"
+        fr   = f"{DIM}tokens in: 0  out: 0{RST} "
+        fpad = max(0, inner_w - vlen(fl) - vlen(fr))
+        out.write(f"│{fl}{' ' * fpad}{fr}│\n")
+
+        # ── Bottom border ─────────────────────────────────────────────────
+        out.write(f"└{'─' * inner_w}┘\n")
+
         out.flush()
 
     # ── Spinner ───────────────────────────────────────────────────────────────
@@ -1405,6 +1402,16 @@ class Interface:
         """  ● Tool(arg) [suffix]"""
         suf = f"  {_d(suffix)}" if suffix else ""
         _p(f"  {_c('●')} {_b(tool)}({_c(arg)}){suf}")
+
+    def _print_approval_bar(self, label: str, arg: str) -> None:
+        """Full-width IBM-blue banner for tool approval requests."""
+        term_w  = shutil.get_terminal_size((120, 24)).columns
+        BBLU    = "\033[48;2;21;98;254m\033[1;97m"   # bold white on IBM blue
+        RST     = "\033[0m"
+        content = f"  ● {label}({arg})"
+        hint    = "  needs approval  "
+        pad     = " " * max(0, term_w - len(content) - len(hint))
+        _p(f"{BBLU}{content}{pad}{hint}{RST}")
 
     def _colorize_diff_line(self, line: str) -> str:
         """Colorize a single diff line: + green, - red, @@ cyan."""
@@ -1509,7 +1516,7 @@ class Interface:
     async def _consume_events(self) -> None:  # noqa: C901
         from bob.protocol.events import (
             BackgroundTerminalOutputEvent,
-            ContextCompactionEvent,
+            HistoryCompactedEvent,
             ErrorEvent,
             ExecApprovalRequestedEvent,
             ExecCompletedEvent,
@@ -1756,9 +1763,7 @@ class Interface:
                     if not self._task_running:
                         self._task_running = True
                     tool_label, cmd_arg = self._format_command(msg.command)
-                    if not self._after_tool:
-                        _p()
-                    self._print_tool_header(tool_label, cmd_arg, suffix="· needs approval")
+                    self._print_approval_bar(tool_label, cmd_arg)
                     self._after_tool = False
                     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
                     self._pending_approval = (msg, fut)
@@ -1829,9 +1834,7 @@ class Interface:
                     if not self._task_running:
                         self._task_running = True
                     n = len(msg.changes)
-                    if not self._after_tool:
-                        _p()
-                    self._print_tool_header("Patch", f"{n} file(s)", suffix="· needs approval")
+                    self._print_approval_bar("Patch", f"{n} file(s)")
                     # Show which files will be changed
                     for change in msg.changes:
                         path = getattr(change, "path", None) or getattr(change, "file", "?")
@@ -1935,20 +1938,12 @@ class Interface:
                     self._total_cached_input_tokens += cached_tok
                     self._last_turn_tokens = {"input": in_tok, "output": out_tok, "cached": cached_tok}
                     
-                    # Display token/cost status line
-                    if hasattr(self._session, 'analytics') and self._session.analytics:
-                        try:
-                            from bob.llm.catalog import get_catalog
-                            catalog = get_catalog()
-                            ctx_window = catalog.get_context_window(self._config.model) if catalog.is_populated() else None
-                            status = self._session.analytics.format_last_turn_status(
-                                model=self._config.model,
-                                context_window=ctx_window
-                            )
-                            if status:
-                                _p(f"  {_d(status)}")
-                        except Exception:
-                            pass
+                    # Token usage — right-aligned, dim gray: in: 1,234 · out: 456
+                    if in_tok or out_tok:
+                        _tok_str = f"in: {in_tok:,} · out: {out_tok:,}"
+                        _term_w  = shutil.get_terminal_size((120, 24)).columns
+                        _pad     = max(0, _term_w - len(_tok_str))
+                        _p(f"\033[2m{' ' * _pad}{_tok_str}\033[0m")
 
                     # Run post_turn hooks and surface their stdout as a status line
                     if self._config.hooks:
@@ -1974,7 +1969,9 @@ class Interface:
                         except Exception:
                             pass
 
-                    _p()   # one blank line = turn boundary (❯ adds visual separation)
+                    # Dim separator between turns
+                    _sep_w = shutil.get_terminal_size((120, 24)).columns
+                    _p(f"\033[2m{'─' * _sep_w}\033[0m")
 
                 elif isinstance(msg, TurnInterruptedEvent):
                     await self._stop_spinner()
@@ -2001,12 +1998,8 @@ class Interface:
                 elif isinstance(msg, WarningEvent):
                     _p(f"  {_y('⚠')} {msg.message}")
 
-                elif isinstance(msg, ContextCompactionEvent):
-                    if msg.success:
-                        delta = max(0, int(msg.token_before) - int(msg.token_after))
-                        _p(f"  {_d(f'[context] compacted ({msg.reason}) -{delta:,} tokens')}")
-                    else:
-                        _p(f"  {_y('⚠')} context compaction failed ({msg.reason})")
+                elif isinstance(msg, HistoryCompactedEvent):
+                    _p(f"  {_d(f'[context] compacted — {msg.turns_removed} turns removed')}")
 
                 elif isinstance(msg, InfoEvent):
                     _p(f"  {_d(msg.message)}")
@@ -2238,16 +2231,6 @@ class Interface:
                     for line in out.splitlines():
                         _p(f"  {self._colorize_diff_line(line)}")
                     _p()
-                    # Also emit IDEShowDiffEvent so IDE integrations can open a diff view
-                    try:
-                        from bob.protocol.events import Event, IDEShowDiffEvent
-                        import uuid
-                        await self._session._emit(Event(
-                            id=str(uuid.uuid4()),
-                            msg=IDEShowDiffEvent(diff=out, base_ref="HEAD", title="git diff HEAD"),
-                        ))
-                    except Exception:
-                        pass
                 else:
                     _p(_d("  (no changes)"))
             except Exception as e:
@@ -2322,13 +2305,11 @@ class Interface:
 
         elif cmd == SlashCommand.INIT:
             try:
-                from bob.instructions.loader import generate_agents_md
-                _p(f"  {_d('generating AGENTS.md...')}")
-                path = await generate_agents_md(Path.cwd(), self._session)
+                from bob.instructions.loader import create_agents_md
+                path = create_agents_md(Path.cwd())
                 _p(f"  {_d(f'created {path}')}")
             except Exception as e:
-                _p(f"  {_r('x')} {e}")
-
+                _p(f"  {_r('✗')} {e}")
 
         elif cmd == SlashCommand.RESUME:
             try:
@@ -3114,8 +3095,18 @@ class Interface:
                     # Spinner is stopped by the event consumer before printing the
                     # approval header; just handle the prompt here.
                     _, fut = self._pending_approval
+                    _blu = "\033[38;2;21;98;254m"
+                    _rst = "\033[0m"
+                    _dim = "\033[2m"
+                    _approval_prompt = ANSI(
+                        f"  {_blu}[y]{_rst} yes  "
+                        f"{_blu}[a]{_rst} always  "
+                        f"{_blu}[n]{_rst} no  "
+                        f"{_blu}[s]{_rst} skip  "
+                        f"{_blu}›{_rst} "
+                    )
                     try:
-                        raw = await ps.prompt_async(_APPROVAL_PROMPT)
+                        raw = await ps.prompt_async(_approval_prompt)
                     except EOFError:
                         raw = "n"
                     except KeyboardInterrupt:
@@ -3450,36 +3441,6 @@ class Interface:
                 buf.insert_text("/")
                 if buf.text == "/" and buf.cursor_position == 1:
                     buf.start_completion(select_first=False)
-
-            @kb.add(Keys.BracketedPaste)
-            def _(event):
-                """Handle Ctrl+V / right-click paste.
-
-                prompt_toolkit enables bracketed paste mode automatically.
-                When the user pastes an image, the terminal sends an empty
-                bracketed paste sequence — we detect that and pull the image
-                from the clipboard using platform-native commands (same
-                approach as Claude Code's imagePaste.ts).
-                """
-                pasted: str = event.data or ""
-
-                # Case 1: pasted text looks like an image file path
-                stripped = pasted.strip().strip('"').strip("'")
-                if stripped.lower().endswith(_IMAGE_EXTENSIONS) and os.path.exists(stripped):
-                    event.current_buffer.insert_text(f"@{stripped} ")
-                    return
-
-                # Case 2: empty paste = image on clipboard (Ctrl+V / right-click)
-                if not pasted.strip():
-                    image_path = _try_paste_clipboard_image()
-                    if image_path:
-                        event.current_buffer.insert_text(f"@{image_path} ")
-                        return
-
-                # Case 3: normal text paste
-                if pasted:
-                    event.current_buffer.insert_text(pasted)
-
             
             session = PromptSession(
                 history=_history,
@@ -3533,10 +3494,11 @@ class Interface:
                     # _turn_started fires the moment TurnStartedEvent arrives in
                     # the event consumer, cancelling the ❯ before any stray
                     # prompt character is committed to screen.
-                    _default = self._next_prompt_default
-                    self._next_prompt_default = ""
+                    self._print_input_box_top()
                     input_task    = asyncio.ensure_future(
-                        ps.prompt_async(self._prompt_str, default=_default)
+                        ps.prompt_async(self._prompt_str,
+                                        rprompt=self._input_rprompt,
+                                        bottom_toolbar=self._footer_toolbar)
                     )
                     wake_tasks = [
                         asyncio.ensure_future(self._turn_started.wait()),
