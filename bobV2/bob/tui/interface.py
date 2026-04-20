@@ -1025,7 +1025,7 @@ class Interface:
 
     def _input_rprompt(self) -> ANSI:
         """Right-side hint shown on the input line."""
-        return ANSI("\033[2m→ Enter to send \033[0m")
+        return ANSI("\033[2m→ Enter to send\033[0m │")
 
     def _print_input_box_top(self) -> None:
         """Print the top border of the input box + hints line (into scrollback)."""
@@ -1043,6 +1043,15 @@ class Interface:
         in_t  = self._total_input_tokens
         out_t = self._total_output_tokens
         return ANSI(f"\033[2m in: {in_t:,} · out: {out_t:,}\033[0m")
+
+    def _print_input_box_bottom(self) -> None:
+        """Print the bottom border of the input box (into scrollback)."""
+        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
+        DIM    = "\033[2m"
+        RST    = "\033[0m"
+        box_w  = term_w - 2
+        bottom = "╰" + "─" * box_w + "╯"
+        _p(f"{DIM}{bottom}{RST}")
 
     async def _save_config(self):
         """Save current config to ~/.bob/config.toml"""
@@ -3497,8 +3506,7 @@ class Interface:
                     self._print_input_box_top()
                     input_task    = asyncio.ensure_future(
                         ps.prompt_async(self._prompt_str,
-                                        rprompt=self._input_rprompt,
-                                        bottom_toolbar=self._footer_toolbar)
+                                        rprompt=self._input_rprompt)
                     )
                     wake_tasks = [
                         asyncio.ensure_future(self._turn_started.wait()),
@@ -3532,10 +3540,12 @@ class Interface:
                     try:
                         text = input_task.result()
                     except (EOFError, KeyboardInterrupt):
+                        self._print_input_box_bottom()
                         _p(f"  {_d('goodbye')}")
                         self._exit_requested.set()
                         break
 
+                    self._print_input_box_bottom()
                     text = text.strip()
                     if not text:
                         continue
