@@ -1134,7 +1134,6 @@ class Interface:
         layout = Layout(
             FloatContainer(
                 content=HSplit([
-                    Window(height=1),
                     Window(height=1, content=FormattedTextControl(_top)),
                     VSplit([
                         Window(content=input_ctrl, wrap_lines=False, height=1),
@@ -1157,6 +1156,7 @@ class Interface:
             layout=layout,
             key_bindings=merge_key_bindings([base_kb, kb]),
             full_screen=False,
+            erase_when_done=True,
             mouse_support=False,
         )
 
@@ -1211,7 +1211,7 @@ class Interface:
         # After the app erases itself, immediately re-print the box with the
         # submitted text so it stays visible in the scrollback history.
         if not cancelled and submitted:
-            _p(f"\n{DIM}╭{'─' * box_w}╮{RST}")
+            _p(f"{DIM}╭{'─' * box_w}╮{RST}")
             _p(f"│ {BLUE}❯{RST}  {submitted[0]}")
             _p(f"{DIM}╰{'─' * box_w}╯{RST}\n")
 
