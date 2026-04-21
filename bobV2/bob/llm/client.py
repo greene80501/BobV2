@@ -99,6 +99,7 @@ class ToolCallEvent:
     id: str
     name: str
     input: dict[str, Any]
+    reasoning_content: str = ""
 
 
 @dataclass
@@ -212,6 +213,7 @@ def _to_chat_messages(
 
         if role == "assistant":
             content_list = item.get("content", [])
+            reasoning_content = str(item.get("reasoning_content", "") or "")
             if isinstance(content_list, list):
                 text = "\n".join(
                     c.get("text", "")
@@ -238,16 +240,20 @@ def _to_chat_messages(
                 j += 1
 
             if tool_calls:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": text or None,
-                        "tool_calls": tool_calls,
-                    }
-                )
+                assistant_message = {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": tool_calls,
+                }
+                if reasoning_content:
+                    assistant_message["reasoning_content"] = reasoning_content
+                messages.append(assistant_message)
                 i = j
             else:
-                messages.append({"role": "assistant", "content": text})
+                assistant_message = {"role": "assistant", "content": text}
+                if reasoning_content:
+                    assistant_message["reasoning_content"] = reasoning_content
+                messages.append(assistant_message)
                 i += 1
             continue
 
@@ -460,6 +466,7 @@ class LiteLLMClient:
 
         tool_buffers: dict[int, dict[str, str]] = {}
         final_usage: Any = None
+        reasoning_parts: list[str] = []
 
         async with _temporary_env(self._env_overrides):
             response = await litellm.acompletion(**kwargs)
@@ -482,7 +489,14 @@ class LiteLLMClient:
 
                 thinking = getattr(delta, "thinking", None)
                 if thinking:
+                    reasoning_parts.append(str(thinking))
                     yield ReasoningDeltaEvent(delta=thinking)
+
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if reasoning_content:
+                    reasoning_text = str(reasoning_content)
+                    reasoning_parts.append(reasoning_text)
+                    yield ReasoningDeltaEvent(delta=reasoning_text)
 
                 tc_deltas = getattr(delta, "tool_calls", None)
                 if tc_deltas:
@@ -523,7 +537,12 @@ class LiteLLMClient:
                 parsed = {"_raw": raw_args}
             # Restore original name if it was sanitized
             original_name = tool_name_map.get(buf["name"], buf["name"])
-            yield ToolCallEvent(id=buf["id"], name=original_name, input=parsed)
+            yield ToolCallEvent(
+                id=buf["id"],
+                name=original_name,
+                input=parsed,
+                reasoning_content="".join(reasoning_parts),
+            )
 
         if final_usage is not None:
             yield CompletedEvent(

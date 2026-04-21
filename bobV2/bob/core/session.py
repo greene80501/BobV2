@@ -1283,7 +1283,7 @@ class BobSession:
         from bob.protocol.ops import (
             UserTurnOp, InterruptOp, ExecApprovalOp, PatchApprovalOp,
             NetworkApprovalOp,
-            DynamicToolResponseOp,
+            DynamicToolResponseOp, UserInputAnswerOp,
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
@@ -1585,6 +1585,11 @@ class BobSession:
 
                         elif isinstance(inner_op, DynamicToolResponseOp):
                             self.resolve_dynamic_tool(inner_op.tool_call_id, inner_op.result)
+
+                        elif isinstance(inner_op, UserInputAnswerOp):
+                            fut = self._pending_user_inputs.get(inner_op.request_id)
+                            if fut and not fut.done():
+                                fut.set_result(inner_op.answer)
 
                         elif isinstance(inner_op, InterruptOp):
                             cancel_ev.set()

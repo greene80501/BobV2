@@ -39,6 +39,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
 from bob.config.schema import BobConfig
+from bob.tui.markdown_engine import MarkdownRenderStyle, StreamState, create_markdown_engine
 from bob.tui.slash_commands import (
     AVAILABLE_DURING_TASK,
     COMMAND_DESCRIPTIONS,
@@ -64,6 +65,8 @@ _YLW = "\033[38;2;255;195;0m"        # yellow
 _CYN = "\033[38;2;0;200;220m"        # cyan
 _PRP = "\033[38;2;164;110;255m"      # purple (#a46eff)
 _BLU = "\033[38;2;21;98;254m"        # blue  (#1562fe)
+_BRD = "\033[38;2;88;99;122m"        # slate border
+_SFT = "\033[38;2;148;163;184m"      # soft text
 
 
 def _d(s: str) -> str:   return f"{_DIM}{s}{_R}"
@@ -74,84 +77,28 @@ def _y(s: str) -> str:   return f"{_YLW}{s}{_R}"
 def _c(s: str) -> str:   return f"{_PRP}{s}{_R}"
 def _cb(s: str) -> str:  return f"{_BLU}{_BLD}{s}{_R}"
 def _cg(s: str) -> str:  return f"{_GRN}{s}{_R}"
+def _bd(s: str) -> str:  return f"{_BRD}{s}{_R}"
+def _s(s: str) -> str:   return f"{_SFT}{s}{_R}"
 def _bold(s: str) -> str: return f"{_BLD}{s}{_R}"
 
 
-# ── Markdown → ANSI renderer ──────────────────────────────────────────────────
+# ── Markdown renderer ────────────────────────────────────────────────────────
 
-# ANSI extras not in the palette above
-_ITA  = "\033[3m"   # italic
 _UND  = "\033[4m"   # underline
 _STR  = "\033[9m"   # strikethrough
-_CODE_BG = "\033[48;5;236m"   # dark-grey background for inline code
 _CODE_FG = "\033[96m"          # bright-cyan text for inline code
 _H1_FG   = "\033[97m"          # bright white
 _H2_FG   = "\033[97m"          # bright white
 _H3_FG   = "\033[36m"          # cyan
+_LINK_FG = _BLU
 
 
-def _inline_md(text: str) -> str:
-    """Apply inline ANSI markdown (bold, italic, code, strikethrough) to *text*."""
-    # bold+italic  ***text***
-    text = re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: f"{_BLD}{_ITA}{m.group(1)}{_R}", text)
-    # bold  **text**
-    text = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{_BLD}{m.group(1)}{_R}", text)
-    # italic  *text*  (not preceded/followed by another *)
-    text = re.sub(r'(?<!\*)\*([^*\n]+?)\*(?!\*)', lambda m: f"{_ITA}{m.group(1)}{_R}", text)
-    # italic  _text_  (not preceded/followed by another _)
-    text = re.sub(r'(?<!_)_([^_\n]+?)_(?!_)', lambda m: f"{_ITA}{m.group(1)}{_R}", text)
-    # inline code  `text`
-    text = re.sub(r'`([^`\n]+?)`', lambda m: f"{_CODE_BG}{_CODE_FG}{m.group(1)}{_R}", text)
-    # strikethrough  ~~text~~
-    text = re.sub(r'~~(.+?)~~', lambda m: f"{_STR}{m.group(1)}{_R}", text)
-    return text
-
-
-def _render_md_line(line: str) -> str:
-    """Render a single complete line with full markdown formatting."""
-    # H1  # Heading
-    if re.match(r'^# ', line):
-        return f"{_BLD}{_H1_FG}{_UND}{_inline_md(line[2:])}{_R}"
-    # H2  ## Heading
-    if re.match(r'^## ', line):
-        return f"{_BLD}{_H2_FG}{_inline_md(line[3:])}{_R}"
-    # H3  ### Heading
-    if re.match(r'^### ', line):
-        return f"{_BLD}{_H3_FG}{_inline_md(line[4:])}{_R}"
-    # H4+ (treat as bold)
-    if re.match(r'^#{4,} ', line):
-        content = re.sub(r'^#{4,} ', '', line)
-        return f"{_BLD}{_inline_md(content)}{_R}"
-    # Horizontal rule  ---  ***  ___
-    if re.match(r'^[-*_]{3,}\s*$', line):
-        w = shutil.get_terminal_size((80, 24)).columns - 4
-        return f"{_DIM}{'─' * w}{_R}"
-    # Blockquote  > text
-    if line.startswith('> '):
-        return f"{_DIM}│ {_inline_md(line[2:])}{_R}"
-    # Unordered bullet  - / * / +
-    m = re.match(r'^(\s*)([-*+]) (.+)$', line)
-    if m:
-        indent, _, content = m.groups()
-        return f"{indent}{_DIM}•{_R} {_inline_md(content)}"
-    # Ordered list  1. text
-    m = re.match(r'^(\s*)(\d+)\. (.+)$', line)
-    if m:
-        indent, num, content = m.groups()
-        return f"{indent}{_DIM}{num}.{_R} {_inline_md(content)}"
-    # Regular line — inline transforms only
-    return _inline_md(line)
-
-
-def _md_render_chunk(text: str) -> str:
-    """Render a streaming chunk: apply full markdown to complete lines,
-    inline-only to the partial last line (no trailing newline)."""
-    if '\n' not in text:
-        return _inline_md(text)
-    parts = text.split('\n')
-    out = [_render_md_line(ln) for ln in parts[:-1]]
-    out.append(_inline_md(parts[-1]))   # partial line — inline only
-    return '\n'.join(out)
+def _print_stream_code_block(text: str) -> None:
+    for line in text.rstrip("\n").splitlines() or [""]:
+        if line:
+            _p(f"{_CODE_FG}{line}{_R}")
+        else:
+            _p("")
 
 
 def _truncate_cmd(s: str, max_len: int = 120) -> str:
@@ -159,6 +106,17 @@ def _truncate_cmd(s: str, max_len: int = 120) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len - 1] + "…"
+
+
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    return len(_ANSI_RE.sub("", text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    return text + (" " * max(0, width - _visible_len(text)))
 
 
 def _p(s: str = "", end: str = "\n") -> None:
@@ -1011,7 +969,26 @@ class Interface:
         self._wrap_buffer = ""
         self._wrap_column = 0
         # Frame-rate limiting: batch text deltas arriving within 16ms (≈60 fps)
-        self._stream_flush_buf: str = ""
+        self._markdown = create_markdown_engine(
+            config.markdown_engine,
+            MarkdownRenderStyle(
+                reset=_R,
+                dim=_DIM,
+                bold=_BLD,
+                underline=_UND,
+                strike=_STR,
+                border=_BRD,
+                soft=_SFT,
+                code=_CODE_FG,
+                link=_LINK_FG,
+                emphasis=_SFT,
+                strong=_BLD,
+                heading1=_H1_FG,
+                heading2=_H2_FG,
+                heading3=_H3_FG,
+            ),
+        )
+        self._markdown_stream = StreamState()
         self._stream_last_flush: float = 0.0
         self._tool_call_inputs: dict[str, dict] = {}
 
@@ -1068,6 +1045,7 @@ class Interface:
         from prompt_toolkit.application import Application
         from prompt_toolkit.layout import Layout, HSplit, VSplit, FloatContainer, Float, Window
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+        from prompt_toolkit.layout.dimension import Dimension
         from prompt_toolkit.layout.menus import CompletionsMenu
         from prompt_toolkit.layout.processors import BeforeInput
         from prompt_toolkit.key_binding import merge_key_bindings
@@ -1086,13 +1064,24 @@ class Interface:
 
         kb = KeyBindings()
 
+        def _insert_newline(event) -> None:
+            event.current_buffer.insert_text('\n')
+
         @kb.add(Keys.Enter)
         def _enter(event):
             event.current_buffer.validate_and_handle()
 
         @kb.add(Keys.Escape, Keys.Enter)
         def _alt_enter(event):
-            event.current_buffer.insert_text('\n')
+            _insert_newline(event)
+
+        @kb.add(Keys.Escape, Keys.ControlM)
+        def _alt_enter_ctrl_m(event):
+            _insert_newline(event)
+
+        @kb.add(Keys.Escape, Keys.ControlJ)
+        def _alt_enter_ctrl_j(event):
+            _insert_newline(event)
 
         @kb.add('/')
         def _slash(event):
@@ -1111,22 +1100,29 @@ class Interface:
                 event.app.exit(exception=EOFError())
 
         def _top():
-            return ANSI(f"{DIM}╭{'─' * box_w}╮{RST}")
+            return ANSI(f"{_BRD}╭{'─' * box_w}╮{RST}")
 
         def _bottom():
-            return ANSI(f"{DIM}╰{'─' * box_w}╯{RST}")
+            return ANSI(f"{_BRD}╰{'─' * box_w}╯{RST}")
 
         def _status():
             in_t  = self._total_input_tokens
             out_t = self._total_output_tokens
             model = self._config.model
-            right = f"Model: {model}  in: {in_t:,}  out: {out_t:,} "
-            pad   = max(0, box_w + 2 - len(right))
-            return ANSI(f"{DIM}{' ' * pad}{right}{RST}")
+            hint = "Enter send · Alt+Enter newline · / commands · @ files"
+            meta = f"{model} · in {in_t:,} · out {out_t:,}"
+            pad = max(2, term_w - len(hint) - len(meta) - 2)
+            return ANSI(f"{_SFT}{hint}{' ' * pad}{RST}{DIM}{meta}{RST}")
+
+        def _submitted_line(text: str) -> str:
+            inner_w = max(1, box_w - 4)
+            clipped = text[:inner_w]
+            content = f"{_bd('│')} {_cb('❯')}  {clipped}"
+            return f"{_pad_visible(content, box_w + 1)}{_bd('│')}"
 
         input_ctrl = BufferControl(
             buffer=buf,
-            input_processors=[BeforeInput(lambda: ANSI(f"│ {BLUE}❯{RST} "))],
+            input_processors=[BeforeInput(lambda: ANSI(f"{_BRD}│{RST} {BLUE}❯{RST} "))],
             focusable=True,
             include_default_input_processors=True,
         )
@@ -1136,10 +1132,17 @@ class Interface:
                 content=HSplit([
                     Window(height=1, content=FormattedTextControl(_top)),
                     VSplit([
-                        Window(content=input_ctrl, wrap_lines=False, height=1),
-                        Window(width=1, height=1, content=FormattedTextControl(
-                            lambda d=DIM, r=RST: ANSI(f"{d}│{r}")
-                        )),
+                        Window(
+                            content=input_ctrl,
+                            wrap_lines=True,
+                            height=Dimension(min=1, max=8),
+                            dont_extend_height=True,
+                        ),
+                        Window(
+                            width=1,
+                            content=FormattedTextControl(lambda: ANSI(f"{_BRD}│{RST}")),
+                            dont_extend_height=True,
+                        ),
                     ]),
                     Window(height=1, content=FormattedTextControl(_bottom)),
                     Window(height=1),
@@ -1211,9 +1214,18 @@ class Interface:
         # After the app erases itself, immediately re-print the box with the
         # submitted text so it stays visible in the scrollback history.
         if not cancelled and submitted:
-            _p(f"{DIM}╭{'─' * box_w}╮{RST}")
-            _p(f"│ {BLUE}❯{RST}  {submitted[0]}")
-            _p(f"{DIM}╰{'─' * box_w}╯{RST}\n")
+            _p(f"{_BRD}╭{'─' * box_w}╮{RST}")
+            inner_w = max(1, box_w - 4)
+            for raw_line in submitted[0].splitlines() or [""]:
+                remaining = raw_line or ""
+                if not remaining:
+                    _p(_submitted_line(""))
+                    continue
+                while remaining:
+                    _p(_submitted_line(remaining[:inner_w]))
+                    remaining = remaining[inner_w:]
+            _p(f"{_BRD}╰{'─' * box_w}╯{RST}")
+            _p()
 
         return None if cancelled else (submitted[0] if submitted else None)
 
@@ -1506,14 +1518,12 @@ class Interface:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
                 label = self._spinner_label
-                width = len(label) + 6
-                out.write(f"\r  {frame} \033[2m{label}\033[0m")
+                out.write(f"\r\033[2K  {frame} \033[2m{label}\033[0m")
                 out.flush()
                 i += 1
                 await asyncio.sleep(0.08)
         finally:
-            # Clear with max possible width
-            out.write("\r" + " " * 80 + "\r")
+            out.write("\r\033[2K\r")
             out.flush()
 
     # ── Tool-call block helpers ───────────────────────────────────────────────
@@ -1563,19 +1573,23 @@ class Interface:
         return "Bash", _truncate_cmd(" ".join(command))
 
     def _print_tool_header(self, tool: str, arg: str, suffix: str = "") -> None:
-        """  ● Tool(arg) [suffix]"""
-        suf = f"  {_d(suffix)}" if suffix else ""
-        _p(f"  {_c('●')} {_b(tool)}({_c(arg)}){suf}")
+        """Print a compact framed header for a tool block."""
+        _p()
+        _p(f"  {_bd('╭─')} {_b(tool)}")
+        details = arg.strip()
+        if suffix:
+            details = f"{details}  {suffix}".strip()
+        if details:
+            _p(f"  {_bd('│')} {_s(details)}")
 
     def _print_approval_bar(self, label: str, arg: str) -> None:
-        """Full-width IBM-blue banner for tool approval requests."""
-        term_w  = shutil.get_terminal_size((120, 24)).columns
-        BBLU    = "\033[48;2;21;98;254m\033[1;97m"   # bold white on IBM blue
-        RST     = "\033[0m"
-        content = f"  ● {label}({arg})"
-        hint    = "  needs approval  "
-        pad     = " " * max(0, term_w - len(content) - len(hint))
-        _p(f"{BBLU}{content}{pad}{hint}{RST}")
+        """Print a framed approval card."""
+        _p()
+        _p(f"  {_bd('╭─')} {_y('Approval Required')}")
+        _p(f"  {_bd('│')} {_b(label)}")
+        if arg:
+            _p(f"  {_bd('│')} {_s(arg)}")
+        _p(f"  {_bd('╰─')} {_d('confirm to continue')}")
 
     def _colorize_diff_line(self, line: str) -> str:
         """Colorize a single diff line: + green, - red, @@ cyan."""
@@ -1593,15 +1607,26 @@ class Interface:
         return line
 
     def _print_tool_output(self, lines: list[str], colorize_diff: bool = False) -> None:
-        """⎿ on first output line, indent on rest, dim for collapsed-count sentinel."""
+        """Print tool output inside a single framed block."""
+        if not lines:
+            _p(f"  {_bd('│')} {_d('(no output)')}")
+            return
         for i, line in enumerate(lines):
             if line.startswith("\x00DIM"):        # collapsed count sentinel
-                _p(f"     {_d(line[4:])}")
+                _p(f"  {_bd('│')} {_d(line[4:])}")
                 continue
-            prefix = "  ⎿ " if i == 0 else "     "
             if colorize_diff:
                 line = self._colorize_diff_line(line)
-            _p(f"{prefix}{line}")
+            _p(f"  {_bd('│')} {line}")
+
+    def _print_tool_footer(self, *, exit_code: int, duration_ms: int) -> None:
+        status = _g("done") if exit_code == 0 else _r(f"exit {exit_code}")
+        _p(f"  {_bd('╰─')} {status}{_d(f'  ·  {duration_ms}ms')}")
+
+    def _print_turn_divider(self) -> None:
+        width = shutil.get_terminal_size((120, 24)).columns
+        span = max(18, min(34, width // 3))
+        _p(f"  {_bd('─' * span)}")
 
     # ── Event consumer ────────────────────────────────────────────────────────
 
@@ -1667,13 +1692,9 @@ class Interface:
 
     def _flush_completed_stream_lines(self) -> None:
         """Render only completed markdown lines; keep the partial tail buffered."""
-        if "\n" not in self._stream_flush_buf:
-            return
-        last_newline = self._stream_flush_buf.rfind("\n")
-        ready = self._stream_flush_buf[: last_newline + 1]
-        self._stream_flush_buf = self._stream_flush_buf[last_newline + 1 :]
-        if ready:
-            _p(_md_render_chunk(ready), end="")
+        chunk = self._markdown.render_stream_chunk("", self._markdown_stream)
+        if chunk.rendered:
+            _p(chunk.rendered, end="")
 
 
 
@@ -1720,6 +1741,7 @@ class Interface:
                     self._current_buf  = ""
                     self._text_started = False
                     self._after_tool   = False
+                    self._markdown_stream.pending = ""
                     self._wrap_buffer = ""
                     self._wrap_column = 0
                     # Spinner is started by _busy_wait AFTER the ❯ prompt is
@@ -1756,32 +1778,14 @@ class Interface:
                                     lang = line.strip()[3:].strip()
                                     self._code_block_lang = lang if lang else "text"
                                     self._code_block_content = ""
-                                    _p(line)  # Print the opening marker
+                                    _p(f"  {_d(line)}")
                                 else:
-                                    # Ending a code block - render with syntax highlighting
+                                    # Ending a code block - render in a single color
                                     self._in_code_block = False
                                     if self._code_block_content:
-                                        from rich.console import Console
-                                        from rich.syntax import Syntax
-                                        import io
-                                        
-                                        string_io = io.StringIO()
-                                        console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns)
-                                        
-                                        syntax = Syntax(
-                                            self._code_block_content,
-                                            self._code_block_lang or "text",
-                                            theme="monokai",
-                                            line_numbers=False,
-                                            word_wrap=True
-                                        )
-                                        console.print(syntax)
-                                        
-                                        output = string_io.getvalue()
-                                        for out_line in output.splitlines():
-                                            _p(out_line)
-                                    
-                                    _p(line)  # Print the closing marker
+                                        _print_stream_code_block(self._code_block_content)
+
+                                    _p(f"  {_d(line)}")
                                     self._code_block_content = ""
                                     self._code_block_lang = None
                             elif self._in_code_block:
@@ -1789,20 +1793,20 @@ class Interface:
                                 self._code_block_content += line + "\n"
                             else:
                                 # Regular text outside code blocks — buffered
-                                self._stream_flush_buf += line
+                                self._markdown_stream.pending += line
                     elif self._in_code_block:
                         # Inside code block, accumulate
                         self._code_block_content += delta
                     else:
                         # Regular streaming text — buffered for frame-rate limiting
-                        self._stream_flush_buf += delta
+                        self._markdown_stream.pending += delta
 
                     # Flush buffer if ≥16ms have elapsed since last render (≈60fps)
                     import time as _time
                     _now = _time.monotonic()
                     if (
-                        self._stream_flush_buf
-                        and "\n" in self._stream_flush_buf
+                        self._markdown_stream.pending
+                        and "\n" in self._markdown_stream.pending
                         and (_now - self._stream_last_flush) >= 0.016
                     ):
                         self._flush_completed_stream_lines()
@@ -1813,13 +1817,13 @@ class Interface:
 
                 elif isinstance(msg, ToolCallStartedEvent):
                     if self._wrap_buffer:
-                        self._stream_flush_buf += self._flush_wrap_buffer()
+                        self._markdown_stream.pending += self._flush_wrap_buffer()
                     # Flush any buffered streaming text before tool output
-                    if self._stream_flush_buf:
+                    if self._markdown_stream.pending:
                         self._flush_completed_stream_lines()
-                        if self._stream_flush_buf:
-                            _p(_render_md_line(self._stream_flush_buf), end="")
-                        self._stream_flush_buf = ""
+                        tail = self._markdown.flush_stream_tail(self._markdown_stream)
+                        if tail:
+                            _p(tail, end="")
                     # Update spinner to show which tool is running
                     tool_name = msg.tool_name
                     # Format tool name nicely (e.g., read_file -> "read file")
@@ -1856,20 +1860,18 @@ class Interface:
 
                 elif isinstance(msg, ReasoningDeltaEvent):
                     if self._wrap_buffer:
-                        self._stream_flush_buf += self._flush_wrap_buffer()
-                    if self._stream_flush_buf:
+                        self._markdown_stream.pending += self._flush_wrap_buffer()
+                    if self._markdown_stream.pending:
                         self._flush_completed_stream_lines()
-                        if self._stream_flush_buf:
-                            _p(_render_md_line(self._stream_flush_buf), end="")
-                        self._stream_flush_buf = ""
+                        tail = self._markdown.flush_stream_tail(self._markdown_stream)
+                        if tail:
+                            _p(tail, end="")
                     if not hasattr(self, '_reasoning_started') or not self._reasoning_started:
                         await self._stop_spinner()
                         self._reasoning_started = True
                         if self._after_tool:
                             _p()
                         self._after_tool = False
-                        # Start reasoning block with thinking icon
-                        _p(f"{_d('💭 thinking...')}")
                         self._reasoning_buf = ""
                     # Accumulate reasoning silently - will be displayed at end
                     self._reasoning_buf += msg.delta
@@ -1909,11 +1911,7 @@ class Interface:
                     self._print_tool_output(_collapse_lines(self._exec_output_buf), colorize_diff=colorize)
                     self._exec_output_buf = []
                     self._is_apply_patch = False
-                    code = msg.exit_code
-                    ms   = msg.duration_ms
-                    if code != 0:
-                        # exit code is metadata, not output — 5-space indent, no ⎿
-                        _p(f"     {_r(f'exit {code}')}{_d(f'  ·  {ms}ms')}")
+                    self._print_tool_footer(exit_code=msg.exit_code, duration_ms=msg.duration_ms)
                     self._after_tool = True
                     # No blank line here — let the NEXT event decide spacing
 
@@ -1962,12 +1960,13 @@ class Interface:
                     if not self._task_running:
                         self._task_running = True
                     _p()
-                    _p(f"  {_y('🌐')} {_bold('Network access requested')}")
-                    _p(f"     {_d('tool:')}   {msg.tool_name or 'web'}")
-                    _p(f"     {_d('domain:')} {msg.domain}")
-                    _p(f"     {_d('url:')}    {msg.url[:80]}")
+                    _p(f"  {_bd('╭─')} {_y('Network Approval Required')}")
+                    _p(f"  {_bd('│')} {_b(msg.tool_name or 'web')}")
+                    _p(f"  {_bd('│')} {_s(msg.domain)}")
+                    _p(f"  {_bd('│')} {_d(msg.url[:90])}")
+                    _p(f"  {_bd('╰─')} {_d('allow once or trust for this session')}")
                     _p()
-                    _p(f"  {_d('[y]')} allow once  {_d('[a]')} allow always (this session)  {_d('[n]')} deny › ", end="")
+                    _p(f"  {_bd('[y]')} allow once  {_bd('[a]')} trust domain  {_bd('[n]')} deny {_bd('›')} ", end="")
                     ps_net = PromptSession()
                     try:
                         answer = (await ps_net.prompt_async("")).strip().lower()
@@ -1976,11 +1975,11 @@ class Interface:
                     approved = answer in ("y", "yes", "a", "always")
                     approve_always = answer in ("a", "always")
                     if approve_always:
-                        _p(f"  {_d(f'✓ {msg.domain} approved for this session')}")
+                        _p(f"  {_bd('·')} {_d(f'{msg.domain} approved for this session')}")
                     elif approved:
-                        _p(f"  {_d(f'✓ {msg.domain} allowed once')}")
+                        _p(f"  {_bd('·')} {_d(f'{msg.domain} allowed once')}")
                     else:
-                        _p(f"  {_r(f'✗ {msg.domain} denied')}")
+                        _p(f"  {_bd('·')} {_r(f'{msg.domain} denied')}")
                     from bob.protocol.ops import NetworkApprovalOp
                     await self._session.submit(NetworkApprovalOp(
                         url=msg.url,
@@ -2031,60 +2030,56 @@ class Interface:
 
                 elif isinstance(msg, TurnEndedEvent):
                     if self._wrap_buffer:
-                        self._stream_flush_buf += self._flush_wrap_buffer()
+                        self._markdown_stream.pending += self._flush_wrap_buffer()
                     # Flush any remaining buffered stream text — full line render
-                    if self._stream_flush_buf:
-                        _p(_render_md_line(self._stream_flush_buf), end="")
-                        self._stream_flush_buf = ""
+                    if self._markdown_stream.pending:
+                        self._flush_completed_stream_lines()
+                        tail = self._markdown.flush_stream_tail(self._markdown_stream)
+                        if tail:
+                            _p(tail, end="")
                     await self._stop_spinner()
+
+                    # Live-streamed replies may end without a final newline.
+                    # Close the prose line before any reasoning/footer output.
+                    if self._text_started and self._current_buf and not self._current_buf.endswith("\n"):
+                        _p()
                     
                     # Display reasoning block if we have thinking content
-                    if hasattr(self, '_reasoning_buf') and self._reasoning_buf:
+                    if (
+                        getattr(self._config, "show_reasoning", False)
+                        and hasattr(self, '_reasoning_buf')
+                        and self._reasoning_buf
+                    ):
+                        _p(f"  {_bd('╭─')} {_s('Reasoning')}")
                         lines = self._reasoning_buf.splitlines()
                         if len(lines) <= 10:
-                            # Short reasoning - show all
-                            _p(f"{_d('💭 Extended Thinking:')}")
+                            _p(f"  {_bd('│')} {_d('Extended thinking')}")
                             for line in lines:
-                                _p(f"{_d('  ')}{_d(line)}")
+                                _p(f"  {_bd('│')} {_d(line)}")
                         else:
-                            # Long reasoning - show first 5 and last 5 with "..." in between
-                            _p(f"{_d('💭 Extended Thinking:')}")
+                            _p(f"  {_bd('│')} {_d('Extended thinking')}")
                             for line in lines[:5]:
-                                _p(f"{_d('  ')}{_d(line)}")
-                            _p(f"{_d('  ... ')}{_d(f'({len(lines) - 10} more lines)')}")
+                                _p(f"  {_bd('│')} {_d(line)}")
+                            _p(f"  {_bd('│')} {_d(f'... ({len(lines) - 10} more lines)')}")
                             for line in lines[-5:]:
-                                _p(f"{_d('  ')}{_d(line)}")
-                        _p()  # Blank line after reasoning
-                        self._reasoning_buf = ""
-                        self._reasoning_started = False
+                                _p(f"  {_bd('│')} {_d(line)}")
+                        _p(f"  {_bd('╰─')} {_d('reasoning captured')}")
+                    self._reasoning_buf = ""
+                    self._reasoning_started = False
                     
-                    # Render accumulated markdown if we have text
-                    if self._current_buf:
+                    # Only do a final full render if no live text was streamed.
+                    if self._current_buf and not self._text_started:
                         # Clear the raw text line
                         if not self._current_buf.endswith("\n"):
                             _p()
-                        # Re-render with markdown formatting
-                        try:
-                            from rich.markdown import Markdown
-                            from rich.console import Console
-                            import io
-                            
-                            # Capture rich output to string
-                            string_io = io.StringIO()
-                            console = Console(file=string_io, force_terminal=True, width=shutil.get_terminal_size((120, 24)).columns - 4)
-                            md = Markdown(self._current_buf)
-                            console.print(md)
-                            rendered = string_io.getvalue()
-                            
-                            # Print the rendered markdown
-                            for line in rendered.splitlines():
-                                _p(f"  {line}")
-                        except Exception:
-                            # Fallback to raw text if markdown rendering fails
-                            if not self._current_buf.endswith("\n"):
-                                _p()
+                        rendered = self._markdown.render(self._current_buf)
+                        if rendered:
+                            _p(rendered)
                     elif self._after_tool and not self._current_buf:
                         # Turn ended with only tool calls and no prose — add spacing
+                        _p()
+                    
+                    if self._text_started or self._current_buf:
                         _p()
                     
                     self._last_assistant_text = self._current_buf
@@ -2134,8 +2129,7 @@ class Interface:
                             pass
 
                     # Dim separator between turns
-                    _sep_w = shutil.get_terminal_size((120, 24)).columns
-                    _p(f"\033[2m{'─' * _sep_w}\033[0m")
+                    self._print_turn_divider()
 
                 elif isinstance(msg, TurnInterruptedEvent):
                     await self._stop_spinner()
@@ -2144,7 +2138,7 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
-                    _p(f"  {_y('⚠')} interrupted")
+                    _p(f"  {_bd('·')} {_y('interrupted')}")
                     _p()
 
                 # ── Error / warning / info ────────────────────────────────────
@@ -2160,24 +2154,21 @@ class Interface:
                     _p()
 
                 elif isinstance(msg, WarningEvent):
-                    _p(f"  {_y('⚠')} {msg.message}")
+                    _p(f"  {_bd('·')} {_y(msg.message)}")
 
                 elif isinstance(msg, HistoryCompactedEvent):
-                    _p(f"  {_d(f'[context] compacted — {msg.turns_removed} turns removed')}")
+                    _p(f"  {_bd('·')} {_d(f'context compacted · {msg.turns_removed} turns removed')}")
 
                 elif isinstance(msg, InfoEvent):
-                    _p(f"  {_d(msg.message)}")
+                    _p(f"  {_bd('·')} {_s(msg.message)}")
 
                 elif isinstance(msg, BackgroundTerminalOutputEvent):
-                    _p(f"  {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
+                    _p(f"  {_bd('·')} {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
 
                 elif UserInputRequestEvent is not None and isinstance(msg, UserInputRequestEvent):
                     await self._stop_spinner()
                     _p()
-                    
-                    # Distinct visual style for questions
-                    _p(f"  {_cb('❓')} {_bold('Question from Bob:')}")
-                    _p(f"  {_d('│')}")
+                    _p(f"  {_bd('╭─')} {_c('Question')}")
                     
                     # Word-wrap the prompt at terminal width
                     import shutil
@@ -2185,8 +2176,8 @@ class Interface:
                     term_width = shutil.get_terminal_size().columns
                     wrapped_lines = textwrap.wrap(msg.prompt, width=term_width - 6)
                     for line in wrapped_lines:
-                        _p(f"  {_d('│')} {line}")
-                    _p(f"  {_d('└─')}")
+                        _p(f"  {_bd('│')} {line}")
+                    _p(f"  {_bd('╰─')} {_d('respond to continue')}")
                     _p()
                     
                     # Handle structured fields if present
@@ -2227,7 +2218,7 @@ class Interface:
                         # Simple text input with custom prompt style
                         try:
                             ps_tmp = PromptSession()
-                            answer = await ps_tmp.prompt_async(ANSI(f"  {_cg('›')} "))
+                            answer = await ps_tmp.prompt_async(ANSI(f"  {_bd('›')} "))
                         except (EOFError, KeyboardInterrupt):
                             answer = ""
                     
@@ -2244,8 +2235,7 @@ class Interface:
                 elif isinstance(msg, PlanApprovalRequestedEvent):
                     await self._stop_spinner()
                     _p()
-                    _p(f"  {_cy('📋')} {_bold('Plan Summary:')}")
-                    _p(f"  {_d('┌─────────────────────────────────────')}")
+                    _p(f"  {_bd('╭─')} {_c('Plan Summary')}")
                     
                     # Word-wrap and display plan
                     import shutil
@@ -2253,18 +2243,18 @@ class Interface:
                     term_width = shutil.get_terminal_size().columns
                     wrapped_lines = textwrap.wrap(msg.plan_summary, width=term_width - 6)
                     for line in wrapped_lines:
-                        _p(f"  {_d('│')} {line}")
+                        _p(f"  {_bd('│')} {line}")
                     
-                    _p(f"  {_d('└─────────────────────────────────────')}")
+                    _p(f"  {_bd('╰─')} {_d('approval unlocks mutating tools')}")
                     _p()
-                    _p(f"  {_y('⚠')} This plan will unlock write tools and allow file modifications.")
+                    _p(f"  {_bd('·')} {_y('This will unlock write tools and file modifications.')}")
                     _p()
                     
                     # Prompt for approval
                     try:
                         ps_tmp = PromptSession()
                         response = await ps_tmp.prompt_async(
-                            ANSI(f"  Approve this plan? (y/n/feedback): ")
+                            ANSI(f"  {_bd('›')} approve plan? (y/n/feedback): ")
                         )
                     except (EOFError, KeyboardInterrupt):
                         response = "n"
@@ -2274,18 +2264,18 @@ class Interface:
                     if response in ('y', 'yes'):
                         from bob.protocol.ops import PlanApprovalOp
                         await self._session.submit(PlanApprovalOp(approved=True))
-                        _p(f"  {_g('✓')} Plan approved")
+                        _p(f"  {_bd('·')} {_g('plan approved')}")
                     elif response in ('n', 'no'):
                         from bob.protocol.ops import PlanApprovalOp
                         await self._session.submit(PlanApprovalOp(approved=False))
-                        _p(f"  {_r('✗')} Plan rejected")
+                        _p(f"  {_bd('·')} {_r('plan rejected')}")
                     else:
                         # Treat as feedback
                         from bob.protocol.ops import PlanApprovalOp
                         await self._session.submit(
                             PlanApprovalOp(approved=False, feedback=response)
                         )
-                        _p(f"  {_y('⚠')} Plan rejected with feedback")
+                        _p(f"  {_bd('·')} {_y('plan rejected with feedback')}")
                     
                     _p()
                     if self._task_running and not self._spinner_active:
@@ -3259,15 +3249,12 @@ class Interface:
                     # Spinner is stopped by the event consumer before printing the
                     # approval header; just handle the prompt here.
                     _, fut = self._pending_approval
-                    _blu = "\033[38;2;21;98;254m"
-                    _rst = "\033[0m"
-                    _dim = "\033[2m"
                     _approval_prompt = ANSI(
-                        f"  {_blu}[y]{_rst} yes  "
-                        f"{_blu}[a]{_rst} always  "
-                        f"{_blu}[n]{_rst} no  "
-                        f"{_blu}[s]{_rst} skip  "
-                        f"{_blu}›{_rst} "
+                        f"  {_bd('[y]')} approve  "
+                        f"{_bd('[a]')} session  "
+                        f"{_bd('[n]')} deny  "
+                        f"{_bd('[s]')} abort  "
+                        f"{_bd('›')} "
                     )
                     try:
                         raw = await ps.prompt_async(_approval_prompt)

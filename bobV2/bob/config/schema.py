@@ -222,6 +222,10 @@ class BobConfig(BaseModel):
     show_cost: bool = False
     # Stream responses in real-time (False = buffer full response)
     stream_responses: bool = True
+    # Markdown renderer backend used by the chat TUI.
+    # "markdown_it" is the CommonMark parser-backed renderer.
+    # "legacy" keeps the old regex-based fallback renderer.
+    markdown_engine: str = "markdown_it"
 
     # ------------------------------------------------------------------
     # File-change / diff

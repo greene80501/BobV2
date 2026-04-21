@@ -440,6 +440,7 @@ async def run_turn(
 
             text_parts: list[str] = []
             tool_calls: list[ClientToolCall] = []
+            reasoning_parts: list[str] = []
             iter_input_tokens = 0
             iter_output_tokens = 0
             stream_error_message: str | None = None
@@ -467,6 +468,7 @@ async def run_turn(
                         await emit(TextDeltaEvent(type="text_delta", delta=ev.delta))
 
                     elif isinstance(ev, ClientReasoningDelta):
+                        reasoning_parts.append(ev.delta)
                         await emit(ReasoningDeltaEvent(
                             type="reasoning_delta", delta=ev.delta
                         ))
@@ -588,11 +590,20 @@ async def run_turn(
             import json as _json
 
             history_items: list[dict] = []
-            if full_text:
-                history_items.append({
+            reasoning_text = "".join(reasoning_parts)
+            assistant_item_needed = bool(full_text or reasoning_text or tool_calls)
+            if assistant_item_needed:
+                assistant_item = {
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": full_text}],
-                })
+                    "content": (
+                        [{"type": "output_text", "text": full_text}]
+                        if full_text
+                        else []
+                    ),
+                }
+                if reasoning_text:
+                    assistant_item["reasoning_content"] = reasoning_text
+                history_items.append(assistant_item)
             for tc in tool_calls:
                 history_items.append({
                     "type": "function_call",

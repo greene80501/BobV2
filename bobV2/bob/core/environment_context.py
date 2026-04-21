@@ -9,6 +9,69 @@ from pathlib import Path
 from typing import Optional
 
 
+_WORKSPACE_SKIP = frozenset({
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+})
+
+
+def _format_tree_name(path: Path, is_dir: bool) -> str:
+    return f"{path.name}/" if is_dir else path.name
+
+
+def _list_tree_entries(root: Path) -> list[Path]:
+    try:
+        entries = [
+            p for p in root.iterdir()
+            if p.name not in _WORKSPACE_SKIP and not p.name.startswith(".")
+        ]
+    except OSError:
+        return []
+    return sorted(entries, key=lambda p: (not p.is_dir(), p.name.lower()))
+
+
+def _build_workspace_snapshot(
+    cwd: Path,
+    *,
+    max_top_level: int = 12,
+    max_child_dirs: int = 5,
+    max_children_per_dir: int = 4,
+) -> str:
+    entries = _list_tree_entries(cwd)
+    if not entries:
+        return f"Workspace snapshot:\n{cwd.name or str(cwd)}/\n  (empty or unreadable)"
+
+    lines = [f"Workspace snapshot:", f"{cwd.name or str(cwd)}/"]
+
+    shown_top = entries[:max_top_level]
+    expanded_dirs = 0
+    for entry in shown_top:
+        is_dir = entry.is_dir()
+        lines.append(f"  - {_format_tree_name(entry, is_dir)}")
+        if not is_dir or expanded_dirs >= max_child_dirs:
+            continue
+
+        children = _list_tree_entries(entry)
+        shown_children = children[:max_children_per_dir]
+        for child in shown_children:
+            lines.append(
+                f"    - {_format_tree_name(child, child.is_dir())}"
+            )
+        remaining_children = len(children) - len(shown_children)
+        if remaining_children > 0:
+            lines.append(f"    - ... {remaining_children} more")
+        expanded_dirs += 1
+
+    remaining_top = len(entries) - len(shown_top)
+    if remaining_top > 0:
+        lines.append(f"  - ... {remaining_top} more top-level items")
+
+    return "\n".join(lines)
+
+
 @dataclass
 class EnvironmentContext:
     """
@@ -34,6 +97,7 @@ class EnvironmentContext:
     timestamp: str
     git_branch: Optional[str]
     git_status: Optional[str]
+    workspace_snapshot: str
 
     # ------------------------------------------------------------------
     # Factory
@@ -83,6 +147,7 @@ class EnvironmentContext:
             timestamp=timestamp,
             git_branch=git_branch,
             git_status=git_status,
+            workspace_snapshot=_build_workspace_snapshot(cwd),
         )
 
     # ------------------------------------------------------------------
@@ -114,6 +179,9 @@ class EnvironmentContext:
                 "Use semicolons (;) not && for chaining. "
                 "Paths use backslashes or forward slashes."
             )
+
+        if self.workspace_snapshot:
+            lines.append(self.workspace_snapshot)
 
         return "\n".join(lines)
 
