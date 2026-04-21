@@ -1025,33 +1025,197 @@ class Interface:
 
     def _input_rprompt(self) -> ANSI:
         """Right-side hint shown on the input line."""
-        return ANSI("\033[2m→ Enter to send\033[0m │")
+        return ANSI("\033[2m→ Enter to send\033[0m │ ")
 
     def _print_input_box_top(self) -> None:
-        """Print the top border of the input box + hints line (into scrollback)."""
+        """Print the top border of the input box (into scrollback)."""
         term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
         DIM    = "\033[2m"
         RST    = "\033[0m"
-        box_w  = term_w - 2
-        hints  = f"{DIM}^C exit · /help · /new{RST}"
-        top    = "╭" + "─" * box_w + "╮"
-        _p(hints)
-        _p(top)
+        box_w  = term_w - 3
+        _p(f"{DIM}╭{'─' * box_w}╮{RST}")
 
     def _footer_toolbar(self) -> ANSI:
-        """Bottom toolbar shown while ❯ prompt is active — token counts."""
-        in_t  = self._total_input_tokens
-        out_t = self._total_output_tokens
-        return ANSI(f"\033[2m in: {in_t:,} · out: {out_t:,}\033[0m")
+        """Bottom border of the input box, shown as bottom toolbar while typing."""
+        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
+        DIM    = "\033[2m"
+        RST    = "\033[0m"
+        box_w  = term_w - 3  # match top border width
+        in_t   = self._total_input_tokens
+        out_t  = self._total_output_tokens
+        counts = f" in: {in_t:,}  out: {out_t:,} "
+        dash_w = max(0, box_w - len(counts))
+        bottom = "╰" + "─" * dash_w + counts + "╯"
+        return ANSI(f"{DIM}{bottom}{RST}")
 
     def _print_input_box_bottom(self) -> None:
         """Print the bottom border of the input box (into scrollback)."""
         term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
         DIM    = "\033[2m"
         RST    = "\033[0m"
-        box_w  = term_w - 2
+        box_w  = term_w - 3  # match top border width
         bottom = "╰" + "─" * box_w + "╯"
         _p(f"{DIM}{bottom}{RST}")
+
+    async def _prompt_with_box(self, ps: "PromptSession") -> "str | None":
+        """
+        Render a 3-line bordered input box using a custom Application so the
+        top border, input line, and bottom border all appear together with no
+        gap.  Returns submitted text, or None if a wake event cancelled it.
+        Raises KeyboardInterrupt / EOFError on exit request.
+        """
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.layout import Layout, HSplit, VSplit, FloatContainer, Float, Window
+        from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+        from prompt_toolkit.layout.menus import CompletionsMenu
+        from prompt_toolkit.layout.processors import BeforeInput
+        from prompt_toolkit.key_binding import merge_key_bindings
+        from prompt_toolkit.key_binding.bindings.emacs import load_emacs_bindings
+        from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
+
+        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
+        box_w  = term_w - 3
+        DIM, BLUE, RST = "\033[2m", "\033[38;2;21;98;254m", "\033[0m"
+
+        buf = ps.default_buffer
+        buf.reset(append_to_history=False)
+
+        submitted: list[str] = []
+        cancelled = False
+
+        kb = KeyBindings()
+
+        @kb.add(Keys.Enter)
+        def _enter(event):
+            event.current_buffer.validate_and_handle()
+
+        @kb.add(Keys.Escape, Keys.Enter)
+        def _alt_enter(event):
+            event.current_buffer.insert_text('\n')
+
+        @kb.add('/')
+        def _slash(event):
+            b = event.current_buffer
+            b.insert_text("/")
+            if b.text == "/" and b.cursor_position == 1:
+                b.start_completion(select_first=False)
+
+        @kb.add('c-c')
+        def _ctrl_c(event):
+            event.app.exit(exception=KeyboardInterrupt())
+
+        @kb.add('c-d')
+        def _ctrl_d(event):
+            if not event.current_buffer.text:
+                event.app.exit(exception=EOFError())
+
+        def _top():
+            return ANSI(f"{DIM}╭{'─' * box_w}╮{RST}")
+
+        def _bottom():
+            return ANSI(f"{DIM}╰{'─' * box_w}╯{RST}")
+
+        def _status():
+            in_t  = self._total_input_tokens
+            out_t = self._total_output_tokens
+            model = self._config.model
+            right = f"Model: {model}  in: {in_t:,}  out: {out_t:,} "
+            pad   = max(0, box_w + 2 - len(right))
+            return ANSI(f"{DIM}{' ' * pad}{right}{RST}")
+
+        input_ctrl = BufferControl(
+            buffer=buf,
+            input_processors=[BeforeInput(lambda: ANSI(f"│ {BLUE}❯{RST} "))],
+            focusable=True,
+            include_default_input_processors=True,
+        )
+
+        layout = Layout(
+            FloatContainer(
+                content=HSplit([
+                    Window(height=1),
+                    Window(height=1, content=FormattedTextControl(_top)),
+                    VSplit([
+                        Window(content=input_ctrl, wrap_lines=False, height=1),
+                        Window(width=1, height=1, content=FormattedTextControl(
+                            lambda d=DIM, r=RST: ANSI(f"{d}│{r}")
+                        )),
+                    ]),
+                    Window(height=1, content=FormattedTextControl(_bottom)),
+                    Window(height=1),
+                    Window(height=1, content=FormattedTextControl(_status)),
+                ]),
+                floats=[Float(xcursor=True, ycursor=True,
+                              content=CompletionsMenu(max_height=12, scroll_offset=1))],
+            ),
+            focused_element=buf,
+        )
+
+        base_kb = load_vi_bindings() if self._vi_mode else load_emacs_bindings()
+        app: Application = Application(
+            layout=layout,
+            key_bindings=merge_key_bindings([base_kb, kb]),
+            full_screen=False,
+            mouse_support=False,
+        )
+
+        def _accept(b):
+            submitted.append(b.text)
+            app.exit()
+
+        buf.accept_handler = _accept
+
+        def _refresh_slash(_b):
+            if buf.text.startswith("/") and " " not in buf.text:
+                buf.start_completion(select_first=False)
+
+        buf.on_text_changed += _refresh_slash
+
+        async def _wake_watcher():
+            nonlocal cancelled
+            await asyncio.wait(
+                {
+                    asyncio.ensure_future(self._turn_started.wait()),
+                    asyncio.ensure_future(self._approval_event.wait()),
+                },
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            cancelled = True
+            app.exit()
+
+        wake_task = asyncio.ensure_future(_wake_watcher())
+
+        try:
+            await app.run_async()
+        except (KeyboardInterrupt, EOFError):
+            if not wake_task.done():
+                wake_task.cancel()
+                try:
+                    await wake_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            buf.accept_handler = None
+            buf.on_text_changed -= _refresh_slash
+            raise
+        finally:
+            if not wake_task.done():
+                wake_task.cancel()
+                try:
+                    await wake_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            buf.accept_handler = None
+            buf.on_text_changed -= _refresh_slash
+
+        # After the app erases itself, immediately re-print the box with the
+        # submitted text so it stays visible in the scrollback history.
+        if not cancelled and submitted:
+            _p(f"\n{DIM}╭{'─' * box_w}╮{RST}")
+            _p(f"│ {BLUE}❯{RST}  {submitted[0]}")
+            _p(f"{DIM}╰{'─' * box_w}╯{RST}\n")
+
+        return None if cancelled else (submitted[0] if submitted else None)
 
     async def _save_config(self):
         """Save current config to ~/.bob/config.toml"""
@@ -1307,15 +1471,6 @@ class Interface:
             cc = pad_r(center[i], center_w)
             rc = pad_r(right[i],  right_w)
             out.write(f"│{lc}{sep}{cc}{sep}{rc}│\n")
-
-        # ── Footer separator ──────────────────────────────────────────────
-        out.write(f"├{'─' * inner_w}┤\n")
-
-        # ── Footer: model left, tokens right ──────────────────────────────
-        fl   = f" {DIM}Model: {model}{RST}"
-        fr   = f"{DIM}tokens in: 0  out: 0{RST} "
-        fpad = max(0, inner_w - vlen(fl) - vlen(fr))
-        out.write(f"│{fl}{' ' * fpad}{fr}│\n")
 
         # ── Bottom border ─────────────────────────────────────────────────
         out.write(f"└{'─' * inner_w}┘\n")
@@ -3498,54 +3653,17 @@ class Interface:
                     if self._done.is_set() or self._exit_requested.is_set():
                         break
 
-                    # ── ❯ prompt — interruptible by turn-start or approval ────
-                    #
-                    # _turn_started fires the moment TurnStartedEvent arrives in
-                    # the event consumer, cancelling the ❯ before any stray
-                    # prompt character is committed to screen.
-                    self._print_input_box_top()
-                    input_task    = asyncio.ensure_future(
-                        ps.prompt_async(self._prompt_str,
-                                        rprompt=self._input_rprompt)
-                    )
-                    wake_tasks = [
-                        asyncio.ensure_future(self._turn_started.wait()),
-                        asyncio.ensure_future(self._approval_event.wait()),
-                    ]
-
-                    done_set, _ = await asyncio.wait(
-                        {input_task, *wake_tasks},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-
-                    # Cancel whatever didn't finish
-                    for t in wake_tasks:
-                        if t not in done_set:
-                            t.cancel()
-                            try:
-                                await t
-                            except (asyncio.CancelledError, Exception):
-                                pass
-
-                    if input_task not in done_set:
-                        # A wake event fired — cancel the prompt and loop back
-                        input_task.cancel()
-                        try:
-                            await input_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                        continue   # re-enters _busy_wait at top of loop
-
-                    # ── User submitted text ───────────────────────────────────
+                    # ── ❯ prompt — bordered box, interruptible by wake events ─
                     try:
-                        text = input_task.result()
+                        text = await self._prompt_with_box(ps)
                     except (EOFError, KeyboardInterrupt):
-                        self._print_input_box_bottom()
                         _p(f"  {_d('goodbye')}")
                         self._exit_requested.set()
                         break
 
-                    self._print_input_box_bottom()
+                    if text is None:
+                        continue   # wake event fired — re-enters _busy_wait
+
                     text = text.strip()
                     if not text:
                         continue
