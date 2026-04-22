@@ -724,15 +724,24 @@ class ThreadManager:
 
         self._bump_state()
         self._persist_tree()
-        if reason:
-            try:
-                from bob.protocol.events import Event, InfoEvent
-                await self.parent_session._emit(Event(
-                    id="subagent",
-                    msg=InfoEvent(type="info", message=f"[agent {rec.id}] closed: {reason}"),
-                ))
-            except Exception:
-                pass
+        try:
+            from bob.protocol.events import AgentStatusEvent, Event
+            display_name = f"{rec.name} agent" if rec.name else rec.id[:8]
+            activity = f"Closed · {reason}" if reason else "Closed"
+            await self.parent_session._emit(Event(
+                id="subagent",
+                msg=AgentStatusEvent(
+                    type="agent_status",
+                    agent_id=rec.id[:8],
+                    display_name=display_name,
+                    color=rec.color,
+                    status="closed",
+                    activity=activity,
+                    tokens=0,
+                ),
+            ))
+        except Exception:
+            pass
 
     def list_agents(self, include_completed: bool = False) -> list[dict]:
         """Return descriptors for tracked agents with enhanced metadata."""
@@ -755,17 +764,25 @@ class ThreadManager:
     async def _agent_worker(self, agent_id: str) -> None:
         """Run queued tasks for one agent session until closed."""
         rec = self._resolve(agent_id)
-        color = rec.color
-        short_id = agent_id[:6]
+        short_id = agent_id[:8]
+        total_tokens = 0
+        display_name = f"{rec.name} agent" if rec.name else short_id
 
-        async def _fwd(text: str) -> None:
-            from bob.protocol.events import Event, InfoEvent
-            msg = InfoEvent(
-                type="info",
-                message=f"[{color}{short_id}{_RST}] {text}",
-            )
+        async def _status(status: str, activity: str) -> None:
+            from bob.protocol.events import AgentStatusEvent, Event
             try:
-                await self.parent_session._emit(Event(id="subagent", msg=msg))
+                await self.parent_session._emit(Event(
+                    id="subagent",
+                    msg=AgentStatusEvent(
+                        type="agent_status",
+                        agent_id=short_id,
+                        display_name=display_name,
+                        color=rec.color,
+                        status=status,
+                        activity=activity,
+                        tokens=total_tokens,
+                    ),
+                ))
             except Exception:
                 pass
 
@@ -774,6 +791,8 @@ class ThreadManager:
                 ErrorEvent,
                 SessionEndedEvent,
                 TextDeltaEvent,
+                ToolCallStartedEvent,
+                ToolCallCompletedEvent,
                 TurnEndedEvent,
                 TurnInterruptedEvent,
             )
@@ -807,6 +826,7 @@ class ThreadManager:
                     await rec.session.submit(
                         UserTurnOp(items=[TextUserInput(type="text", text=task)])
                     )
+                    await _status("running", "Thinking…")
 
                     text_buf: list[str] = []
                     failure: Optional[str] = None
@@ -838,20 +858,25 @@ class ThreadManager:
                             rec.current_task = None
                             rec.current_task_name = None
                             rec.updated_at_ts = _now_ts()
-                            await _fwd(f"[error: {failure}]")
+                            await _status("error", f"Timeout after {rec.runtime_ttl_seconds}s")
                             break
 
                         msg = event.msg
                         if isinstance(msg, TextDeltaEvent):
                             text_buf.append(msg.delta)
-                            await _fwd(msg.delta)
+                        elif isinstance(msg, ToolCallStartedEvent):
+                            tool_display = msg.tool_name.replace("_", " ").title()
+                            await _status("tool_use", f"{tool_display}…")
+                        elif isinstance(msg, ToolCallCompletedEvent):
+                            await _status("running", "Thinking…")
                         elif isinstance(msg, TurnEndedEvent):
+                            total_tokens += msg.output_tokens
                             rec.last_result = "".join(text_buf).strip() or None
                             rec.status = "idle"
                             rec.current_task = None
                             rec.current_task_name = None
                             rec.updated_at_ts = _now_ts()
-                            await _fwd(f"[done - {msg.output_tokens} tokens]")
+                            await _status("done", f"Done · {total_tokens} tok")
                             if rec.name and rec.last_result:
                                 changed_files = list(getattr(rec.session.analytics, "last_turn_changed_files", []) or [])
                                 asyncio.create_task(
@@ -879,7 +904,7 @@ class ThreadManager:
                             rec.current_task = None
                             rec.current_task_name = None
                             rec.updated_at_ts = _now_ts()
-                            await _fwd(f"[error: {msg.message}]")
+                            await _status("error", f"Error: {msg.message[:60]}")
                             break
 
                     # If additional tasks are queued, keep this agent non-idle between runs.
@@ -914,6 +939,6 @@ class ThreadManager:
             self._bump_state()
             self._persist_tree()
             try:
-                await _fwd(f"[exception: {exc}]")
+                await _status("error", f"Exception: {str(exc)[:60]}")
             except Exception:
                 pass

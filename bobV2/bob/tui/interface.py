@@ -991,6 +991,8 @@ class Interface:
         self._markdown_stream = StreamState()
         self._stream_last_flush: float = 0.0
         self._tool_call_inputs: dict[str, dict] = {}
+        # Sub-agent status strip: agent_id -> {color, activity, tokens, status, _done_at}
+        self._agent_statuses: dict[str, dict] = {}
 
     # ── Dynamic prompt & footer toolbar ──────────────────────────────────────
 
@@ -1047,13 +1049,12 @@ class Interface:
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
         from prompt_toolkit.layout.dimension import Dimension
         from prompt_toolkit.layout.menus import CompletionsMenu
-        from prompt_toolkit.layout.processors import BeforeInput
         from prompt_toolkit.key_binding import merge_key_bindings
         from prompt_toolkit.key_binding.bindings.emacs import load_emacs_bindings
         from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 
         term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
-        box_w  = term_w - 3
+        box_w  = term_w - 2
         DIM, BLUE, RST = "\033[2m", "\033[38;2;21;98;254m", "\033[0m"
 
         buf = ps.default_buffer
@@ -1114,15 +1115,20 @@ class Interface:
             pad = max(2, term_w - len(hint) - len(meta) - 2)
             return ANSI(f"{_SFT}{hint}{' ' * pad}{RST}{DIM}{meta}{RST}")
 
-        def _submitted_line(text: str) -> str:
+        def _submitted_line(text: str, is_first: bool = False) -> str:
             inner_w = max(1, box_w - 4)
             clipped = text[:inner_w]
-            content = f"{_bd('│')} {_cb('❯')}  {clipped}"
+            prefix = f"{_bd('│')} {_cb('❯')}  " if is_first else f"{_bd('│')}    "
+            content = f"{prefix}{clipped}"
             return f"{_pad_visible(content, box_w + 1)}{_bd('│')}"
+
+        def _line_prefix(lineno, wrap_count):
+            if lineno == 0 and wrap_count == 0:
+                return ANSI(f"{_BRD}│{RST} {BLUE}❯{RST}  ")
+            return ANSI(f"{_BRD}│{RST}    ")
 
         input_ctrl = BufferControl(
             buffer=buf,
-            input_processors=[BeforeInput(lambda: ANSI(f"{_BRD}│{RST} {BLUE}❯{RST} "))],
             focusable=True,
             include_default_input_processors=True,
         )
@@ -1137,6 +1143,7 @@ class Interface:
                             wrap_lines=True,
                             height=Dimension(min=1, max=8),
                             dont_extend_height=True,
+                            get_line_prefix=_line_prefix,
                         ),
                         Window(
                             width=1,
@@ -1216,14 +1223,17 @@ class Interface:
         if not cancelled and submitted:
             _p(f"{_BRD}╭{'─' * box_w}╮{RST}")
             inner_w = max(1, box_w - 4)
+            is_first = True
             for raw_line in submitted[0].splitlines() or [""]:
                 remaining = raw_line or ""
                 if not remaining:
-                    _p(_submitted_line(""))
+                    _p(_submitted_line("", is_first=is_first))
+                    is_first = False
                     continue
                 while remaining:
-                    _p(_submitted_line(remaining[:inner_w]))
+                    _p(_submitted_line(remaining[:inner_w], is_first=is_first))
                     remaining = remaining[inner_w:]
+                    is_first = False
             _p(f"{_BRD}╰{'─' * box_w}╯{RST}")
             _p()
 
@@ -1510,23 +1520,224 @@ class Interface:
         self._spinner_task = None
 
     async def _run_spinner(self) -> None:
-        """Animate via sys.__stdout__ (bypasses patch_stdout proxy so \\r works)."""
+        """Animate spinner + sub-agent status strip via sys.__stdout__."""
+        import time as _time
         out    = sys.__stdout__
         frames = _SPINNER_FRAMES
         i = 0
+        prev_agent_lines = 0
+
+        def _clip(text: str, max_len: int) -> str:
+            text = str(text or "").strip()
+            if max_len <= 0:
+                return ""
+            if len(text) <= max_len:
+                return text
+            if max_len == 1:
+                return "…"
+            return text[: max_len - 1] + "…"
+
+        def _status_badge(status: str) -> str:
+            status = (status or "").lower()
+            if status == "done":
+                return f"{_GRN}[DONE]{_R}"
+            if status == "error":
+                return f"{_RED}[ERR ]{_R}"
+            if status == "closed":
+                return f"{_DIM}[EXIT]{_R}"
+            if status == "tool_use":
+                return f"{_YLW}[TOOL]{_R}"
+            return f"{_BLU}[RUN ]{_R}"
         try:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
                 label = self._spinner_label
+
+                # Expire agents that finished > 2 seconds ago
+                _now_mono = _time.monotonic()
+                to_remove = [
+                    aid for aid, info in self._agent_statuses.items()
+                    if info.get("status") in ("done", "closed", "error")
+                    and info.get("_done_at") is not None
+                    and (_now_mono - info["_done_at"]) > 2.0
+                ]
+                for aid in to_remove:
+                    del self._agent_statuses[aid]
+
+                # Build one display line per active agent
+                agent_lines: list[str] = []
+                for aid, info in self._agent_statuses.items():
+                    color   = info.get("color", "")
+                    display_name = info.get("display_name", aid)
+                    activity = info.get("activity", "")
+                    tokens  = info.get("tokens", 0)
+                    status  = info.get("status", "")
+                    if status == "done":
+                        indicator = "\033[32m✓\033[0m"
+                    elif status == "error":
+                        indicator = "\033[31m✗\033[0m"
+                    else:
+                        indicator = "\033[2m·\033[0m"
+                    tok_str = f"  \033[2m{tokens:,} tok\033[0m" if tokens else ""
+                    agent_lines.append(
+                        f"  {indicator} {color}{display_name}\033[0m \033[2m{activity}\033[0m{tok_str}"
+                    )
+
+                # Move cursor back up to the spinner line from last frame
+                if prev_agent_lines > 0:
+                    out.write(f"\033[{prev_agent_lines}A")
+
+                # Draw spinner line
                 out.write(f"\r\033[2K  {frame} \033[2m{label}\033[0m")
+
+                # Draw agent lines below
+                for line in agent_lines:
+                    out.write(f"\n\r\033[2K{line}")
+
+                # Clear leftover lines from a frame that had more agents
+                extra = prev_agent_lines - len(agent_lines)
+                if extra > 0:
+                    for _ in range(extra):
+                        out.write(f"\n\r\033[2K")
+                    out.write(f"\033[{extra}A")
+
                 out.flush()
+                prev_agent_lines = len(agent_lines)
                 i += 1
                 await asyncio.sleep(0.08)
         finally:
-            out.write("\r\033[2K\r")
+            # Clear spinner line + all agent lines, leave cursor at col 0 of spinner line
+            if prev_agent_lines > 0:
+                out.write(f"\033[{prev_agent_lines}A")
+            out.write("\r\033[2K")
+            for _ in range(prev_agent_lines):
+                out.write(f"\n\r\033[2K")
+            if prev_agent_lines > 0:
+                out.write(f"\033[{prev_agent_lines}A")
+            out.write("\r")
             out.flush()
 
     # ── Tool-call block helpers ───────────────────────────────────────────────
+
+    async def _run_spinner(self) -> None:
+        """Animate spinner + a compact live sub-agent panel via sys.__stdout__."""
+        import time as _time
+
+        out = sys.__stdout__
+        frames = _SPINNER_FRAMES
+        i = 0
+        prev_agent_lines = 0
+
+        def _clip(text: str, max_len: int) -> str:
+            text = str(text or "").strip()
+            if max_len <= 0:
+                return ""
+            if len(text) <= max_len:
+                return text
+            if max_len == 1:
+                return "…"
+            return text[: max_len - 1] + "…"
+
+        def _status_badge(status: str) -> str:
+            normalized = (status or "").lower()
+            if normalized == "done":
+                return f"{_GRN}[DONE]{_R}"
+            if normalized == "error":
+                return f"{_RED}[ERR ]{_R}"
+            if normalized == "closed":
+                return f"{_DIM}[EXIT]{_R}"
+            if normalized == "tool_use":
+                return f"{_YLW}[TOOL]{_R}"
+            return f"{_BLU}[RUN ]{_R}"
+
+        try:
+            while not self._spinner_stop.is_set():
+                frame = frames[i % len(frames)]
+                spinner_label = self._spinner_label
+
+                _now_mono = _time.monotonic()
+                to_remove = [
+                    aid for aid, info in self._agent_statuses.items()
+                    if info.get("status") in ("done", "closed", "error")
+                    and info.get("_done_at") is not None
+                    and (_now_mono - info["_done_at"]) > 2.0
+                ]
+                for aid in to_remove:
+                    del self._agent_statuses[aid]
+
+                agent_infos = list(self._agent_statuses.items())
+                active_agents = sum(
+                    1 for _, info in agent_infos
+                    if info.get("status") not in ("done", "closed", "error")
+                )
+
+                agent_lines: list[str] = []
+                if agent_infos:
+                    spinner_label = (
+                        f"{spinner_label}  ·  {active_agents} sub-agent"
+                        f"{'s' if active_agents != 1 else ''} active"
+                    )
+                    term_w = shutil.get_terminal_size((120, 24)).columns
+                    max_name_len = max(
+                        (_visible_len(str(info.get("display_name", aid) or aid)) for aid, info in agent_infos),
+                        default=16,
+                    )
+                    name_w = max(16, min(26, max_name_len))
+                    activity_w = max(18, min(42, term_w - name_w - 24))
+                    done_agents = sum(1 for _, info in agent_infos if info.get("status") == "done")
+                    tool_agents = sum(1 for _, info in agent_infos if info.get("status") == "tool_use")
+
+                    agent_lines.append(
+                        f"  {_bd('╭─')} {_b('Agents')} "
+                        f"{_d(f'· {len(agent_infos)} total · {done_agents} done · {tool_agents} in tools')}"
+                    )
+                    for aid, info in agent_infos:
+                        color = info.get("color", "")
+                        display_name = _clip(str(info.get("display_name", aid) or aid), name_w)
+                        activity = _clip(str(info.get("activity", "") or "Idle"), activity_w)
+                        tokens = info.get("tokens", 0)
+                        status = str(info.get("status", "") or "")
+                        name_cell = _pad_visible(f"{color}{display_name}{_R}", name_w)
+                        tok_str = f"  {_d(f'{tokens:,} tok')}" if tokens else ""
+                        agent_lines.append(
+                            f"  {_bd('│')} {name_cell}  {_status_badge(status)}  {_s(activity)}{tok_str}"
+                        )
+
+                    footer_text = (
+                        f"waiting on {active_agents} running agent{'s' if active_agents != 1 else ''}"
+                        if active_agents > 0
+                        else "all sub-agents completed"
+                    )
+                    agent_lines.append(f"  {_bd('╰─')} {_d(footer_text)}")
+
+                if prev_agent_lines > 0:
+                    out.write(f"\033[{prev_agent_lines}A")
+
+                out.write(f"\r\033[2K  {frame} {_d(spinner_label)}")
+
+                for line in agent_lines:
+                    out.write(f"\n\r\033[2K{line}")
+
+                extra = prev_agent_lines - len(agent_lines)
+                if extra > 0:
+                    for _ in range(extra):
+                        out.write(f"\n\r\033[2K")
+                    out.write(f"\033[{extra}A")
+
+                out.flush()
+                prev_agent_lines = len(agent_lines)
+                i += 1
+                await asyncio.sleep(0.08)
+        finally:
+            if prev_agent_lines > 0:
+                out.write(f"\033[{prev_agent_lines}A")
+            out.write("\r\033[2K")
+            for _ in range(prev_agent_lines):
+                out.write(f"\n\r\033[2K")
+            if prev_agent_lines > 0:
+                out.write(f"\033[{prev_agent_lines}A")
+            out.write("\r")
+            out.flush()
 
     @staticmethod
     def _format_command(command: list[str]) -> tuple[str, str]:
@@ -1700,6 +1911,7 @@ class Interface:
 
     async def _consume_events(self) -> None:  # noqa: C901
         from bob.protocol.events import (
+            AgentStatusEvent,
             BackgroundTerminalOutputEvent,
             HistoryCompactedEvent,
             ErrorEvent,
@@ -2161,6 +2373,20 @@ class Interface:
 
                 elif isinstance(msg, InfoEvent):
                     _p(f"  {_bd('·')} {_s(msg.message)}")
+
+                elif isinstance(msg, AgentStatusEvent):
+                    import time as _time
+                    _done_at = None
+                    if msg.status in ("done", "closed", "error"):
+                        _done_at = _time.monotonic()
+                    self._agent_statuses[msg.agent_id] = {
+                        "color": msg.color,
+                        "display_name": msg.display_name or msg.agent_id,
+                        "activity": msg.activity,
+                        "tokens": msg.tokens,
+                        "status": msg.status,
+                        "_done_at": _done_at,
+                    }
 
                 elif isinstance(msg, BackgroundTerminalOutputEvent):
                     _p(f"  {_bd('·')} {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
@@ -3257,7 +3483,7 @@ class Interface:
                         f"{_bd('›')} "
                     )
                     try:
-                        raw = await ps.prompt_async(_approval_prompt)
+                        raw = await PromptSession().prompt_async(_approval_prompt)
                     except EOFError:
                         raw = "n"
                     except KeyboardInterrupt:
@@ -3282,119 +3508,6 @@ class Interface:
                         return
         finally:
             await self._stop_spinner()
-
-    async def _handle_model_picker(self, search: str) -> None:
-        """Interactive /model picker — filter by search string, pick by number."""
-        from bob.llm.catalog import get_catalog
-
-        catalog = get_catalog()
-        current = self._config.model
-
-        # ── No catalog: fall back to direct set or show current ──────────
-        if not catalog.is_populated():
-            if search and not search.isdigit():
-                # Treat as a direct model name — backward-compat
-                self._config = self._config.model_copy(update={"model": search})
-                self._session.client = self._session._make_client(search)
-                _p(f"  {_g('✓')} Model set to: {_b(search)}")
-                _p(f"  {_d('(tip: run  python scripts/build_model_catalog.py  for the full picker)')}")
-            else:
-                _p(f"  current model: {_b(current)}")
-                _p(f"  {_d('Model catalog not built — run: python scripts/build_model_catalog.py')}")
-                _p(f"  {_d('Usage: /model <name>   e.g.  /model claude-3-5-sonnet-20241022')}")
-            return
-
-        # ── Filter models ─────────────────────────────────────────────────
-        all_models = catalog.list_models(status="active")
-        if search:
-            s = search.lower()
-            models = [
-                m for m in all_models
-                if s in m["model_id"].lower()
-                or s in (m.get("provider") or "").lower()
-                or s in (m.get("family") or "").lower()
-                or s in (m.get("display_name") or "").lower()
-            ]
-        else:
-            models = all_models
-
-        if not models:
-            _p(f"  {_y('⚠')}  No models found matching {_b(repr(search))}")
-            _p(f"  {_d('Try: /model gpt   /model claude   /model gemini   /model llama')}")
-            return
-
-        MAX_ROWS = 30
-        shown = models[:MAX_ROWS]
-
-        # ── Display table ─────────────────────────────────────────────────
-        _p()
-        header = f"  {'#':<4} {'Model ID':<44} {'Provider':<12} {'Context':<9} {'$/1M in  out'}"
-        _p(_d(header))
-        _p(_d("  " + "─" * (len(header) - 2)))
-
-        for i, m in enumerate(shown, 1):
-            mid      = m["model_id"]
-            provider = m.get("provider") or ""
-            ctx      = m.get("context_window")
-            ctx_str  = f"{ctx // 1000}K" if ctx else "—"
-            inp      = m.get("input_price_per_1m")
-            out      = m.get("output_price_per_1m")
-            if inp is not None and out is not None:
-                price_str = f"${inp:<6.2f}  ${out:.2f}"
-            else:
-                price_str = "—"
-            marker = f" {_g('←')}" if mid == current else ""
-            num    = _d(f"{i}.")
-            _p(f"  {num:<6} {mid:<44} {_d(provider):<12} {_d(ctx_str):<9} {_d(price_str)}{marker}")
-
-        if len(models) > MAX_ROWS:
-            _p(_d(f"\n  … {len(models) - MAX_ROWS} more — narrow your search (e.g. /model gemini-2)"))
-
-        _p()
-        _p(_d(f"  current: {current}"))
-        _p()
-
-        # ── Prompt for selection ──────────────────────────────────────────
-        try:
-            ps = PromptSession()
-            raw = await ps.prompt_async(
-                ANSI(f"  {_c('Enter number or model name')} {_d('(Enter = cancel)')} {_cb('›')} ")
-            )
-            raw = raw.strip()
-        except (KeyboardInterrupt, EOFError):
-            _p(_d("  cancelled"))
-            return
-
-        if not raw:
-            _p(_d("  cancelled"))
-            return
-
-        # ── Resolve selection ─────────────────────────────────────────────
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(shown):
-                chosen = shown[idx]["model_id"]
-            else:
-                _p(f"  {_y('⚠')}  Invalid number — must be 1–{len(shown)}")
-                return
-        else:
-            chosen = raw  # direct model name typed by user
-
-        # ── Apply ─────────────────────────────────────────────────────────
-        self._config = self._config.model_copy(update={"model": chosen})
-        self._session.client = self._session._make_client(chosen)
-
-        # Show what we switched to (with pricing if available)
-        info = catalog.get_model(chosen)
-        if info:
-            ctx   = info.get("context_window")
-            inp   = info.get("input_price_per_1m")
-            out   = info.get("output_price_per_1m")
-            ctx_s = f"  context: {ctx // 1000}K" if ctx else ""
-            pr_s  = f"  ${inp:.2f}/${out:.2f} per 1M" if (inp is not None and out is not None) else ""
-            _p(f"  {_g('✓')} Model set to: {_b(chosen)}{_d(ctx_s + pr_s)}")
-        else:
-            _p(f"  {_g('✓')} Model set to: {_b(chosen)}")
 
     async def _load_model_picker_models(self) -> list[dict]:
         """Return model metadata for the interactive picker."""
@@ -3447,6 +3560,20 @@ class Interface:
         self._config = self._config.model_copy(update={"model": model_name})
         self._session.config = self._session.config.model_copy(update={"model": model_name})
         self._session.client = self._session._make_client(model_name)
+        # Persist the choice to the user-global config so it survives across sessions.
+        from bob.config.editor import set_value
+        try:
+            set_value("model", model_name)
+        except Exception:
+            pass  # Best-effort: don't crash the UI if the config file can't be written.
+
+    def _persist_current_model(self) -> None:
+        """Save the currently active model to the user-global config on exit."""
+        from bob.config.editor import set_value
+        try:
+            set_value("model", self._config.model)
+        except Exception:
+            pass  # Best-effort: don't crash on exit if the config file can't be written.
 
     async def _handle_model_picker(self, search: str) -> None:
         """Interactive /model picker with immediate searchable dropdown."""
@@ -3719,15 +3846,28 @@ class Interface:
                         break
 
             finally:
-                event_task.cancel()
                 try:
-                    await event_task
-                except asyncio.CancelledError:
+                    event_task.cancel()
+                    try:
+                        await event_task
+                    except asyncio.CancelledError:
+                        pass
+                except BaseException:
+                    pass
+                try:
+                    self._persist_current_model()
+                except BaseException:
                     pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-async def run_interface(session, config: BobConfig) -> None:
-    """Called from bob/cli/main.py after BobSession is started."""
-    await Interface(session=session, config=config).run()
+async def run_interface(session, config: BobConfig) -> str:
+    """Called from bob/cli/main.py after BobSession is started.
+
+    Returns the model ID that was active at the end of the session so the
+    caller can persist it as the default for future conversations.
+    """
+    interface = Interface(session=session, config=config)
+    await interface.run()
+    return interface._config.model

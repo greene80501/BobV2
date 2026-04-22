@@ -602,6 +602,16 @@ class DebugEvent(BaseModel):
     data: Optional[dict[str, Any]] = None
 
 
+class AgentStatusEvent(BaseModel):
+    type: Literal["agent_status"] = "agent_status"
+    agent_id: str = ""     # short 8-char ID
+    display_name: str = "" # human-readable agent label
+    color: str = ""        # ANSI color code assigned to this agent
+    status: str = ""       # "running" | "tool_use" | "done" | "closed" | "error"
+    activity: str = ""     # human-readable: "Thinking…", "Read File…", "Done · 312 tok"
+    tokens: int = 0        # cumulative output token count
+
+
 # ===========================================================================
 # Token budget / cost
 # ===========================================================================
@@ -737,6 +747,7 @@ EventMsg = Annotated[
         WarningEvent,
         InfoEvent,
         DebugEvent,
+        AgentStatusEvent,
         # Token budget / cost
         TokenBudgetEvent,
         CostEstimateEvent,

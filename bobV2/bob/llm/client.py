@@ -89,6 +89,41 @@ def _patch_message_tool_names(messages: list[dict], name_map: dict[str, str]) ->
     return out
 
 
+def _merge_provider_specific_fields(*sources: Any) -> Optional[dict[str, Any]]:
+    merged: dict[str, Any] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            if value is not None and key not in merged:
+                merged[key] = value
+    return merged or None
+
+
+def _history_function_call_to_chat_tool_call(fc: dict[str, Any]) -> dict[str, Any]:
+    tool_call = {
+        "id": fc["call_id"],
+        "type": "function",
+        "function": {
+            "name": fc["name"],
+            "arguments": fc.get("arguments", "{}"),
+        },
+    }
+    provider_specific_fields = _merge_provider_specific_fields(
+        fc.get("provider_specific_fields")
+    )
+    if provider_specific_fields:
+        tool_call["provider_specific_fields"] = provider_specific_fields
+    return tool_call
+
+
+def _extract_tool_call_provider_specific_fields(tc: Any, fn: Any = None) -> Optional[dict[str, Any]]:
+    return _merge_provider_specific_fields(
+        getattr(tc, "provider_specific_fields", None),
+        getattr(fn, "provider_specific_fields", None),
+    )
+
+
 @dataclass
 class TextDeltaEvent:
     delta: str
@@ -100,6 +135,7 @@ class ToolCallEvent:
     name: str
     input: dict[str, Any]
     reasoning_content: str = ""
+    provider_specific_fields: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -227,16 +263,7 @@ def _to_chat_messages(
             j = i + 1
             while j < len(items) and items[j].get("type") == "function_call":
                 fc = items[j]
-                tool_calls.append(
-                    {
-                        "id": fc["call_id"],
-                        "type": "function",
-                        "function": {
-                            "name": fc["name"],
-                            "arguments": fc.get("arguments", "{}"),
-                        },
-                    }
-                )
+                tool_calls.append(_history_function_call_to_chat_tool_call(fc))
                 j += 1
 
             if tool_calls:
@@ -261,16 +288,7 @@ def _to_chat_messages(
             tool_calls = []
             while i < len(items) and items[i].get("type") == "function_call":
                 fc = items[i]
-                tool_calls.append(
-                    {
-                        "id": fc["call_id"],
-                        "type": "function",
-                        "function": {
-                            "name": fc["name"],
-                            "arguments": fc.get("arguments", "{}"),
-                        },
-                    }
-                )
+                tool_calls.append(_history_function_call_to_chat_tool_call(fc))
                 i += 1
             messages.append(
                 {
@@ -464,7 +482,7 @@ class LiteLLMClient:
         kwargs.update(self._provider_kwargs)
         kwargs["stream_options"] = {"include_usage": True}
 
-        tool_buffers: dict[int, dict[str, str]] = {}
+        tool_buffers: dict[int, dict[str, Any]] = {}
         final_usage: Any = None
         reasoning_parts: list[str] = []
 
@@ -502,19 +520,33 @@ class LiteLLMClient:
                 if tc_deltas:
                     for tc in tc_deltas:
                         idx = int(getattr(tc, "index", 0) or 0)
+                        fn = getattr(tc, "function", None)
+                        fn_name = getattr(fn, "name", None) if fn else None
+                        fn_args = getattr(fn, "arguments", None) if fn else None
+                        tc_id = getattr(tc, "id", None)
+
+                        # Some providers (e.g. Gemini via VertexAI) send all
+                        # parallel tool calls with index=0 instead of distinct
+                        # indices. When a new name arrives on an already-named
+                        # buffer, allocate a fresh slot rather than concatenating.
+                        if fn_name and idx in tool_buffers and tool_buffers[idx]["name"]:
+                            idx = max(tool_buffers.keys()) + 1
+
                         if idx not in tool_buffers:
                             tool_buffers[idx] = {"id": "", "name": "", "args": ""}
                         buf = tool_buffers[idx]
-                        if getattr(tc, "id", None):
-                            buf["id"] = tc.id
-                        fn = getattr(tc, "function", None)
-                        if fn:
-                            fn_name = getattr(fn, "name", None)
-                            fn_args = getattr(fn, "arguments", None)
-                            if fn_name:
-                                buf["name"] += fn_name
-                            if fn_args:
-                                buf["args"] += fn_args
+                        if tc_id:
+                            buf["id"] = tc_id
+                        if fn_name:
+                            buf["name"] += fn_name
+                        if fn_args:
+                            buf["args"] += fn_args
+                        provider_specific_fields = _extract_tool_call_provider_specific_fields(tc, fn)
+                        if provider_specific_fields:
+                            buf["provider_specific_fields"] = _merge_provider_specific_fields(
+                                buf.get("provider_specific_fields"),
+                                provider_specific_fields,
+                            )
 
                 usage = getattr(chunk, "usage", None)
                 if usage and (
@@ -542,6 +574,7 @@ class LiteLLMClient:
                 name=original_name,
                 input=parsed,
                 reasoning_content="".join(reasoning_parts),
+                provider_specific_fields=buf.get("provider_specific_fields"),
             )
 
         if final_usage is not None:

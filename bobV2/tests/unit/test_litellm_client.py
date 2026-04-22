@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from bob.llm.client import _to_chat_messages
+from types import SimpleNamespace
+
+from bob.llm.client import (
+    _extract_tool_call_provider_specific_fields,
+    _to_chat_messages,
+)
 
 
 def test_to_chat_messages_preserves_reasoning_content_for_assistant_tool_calls() -> None:
@@ -64,3 +69,57 @@ def test_to_chat_messages_preserves_reasoning_content_for_plain_assistant_messag
             "reasoning_content": "Short private reasoning.",
         }
     ]
+
+
+def test_to_chat_messages_preserves_tool_call_provider_specific_fields() -> None:
+    items = [
+        {
+            "role": "assistant",
+            "content": [],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "spawn_agent",
+            "arguments": "{\"task\":\"inspect\"}",
+            "provider_specific_fields": {"thought_signature": "sig-123"},
+        },
+    ]
+
+    messages = _to_chat_messages("", items, model="vertex_ai/gemini-3-flash-preview")
+
+    assert messages == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"task\":\"inspect\"}",
+                    },
+                    "provider_specific_fields": {"thought_signature": "sig-123"},
+                }
+            ],
+        }
+    ]
+
+
+def test_extract_tool_call_provider_specific_fields_merges_tool_and_function_levels() -> None:
+    function = SimpleNamespace(provider_specific_fields={"other": "value"})
+    tool_call = SimpleNamespace(
+        provider_specific_fields={"thought_signature": "sig-123"},
+        function=function,
+    )
+
+    provider_specific_fields = _extract_tool_call_provider_specific_fields(
+        tool_call,
+        function,
+    )
+
+    assert provider_specific_fields == {
+        "thought_signature": "sig-123",
+        "other": "value",
+    }

@@ -605,12 +605,15 @@ async def run_turn(
                     assistant_item["reasoning_content"] = reasoning_text
                 history_items.append(assistant_item)
             for tc in tool_calls:
-                history_items.append({
+                tool_call_item = {
                     "type": "function_call",
                     "call_id": tc.id,
                     "name": tc.name,
                     "arguments": _json.dumps(tc.input),
-                })
+                }
+                if tc.provider_specific_fields:
+                    tool_call_item["provider_specific_fields"] = tc.provider_specific_fields
+                history_items.append(tool_call_item)
 
             if history_items:
                 session.context_manager.record_items(history_items)

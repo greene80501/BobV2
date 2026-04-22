@@ -80,7 +80,13 @@ def main(
                 )
             asyncio.create_task(_send_initial())
 
-        await run_interface(session=session, config=config)
+        final_model = await run_interface(session=session, config=config)
+        # Persist the last active model so the next conversation starts with it.
+        from bob.config.editor import set_value
+        try:
+            set_value("model", final_model)
+        except Exception:
+            pass
         await session.shutdown()
 
     try:
