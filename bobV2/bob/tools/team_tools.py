@@ -5,7 +5,10 @@ from typing import Any
 TEAM_CREATE_DESCRIPTION = (
     "Create a named team of agents that share a common set of instructions. "
     "All agents spawned into this team will have the team's instructions "
-    "prepended to their task context."
+    "prepended to their task context. "
+    "Use teams when you need multiple agents with the same specialised role "
+    "(e.g., a 'frontend-team' that always uses React hooks, or a 'test-team' "
+    "that enforces pytest fixtures)."
 )
 
 TEAM_CREATE_SCHEMA = {
@@ -29,7 +32,8 @@ TEAM_CREATE_SCHEMA = {
 
 TEAM_SPAWN_AGENT_DESCRIPTION = (
     "Spawn a new agent as a member of an existing team. The team's shared "
-    "instructions are automatically prepended to the agent's task."
+    "instructions are automatically prepended to the agent's task. "
+    "Use this to create multiple parallel workers with the same baseline context."
 )
 
 TEAM_SPAWN_AGENT_SCHEMA = {

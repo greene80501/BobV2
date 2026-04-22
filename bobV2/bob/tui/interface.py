@@ -1006,12 +1006,19 @@ class Interface:
         """Right-side hint shown on the input line."""
         return ANSI("\033[2m→ Enter to send\033[0m │ ")
 
+    @staticmethod
+    def _input_box_dash_width(term_width: int | None = None) -> int:
+        """Return the dash width used by the bordered prompt box."""
+        width = term_width
+        if width is None:
+            width = shutil.get_terminal_size((120, 24)).columns
+        return max(40, width) - 3
+
     def _print_input_box_top(self) -> None:
         """Print the top border of the input box (into scrollback)."""
-        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
         DIM    = "\033[2m"
         RST    = "\033[0m"
-        box_w  = term_w - 3
+        box_w  = self._input_box_dash_width()
         _p(f"{DIM}╭{'─' * box_w}╮{RST}")
 
     def _footer_toolbar(self) -> ANSI:
@@ -1019,7 +1026,7 @@ class Interface:
         term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
         DIM    = "\033[2m"
         RST    = "\033[0m"
-        box_w  = term_w - 3  # match top border width
+        box_w  = self._input_box_dash_width(term_w)
         in_t   = self._total_input_tokens
         out_t  = self._total_output_tokens
         counts = f" in: {in_t:,}  out: {out_t:,} "
@@ -1029,10 +1036,9 @@ class Interface:
 
     def _print_input_box_bottom(self) -> None:
         """Print the bottom border of the input box (into scrollback)."""
-        term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
         DIM    = "\033[2m"
         RST    = "\033[0m"
-        box_w  = term_w - 3  # match top border width
+        box_w  = self._input_box_dash_width()
         bottom = "╰" + "─" * box_w + "╯"
         _p(f"{DIM}{bottom}{RST}")
 
@@ -1054,7 +1060,8 @@ class Interface:
         from prompt_toolkit.key_binding.bindings.vi import load_vi_bindings
 
         term_w = max(40, shutil.get_terminal_size((120, 24)).columns)
-        box_w  = term_w - 2
+        box_w  = self._input_box_dash_width(term_w)
+        row_w = box_w + 2
         DIM, BLUE, RST = "\033[2m", "\033[38;2;21;98;254m", "\033[0m"
 
         buf = ps.default_buffer
@@ -1136,11 +1143,17 @@ class Interface:
         layout = Layout(
             FloatContainer(
                 content=HSplit([
-                    Window(height=1, content=FormattedTextControl(_top)),
+                    Window(
+                        height=1,
+                        width=Dimension.exact(row_w),
+                        dont_extend_width=True,
+                        content=FormattedTextControl(_top),
+                    ),
                     VSplit([
                         Window(
                             content=input_ctrl,
                             wrap_lines=True,
+                            width=Dimension.exact(row_w - 1),
                             height=Dimension(min=1, max=8),
                             dont_extend_height=True,
                             get_line_prefix=_line_prefix,
@@ -1150,8 +1163,13 @@ class Interface:
                             content=FormattedTextControl(lambda: ANSI(f"{_BRD}│{RST}")),
                             dont_extend_height=True,
                         ),
-                    ]),
-                    Window(height=1, content=FormattedTextControl(_bottom)),
+                    ], width=Dimension.exact(row_w)),
+                    Window(
+                        height=1,
+                        width=Dimension.exact(row_w),
+                        dont_extend_width=True,
+                        content=FormattedTextControl(_bottom),
+                    ),
                     Window(height=1),
                     Window(height=1, content=FormattedTextControl(_status)),
                 ]),
@@ -1746,12 +1764,12 @@ class Interface:
 
         Rules:
         - apply_patch  → ("Patch", "file1, file2") extracted from patch text
-        - cmd.exe /C … → ("Bash", inner command)
-        - powershell … → ("Bash", inner command, stripped of -Command flag)
-        - everything else → ("Bash", joined command, truncated to 120 chars)
+        - cmd.exe /C … → ("Cmd", inner command)
+        - powershell … → ("PowerShell", inner command with wrapper flags stripped)
+        - everything else → ("Shell", joined command, truncated to 120 chars)
         """
         if not command:
-            return "Bash", ""
+            return "Shell", ""
 
         cmd0 = command[0].lower()
 
@@ -1770,18 +1788,20 @@ class Interface:
         # cmd.exe /C <rest>: strip wrapper, show inner command
         if cmd0 in ("cmd.exe", "cmd") and len(command) >= 3 and command[1].upper() == "/C":
             inner = " ".join(command[2:])
-            return "Bash", _truncate_cmd(inner)
+            return "Cmd", _truncate_cmd(inner)
 
-        # powershell: strip powershell.exe/-Command/-c flags
-        if "powershell" in cmd0:
+        # PowerShell wrappers: strip wrapper flags, but keep flags belonging to the inner command.
+        if "powershell" in cmd0 or cmd0 in ("pwsh", "pwsh.exe"):
             parts = command[1:]
-            # Drop -Command / -c / -NonInteractive / -NoProfile etc.
-            cleaned = [p for p in parts if not p.startswith("-")]
-            inner = " ".join(cleaned).strip() or " ".join(parts)
-            return "Bash", _truncate_cmd(inner)
+            while parts and parts[0].startswith("-"):
+                flag = parts.pop(0)
+                if flag.lower() in ("-command", "-c"):
+                    break
+            inner = " ".join(parts).strip() or " ".join(command[1:])
+            return "PowerShell", _truncate_cmd(inner)
 
         # Everything else
-        return "Bash", _truncate_cmd(" ".join(command))
+        return "Shell", _truncate_cmd(" ".join(command))
 
     def _print_tool_header(self, tool: str, arg: str, suffix: str = "") -> None:
         """Print a compact framed header for a tool block."""

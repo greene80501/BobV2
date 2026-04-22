@@ -211,6 +211,9 @@ class BobSession:
         from bob.tools.multi_agent.resume_agent import (
             resume_agent_handler, RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA,
         )
+        from bob.tools.multi_agent.run_workflow import (
+            run_workflow_handler, RUN_WORKFLOW_DESCRIPTION, RUN_WORKFLOW_SCHEMA,
+        )
         from bob.tools.task_create import (
             task_create_handler, TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA,
         )
@@ -382,6 +385,9 @@ class BobSession:
         )
         self.tool_registry.register(
             "resume_agent", RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA, resume_agent_handler
+        )
+        self.tool_registry.register(
+            "run_workflow", RUN_WORKFLOW_DESCRIPTION, RUN_WORKFLOW_SCHEMA, run_workflow_handler
         )
         # Task management tools
         self.tool_registry.register(
@@ -869,6 +875,33 @@ class BobSession:
                 "- Be thorough and educational"
             )
         # NORMAL style has no extra directive
+
+        # Add collaboration mode directive
+        from bob.protocol.config_types import CollaborationModeKind
+        collab_mode = self.config.collaboration_mode.mode
+        if collab_mode == CollaborationModeKind.PLAN:
+            base += (
+                "\n\n# COLLABORATION MODE: PLAN\n"
+                "- You are in planning mode. Use read-only tools and spawn plan agents to explore.\n"
+                "- Do NOT write or edit files until the user approves the plan.\n"
+                "- Produce a detailed, step-by-step plan with clear deliverables."
+            )
+        elif collab_mode == CollaborationModeKind.PAIR_PROGRAMMING:
+            base += (
+                "\n\n# COLLABORATION MODE: PAIR PROGRAMMING\n"
+                "- Work closely with the user. Explain your reasoning as you go.\n"
+                "- Suggest alternatives and ask clarifying questions when appropriate.\n"
+                "- Spawn implementer agents only for well-defined, independent sub-tasks."
+            )
+        elif collab_mode == CollaborationModeKind.EXECUTE:
+            base += (
+                "\n\n# COLLABORATION MODE: EXECUTE\n"
+                "- Focus on getting things done with minimal back-and-forth.\n"
+                "- Aggressively parallelise: spawn multiple implementer agents for independent changes.\n"
+                "- After implementation, spawn a review agent to verify quality.\n"
+                "- Only ask the user for input when truly blocked."
+            )
+        # DEFAULT mode has no extra directive
 
         self._system_prompt = base
 

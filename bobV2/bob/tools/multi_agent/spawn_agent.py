@@ -5,7 +5,11 @@ from typing import Any
 SPAWN_AGENT_DESCRIPTION = (
     "Spawn a sub-agent to handle a specific subtask independently. "
     "The sub-agent runs in its own context and returns its result when complete. "
-    "Use for parallelisable work or tasks that benefit from a clean context."
+    "Use for parallelisable work or tasks that benefit from a clean context. "
+    "Examples: (1) spawn multiple explore agents to search different directories in parallel, "
+    "(2) spawn a plan agent to design a refactor while you continue talking to the user, "
+    "(3) spawn an implementer agent for each independent file change, "
+    "(4) spawn a review agent after making edits to check for bugs."
 )
 
 SPAWN_AGENT_SCHEMA = {
