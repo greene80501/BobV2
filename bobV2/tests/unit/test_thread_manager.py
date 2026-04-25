@@ -14,8 +14,10 @@ class _FakeSession:
         self.bob_home = bob_home
         self.cwd = cwd
         self.session_id = session_id
+        self.emitted: list[object] = []
 
-    async def _emit(self, _event) -> None:
+    async def _emit(self, event) -> None:
+        self.emitted.append(event)
         return None
 
 
@@ -152,3 +154,16 @@ async def test_close_clears_queue_and_resume_reactivates_failed_agent(tmp_path: 
     assert snap["status"] == "idle"
     assert rec.status == "idle"
     assert rec.closed_at_ts is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_close_does_not_emit_closed_status_event(tmp_path: Path) -> None:
+    session = _FakeSession(bob_home=tmp_path / ".bob", cwd=tmp_path)
+    manager = ThreadManager(session)
+    rec = _mk_record(agent_id="a1", path="a1", status="idle")
+    manager._agents[rec.id] = rec
+
+    await manager.close_agent(rec.id, reason="workflow_node_complete:research")
+
+    assert rec.status == "closed"
+    assert session.emitted == []

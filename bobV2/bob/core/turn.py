@@ -52,6 +52,18 @@ TRUSTED_COMMANDS: frozenset[str] = frozenset([
 ])
 
 
+def _format_missing_provider_auth_message(provider: str, missing: list[str], env_vars: tuple[str, ...]) -> str:
+    parts = [f"Missing auth for provider '{provider}'."]
+    if "api_key" in missing and env_vars:
+        joined = ", ".join(env_vars)
+        parts.append(f"Set one of: {joined}.")
+    elif missing:
+        parts.append("Missing settings: " + ", ".join(missing) + ".")
+    if provider == "kimi":
+        parts.append("Kimi uses an OpenAI-compatible endpoint, but it still requires a Kimi credential.")
+    return " ".join(parts)
+
+
 def _canonicalize_command(command: list[str]) -> list[str]:
     """Strip shell wrapper tokens to get the real command for trust matching.
 
@@ -448,9 +460,29 @@ async def run_turn(
             # ----------------------------------------------------------
             # Stream from model
             # ----------------------------------------------------------
-            from bob.llm.compatibility import build_model_request_params
+            from bob.llm.compatibility import (
+                build_model_request_params,
+                get_provider_profile,
+            )
 
             compatibility, _provider_auth = session.get_model_runtime(session.config.model)
+            if _provider_auth.missing:
+                profile = get_provider_profile(compatibility.provider)
+                await emit(ErrorEvent(
+                    type="error",
+                    message=_format_missing_provider_auth_message(
+                        compatibility.provider,
+                        list(_provider_auth.missing),
+                        profile.api_key_env_vars,
+                    ),
+                ))
+                await emit(TurnEndedEvent(
+                    type="turn_ended",
+                    turn_id=turn_id,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                ))
+                return
             extra_params = build_model_request_params(session.config, compatibility)
 
             try:

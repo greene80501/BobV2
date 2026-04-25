@@ -1,4 +1,4 @@
-"""
+﻿"""
 bob terminal interface — inline chat UI mirroring Claude Code's visual style.
 
 Output split:
@@ -15,6 +15,7 @@ Main-loop contract
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import html
 import os
 import re
@@ -109,6 +110,7 @@ def _truncate_cmd(s: str, max_len: int = 120) -> str:
 
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+_UI_LOG_SINK = None
 
 
 def _visible_len(text: str) -> int:
@@ -119,9 +121,18 @@ def _pad_visible(text: str, width: int) -> str:
     return text + (" " * max(0, width - _visible_len(text)))
 
 
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
 def _p(s: str = "", end: str = "\n") -> None:
     """Print ANSI text via prompt_toolkit — safe inside patch_stdout on all platforms."""
     print_formatted_text(ANSI(s + end), end="")
+    if _UI_LOG_SINK is not None:
+        try:
+            _UI_LOG_SINK(_strip_ansi(s + end))
+        except Exception:
+            pass
 
 
 def _render_error(message: str, tool_name: str | None = None, tool_input: dict | None = None) -> None:
@@ -993,6 +1004,89 @@ class Interface:
         self._tool_call_inputs: dict[str, dict] = {}
         # Sub-agent status strip: agent_id -> {color, activity, tokens, status, _done_at}
         self._agent_statuses: dict[str, dict] = {}
+        self._last_spinner_snapshot: str = ""
+        self._session_log_path = self._make_session_log_path()
+        self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._session_log_handle = self._session_log_path.open("a", encoding="utf-8", buffering=1)
+        self._log_ui_line(f"[session] log started for session={getattr(self._session, 'session_id', 'unknown')}")
+
+    def _make_session_log_path(self) -> Path:
+        logs_dir = self._session.bob_home / "logs" / "tui"
+        session_id = getattr(self._session, "session_id", "session")
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        return logs_dir / f"{stamp}-{session_id}.log"
+
+    def _log_ui_line(self, text: str) -> None:
+        cleaned = str(text).replace("\r", "")
+        if not cleaned:
+            return
+        if not cleaned.endswith("\n"):
+            cleaned += "\n"
+        self._session_log_handle.write(cleaned)
+        self._session_log_handle.flush()
+
+    def _log_spinner_snapshot(self, spinner_label: str, agent_lines: list[str]) -> None:
+        snapshot = "\n".join([_strip_ansi(f"SPINNER {spinner_label}"), *(_strip_ansi(line) for line in agent_lines)])
+        if snapshot != self._last_spinner_snapshot:
+            self._last_spinner_snapshot = snapshot
+            self._log_ui_line(snapshot)
+
+    def _log_terminal_mutation(self, action: str, **details: object) -> None:
+        suffix = ""
+        if details:
+            parts = [f"{key}={value}" for key, value in details.items()]
+            suffix = " " + " ".join(parts)
+        self._log_ui_line(f"[terminal] {action}{suffix}")
+
+    def _log_terminal_block(self, label: str, lines: list[str]) -> None:
+        if not lines:
+            return
+        text = "\n".join(_strip_ansi(line) for line in lines)
+        self._log_ui_line(f"[terminal-block] {label}\n{text}")
+
+    def _log_event_message(self, msg: object) -> None:
+        event_type = getattr(msg, "type", msg.__class__.__name__)
+        try:
+            payload = msg.model_dump() if hasattr(msg, "model_dump") else str(msg)
+        except Exception:
+            payload = str(msg)
+        text = str(payload)
+        if len(text) > 4000:
+            text = text[:4000] + "... [truncated]"
+        self._log_ui_line(f"[event] type={event_type} payload={text}")
+
+    def _record_agent_status(
+        self,
+        agent_id: str,
+        *,
+        color: str,
+        display_name: str,
+        activity: str,
+        tokens: int,
+        status: str,
+    ) -> None:
+        import time as _time
+
+        _done_at = None
+        if status in ("done", "closed", "error"):
+            _done_at = _time.monotonic()
+        self._agent_statuses[agent_id] = {
+            "color": color,
+            "display_name": display_name or agent_id,
+            "activity": activity,
+            "tokens": tokens,
+            "status": status,
+            "_done_at": _done_at,
+        }
+        self._log_ui_line(
+            f"[agent-panel] update id={agent_id} status={status} tokens={tokens} activity={_strip_ansi(activity)}"
+        )
+
+    def _clear_agent_statuses(self, reason: str) -> None:
+        if self._agent_statuses:
+            removed = ", ".join(sorted(self._agent_statuses.keys()))
+            self._log_ui_line(f"[agent-panel] cleared reason={reason} removed={removed}")
+        self._agent_statuses.clear()
 
     # ── Dynamic prompt & footer toolbar ──────────────────────────────────────
 
@@ -1503,19 +1597,24 @@ class Interface:
         out = sys.__stdout__
 
         # ── Top border ────────────────────────────────────────────────────
-        out.write(f"┌{'─' * inner_w}┐\n")
+        rendered_lines = [f"┌{'─' * inner_w}┐"]
+        out.write(rendered_lines[0] + "\n")
 
         # ── Content rows ──────────────────────────────────────────────────
         for i in range(n):
             lc = pad_r(left[i],   left_w)
             cc = pad_r(center[i], center_w)
             rc = pad_r(right[i],  right_w)
-            out.write(f"│{lc}{sep}{cc}{sep}{rc}│\n")
+            row = f"│{lc}{sep}{cc}{sep}{rc}│"
+            rendered_lines.append(row)
+            out.write(row + "\n")
 
         # ── Bottom border ─────────────────────────────────────────────────
-        out.write(f"└{'─' * inner_w}┘\n")
+        rendered_lines.append(f"└{'─' * inner_w}┘")
+        out.write(rendered_lines[-1] + "\n")
 
         out.flush()
+        self._log_terminal_block("header", rendered_lines)
 
     # ── Spinner ───────────────────────────────────────────────────────────────
 
@@ -1523,11 +1622,13 @@ class Interface:
         self._spinner_stop   = asyncio.Event()
         self._spinner_active = True
         self._spinner_task   = asyncio.create_task(self._run_spinner())
+        self._log_terminal_mutation("spinner_started", label=_strip_ansi(self._spinner_label))
 
     async def _stop_spinner(self) -> None:
         if not self._spinner_active:
             return
         self._spinner_active = False
+        self._log_terminal_mutation("spinner_stop_requested", label=_strip_ansi(self._spinner_label))
         if self._spinner_stop:
             self._spinner_stop.set()
         if self._spinner_task and not self._spinner_task.done():
@@ -1573,6 +1674,7 @@ class Interface:
 
                 # Expire agents that finished > 2 seconds ago
                 _now_mono = _time.monotonic()
+                previous_agent_ids = set(self._agent_statuses.keys())
                 to_remove = [
                     aid for aid, info in self._agent_statuses.items()
                     if info.get("status") in ("done", "closed", "error")
@@ -1581,6 +1683,11 @@ class Interface:
                 ]
                 for aid in to_remove:
                     del self._agent_statuses[aid]
+                removed_agent_ids = sorted(previous_agent_ids - set(self._agent_statuses.keys()))
+                if removed_agent_ids:
+                    self._log_ui_line(
+                        f"[agent-panel] removed expired entries: {', '.join(removed_agent_ids)}"
+                    )
 
                 # Build one display line per active agent
                 agent_lines: list[str] = []
@@ -1611,6 +1718,7 @@ class Interface:
                 # Draw agent lines below
                 for line in agent_lines:
                     out.write(f"\n\r\033[2K{line}")
+                self._log_spinner_snapshot(label, agent_lines)
 
                 # Clear leftover lines from a frame that had more agents
                 extra = prev_agent_lines - len(agent_lines)
@@ -1674,6 +1782,7 @@ class Interface:
                 spinner_label = self._spinner_label
 
                 _now_mono = _time.monotonic()
+                previous_agent_ids = set(self._agent_statuses.keys())
                 to_remove = [
                     aid for aid, info in self._agent_statuses.items()
                     if info.get("status") in ("done", "closed", "error")
@@ -1682,6 +1791,11 @@ class Interface:
                 ]
                 for aid in to_remove:
                     del self._agent_statuses[aid]
+                removed_agent_ids = sorted(previous_agent_ids - set(self._agent_statuses.keys()))
+                if removed_agent_ids:
+                    self._log_ui_line(
+                        f"[agent-panel] removed expired entries: {', '.join(removed_agent_ids)}"
+                    )
 
                 agent_infos = list(self._agent_statuses.items())
                 active_agents = sum(
@@ -1729,15 +1843,24 @@ class Interface:
                     agent_lines.append(f"  {_bd('╰─')} {_d(footer_text)}")
 
                 if prev_agent_lines > 0:
+                    self._log_terminal_mutation("cursor_up", lines=prev_agent_lines)
                     out.write(f"\033[{prev_agent_lines}A")
 
                 out.write(f"\r\033[2K  {frame} {_d(spinner_label)}")
 
                 for line in agent_lines:
                     out.write(f"\n\r\033[2K{line}")
+                self._log_spinner_snapshot(spinner_label, agent_lines)
+                self._log_terminal_mutation(
+                    "frame_drawn",
+                    spinner=_strip_ansi(spinner_label),
+                    panel_lines=len(agent_lines),
+                    active_agents=active_agents,
+                )
 
                 extra = prev_agent_lines - len(agent_lines)
                 if extra > 0:
+                    self._log_terminal_mutation("clear_extra_lines", count=extra)
                     for _ in range(extra):
                         out.write(f"\n\r\033[2K")
                     out.write(f"\033[{extra}A")
@@ -1747,6 +1870,7 @@ class Interface:
                 i += 1
                 await asyncio.sleep(0.08)
         finally:
+            self._log_terminal_mutation("clear_spinner_frame", lines=prev_agent_lines + 1)
             if prev_agent_lines > 0:
                 out.write(f"\033[{prev_agent_lines}A")
             out.write("\r\033[2K")
@@ -1965,6 +2089,7 @@ class Interface:
         async for event in self._session.events():
             msg = event.msg
             try:
+                self._log_event_message(msg)
                 # ── Turn lifecycle ────────────────────────────────────────────
 
                 if isinstance(msg, TurnStartedEvent):
@@ -2318,6 +2443,7 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
+                    self._clear_agent_statuses("turn_ended")
                     self._wrap_buffer = ""
                     self._wrap_column = 0
                     # Token tracking
@@ -2370,6 +2496,7 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
+                    self._clear_agent_statuses("turn_interrupted")
                     _p(f"  {_bd('·')} {_y('interrupted')}")
                     _p()
 
@@ -2382,6 +2509,7 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
+                    self._clear_agent_statuses("error")
                     _render_error(msg.message)
                     _p()
 
@@ -2395,18 +2523,14 @@ class Interface:
                     _p(f"  {_bd('·')} {_s(msg.message)}")
 
                 elif isinstance(msg, AgentStatusEvent):
-                    import time as _time
-                    _done_at = None
-                    if msg.status in ("done", "closed", "error"):
-                        _done_at = _time.monotonic()
-                    self._agent_statuses[msg.agent_id] = {
-                        "color": msg.color,
-                        "display_name": msg.display_name or msg.agent_id,
-                        "activity": msg.activity,
-                        "tokens": msg.tokens,
-                        "status": msg.status,
-                        "_done_at": _done_at,
-                    }
+                    self._record_agent_status(
+                        msg.agent_id,
+                        color=msg.color,
+                        display_name=msg.display_name or msg.agent_id,
+                        activity=msg.activity,
+                        tokens=msg.tokens,
+                        status=msg.status,
+                    )
 
                 elif isinstance(msg, BackgroundTerminalOutputEvent):
                     _p(f"  {_bd('·')} {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
@@ -3765,6 +3889,14 @@ class Interface:
         self._print_header()   # rich Panel — before patch_stdout
 
         with patch_stdout():
+            global _UI_LOG_SINK
+            _UI_LOG_SINK = self._log_ui_line
+            self._log_ui_line("[header] welcome header rendered")
+            self._log_ui_line(f"[session] cwd={self._session.cwd}")
+            self._log_ui_line(f"[session] model={self._config.model}")
+            _p(f"  {_d(f'log: {self._session_log_path}')}")
+            if hasattr(self._session, "action_log_path"):
+                _p(f"  {_d(f'actions: {self._session.action_log_path}')}")
             event_task = asyncio.create_task(self._consume_events())
 
             try:
@@ -3807,18 +3939,21 @@ class Interface:
                         if cmd is None:
                             _p(f"  {_r('✗')} unknown command: {text}")
                             continue
+                        self._log_ui_line(f"[input] slash={text}")
                         if await self._dispatch_slash(cmd, args):
                             break
 
                     elif text.startswith("!"):
                         shell_cmd = text[1:].strip()
                         if shell_cmd:
+                            self._log_ui_line(f"[input] shell=!{shell_cmd}")
                             from bob.protocol.ops import RunUserShellCommandOp
                             await self._session.submit(
                                 RunUserShellCommandOp(command=shell_cmd)
                             )
 
                     else:
+                        self._log_ui_line(f"[input] user={text}")
                         from bob.protocol.items import TextUserInput
                         from bob.protocol.ops import UserTurnOp
                         # Prepend any pending context items
@@ -3866,6 +4001,7 @@ class Interface:
                         break
 
             finally:
+                _UI_LOG_SINK = None
                 try:
                     event_task.cancel()
                     try:
@@ -3876,6 +4012,11 @@ class Interface:
                     pass
                 try:
                     self._persist_current_model()
+                except BaseException:
+                    pass
+                try:
+                    self._log_ui_line("[session] log closed")
+                    self._session_log_handle.close()
                 except BaseException:
                     pass
 

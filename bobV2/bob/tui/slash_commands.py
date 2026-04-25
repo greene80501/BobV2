@@ -70,6 +70,8 @@ class SlashCommand(str, Enum):
     THINK = "think"
     BRIEF = "brief"
     TASKS = "tasks"
+    # Swarm
+    SWARM = "swarm"
 
 
 COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
@@ -136,6 +138,7 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.THINK: "set thinking budget for next turn: /think [tokens]",
     SlashCommand.BRIEF: "alias for /output-style brief",
     SlashCommand.TASKS: "list all tasks or filter by status: /tasks [status]",
+    SlashCommand.SWARM: "run task as coordinated agent swarm: /swarm [task]",
 }
 
 AVAILABLE_DURING_TASK: set[SlashCommand] = {
@@ -153,7 +156,7 @@ SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.FAST, SlashCommand.SANDBOX_READ_ROOT,
     SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.BRANCH,
     SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
-    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK,
+    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK, SlashCommand.SWARM,
 }
 
 

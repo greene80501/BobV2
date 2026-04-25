@@ -70,6 +70,25 @@ def test_vertex_ai_requires_location_and_credentials() -> None:
     assert "GOOGLE_APPLICATION_CREDENTIALS" in resolved.missing
 
 
+def test_kimi_accepts_openai_api_key_for_openai_compatible_setup() -> None:
+    config = BobConfig.model_validate(
+        {
+            "model": "kimi/kimi-for-coding",
+        }
+    )
+
+    resolved = resolve_provider_auth(
+        "kimi/kimi-for-coding",
+        config,
+        env={"OPENAI_API_KEY": "kimi-via-openai-env"},
+    )
+
+    assert resolved.provider == "kimi"
+    assert resolved.api_key == "kimi-via-openai-env"
+    assert resolved.base_url == "https://api.kimi.com/coding/v1"
+    assert resolved.missing == ()
+
+
 def test_openai_request_params_map_reasoning_and_service_tier() -> None:
     config = BobConfig(
         model="gpt-5.1-codex-mini",

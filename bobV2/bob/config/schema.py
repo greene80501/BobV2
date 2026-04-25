@@ -89,6 +89,32 @@ class ProviderConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Swarm configuration
+# ---------------------------------------------------------------------------
+
+class SwarmConfig(BaseModel):
+    enabled: bool = True
+    # Auto-detect complex tasks and offer swarm mode
+    auto_detect: bool = True
+    # Minimum complexity level to trigger the offer: "moderate" or "complex"
+    auto_detect_threshold: str = "moderate"
+    # Max parallel execution agents
+    max_agents: int = 20
+    # Per-agent wall-clock timeout in seconds
+    agent_timeout_seconds: int = 300
+    # Turns with no file/turn activity before flagging as stalled
+    stall_threshold_turns: int = 5
+    # Delete agent temp dirs after the run completes
+    workspace_cleanup: bool = True
+    # Planner attempts before falling back
+    planning_max_retries: int = 2
+    # Allow executing fallback plans for broad tasks when structured planning fails
+    allow_unsafe_fallback_execution: bool = False
+    # Audit log directory (None = ~/.bob/swarm_runs)
+    audit_log_dir: Optional[Path] = None
+
+
+# ---------------------------------------------------------------------------
 # Full BobConfig
 # ---------------------------------------------------------------------------
 
@@ -267,6 +293,11 @@ class BobConfig(BaseModel):
     rollout_dir: Optional[Path] = None
     # Whether to persist session history across process restarts
     persist_sessions: bool = True
+
+    # ------------------------------------------------------------------
+    # Swarm
+    # ------------------------------------------------------------------
+    swarm: SwarmConfig = Field(default_factory=SwarmConfig)
 
     # ------------------------------------------------------------------
     # Misc feature flags

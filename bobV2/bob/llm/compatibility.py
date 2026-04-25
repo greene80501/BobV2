@@ -300,7 +300,8 @@ _PROFILES: dict[str, ProviderProfile] = {
         display_name="Kimi for Coding",
         support_level=SupportLevel.EXPERIMENTAL,
         route=ClientRoute.LITELLM_CHAT,
-        api_key_env_vars=("KIMI_API_KEY",),
+        api_key_env_vars=("KIMI_API_KEY", "MOONSHOT_API_KEY", "OPENAI_API_KEY"),
+        base_url_env_vars=("KIMI_API_BASE", "OPENAI_API_BASE"),
         default_base_url="https://api.kimi.com/coding/v1",
         default_extra_headers={
             "User-Agent": "claude-code/1.0",
@@ -308,7 +309,10 @@ _PROFILES: dict[str, ProviderProfile] = {
         },
         suggested_models=("kimi/kimi-for-coding",),
         supports_vision=False,
-        notes="Kimi for Coding by Moonshot AI. Requires KIMI_API_KEY from kimi.com/coding (not platform.moonshot.ai). OpenAI-compatible endpoint.",
+        notes=(
+            "Kimi for Coding by Moonshot AI. Accepts KIMI_API_KEY / MOONSHOT_API_KEY, "
+            "and also OPENAI_API_KEY for Cloud Code/Codex-style OpenAI-compatible setups."
+        ),
     ),
     "unknown": ProviderProfile(
         name="unknown",

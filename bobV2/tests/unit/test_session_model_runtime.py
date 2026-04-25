@@ -112,3 +112,25 @@ def test_describe_model_runtime_reports_missing_auth(monkeypatch) -> None:
     assert runtime["provider"] == "gemini"
     assert runtime["route"] == "litellm_chat"
     assert "api_key" in runtime["missing_auth"]
+
+
+def test_session_passes_kimi_openai_compatible_defaults(monkeypatch) -> None:
+    import bob.llm.client as litellm_client
+
+    monkeypatch.setattr(litellm_client, "LiteLLMClient", DummyLiteLLMClient)
+    config = BobConfig.model_validate(
+        {
+            "model": "kimi/kimi-for-coding",
+        }
+    )
+    session = _make_session(config)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "kimi-openai-compatible-key")
+    client = session._make_client(config.model)
+
+    assert isinstance(client, DummyLiteLLMClient)
+    assert client.kwargs["api_key"] == "kimi-openai-compatible-key"
+    assert client.kwargs["model"] == "openai/kimi-for-coding"
+    assert client.kwargs["base_url"] == "https://api.kimi.com/coding/v1"
+    assert client.kwargs["provider_kwargs"]["extra_headers"]["X-Client-Name"] == "claude-code"
+    assert session._model_compatibility.provider == "kimi"

@@ -3,6 +3,7 @@ import asyncio
 import uuid
 import os
 import datetime
+import json
 from pathlib import Path
 from typing import Optional, AsyncIterator, Any
 from bob.config.schema import BobConfig
@@ -13,6 +14,84 @@ from bob.protocol.ops import (
 )
 from bob.protocol.events import Event, EventMsg
 
+
+# ---------------------------------------------------------------------------
+# Swarm task coroutines (module-level so they can run as asyncio.Tasks)
+# ---------------------------------------------------------------------------
+
+async def _run_swarm_task(session, sub_id: str, task: str, cancel_ev) -> None:
+    """Run SwarmOrchestrator as a turn-equivalent task."""
+    from bob.swarm.orchestrator import SwarmOrchestrator
+    from bob.protocol.events import Event, TurnEndedEvent, TurnStartedEvent
+    try:
+        await session._emit(Event(
+            id=sub_id,
+            msg=TurnStartedEvent(type="turn_started", turn_id=sub_id),
+        ))
+        await SwarmOrchestrator(session).run(task)
+        await session._emit(Event(
+            id=sub_id,
+            msg=TurnEndedEvent(type="turn_ended", turn_id=sub_id),
+        ))
+    except asyncio.CancelledError:
+        from bob.protocol.events import TurnInterruptedEvent
+        await session._emit(Event(
+            id=sub_id,
+            msg=TurnInterruptedEvent(type="turn_interrupted", turn_id=sub_id, graceful=True),
+        ))
+        raise
+    except Exception as exc:
+        from bob.protocol.events import ErrorEvent
+        await session._emit(Event(id=sub_id, msg=ErrorEvent(
+            type="error", message=f"Swarm error: {exc}"
+        )))
+
+
+async def _run_with_swarm_offer(
+    session,
+    sub_id: str,
+    op,
+    cancel_ev,
+    complexity: str,
+    reason: str,
+    user_preview: str,
+) -> None:
+    """Emit a SwarmOfferEvent, wait for user's y/n, then run swarm or normal turn."""
+    from bob.protocol.events import SwarmOfferEvent
+    from bob.core.turn import run_turn
+    from bob.swarm.orchestrator import SwarmOrchestrator
+
+    offer_id = sub_id
+    await session._emit(Event(
+        id=sub_id,
+        msg=SwarmOfferEvent(
+            offer_id=offer_id,
+            task_preview=user_preview[:200],
+            complexity=complexity,
+            reason=reason,
+        ),
+    ))
+
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    if not hasattr(session, "_pending_swarm_authorizations"):
+        session._pending_swarm_authorizations = {}
+    session._pending_swarm_authorizations[offer_id] = fut
+
+    try:
+        approved, _ = await asyncio.wait_for(fut, timeout=60.0)
+    except asyncio.TimeoutError:
+        approved = False
+    finally:
+        session._pending_swarm_authorizations.pop(offer_id, None)
+
+    if approved:
+        await _run_swarm_task(session, sub_id, user_preview, cancel_ev)
+    else:
+        await run_turn(session, sub_id, op, cancel_ev)
+
+
+# ---------------------------------------------------------------------------
 
 class ToolContext:
     """Passed to tool handlers â€” contains session state they need."""
@@ -58,6 +137,8 @@ class BobSession:
         # Domains approved for web access this session (key = request_id â†’ Future)
         self._pending_network_approvals: dict[str, asyncio.Future] = {}
         self._pending_dynamic_tool_calls: dict[str, asyncio.Future] = {}
+        # Swarm authorization futures — keyed by offer_id or swarm run_id
+        self._pending_swarm_authorizations: dict[str, asyncio.Future] = {}
 
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
@@ -123,6 +204,12 @@ class BobSession:
         # Task database
         from bob.core.task_db import TaskDB
         self._task_db = TaskDB(self.bob_home / "tasks.db")
+        self._action_log_path = self._make_action_log_path()
+        self._action_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._action_log_handle = self._action_log_path.open("a", encoding="utf-8", buffering=1)
+        self._log_action_line(
+            f"[session] action log started session={self.session_id} cwd={self.cwd} model={self.config.model}"
+        )
 
     # ------------------------------------------------------------------
     # Bob home helper
@@ -132,6 +219,33 @@ class BobSession:
     def bob_home(self) -> Path:
         """Return the ~/.bob directory (or $BOB_HOME if set)."""
         return Path(os.environ.get("BOB_HOME", Path.home() / ".bob"))
+
+    @property
+    def action_log_path(self) -> Path:
+        return self._action_log_path
+
+    def _make_action_log_path(self) -> Path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        return self.bob_home / "logs" / "actions" / f"{stamp}-{self.session_id}.log"
+
+    def _log_action_line(self, text: str) -> None:
+        cleaned = str(text).replace("\r", "")
+        if not cleaned:
+            return
+        if not cleaned.endswith("\n"):
+            cleaned += "\n"
+        self._action_log_handle.write(cleaned)
+        self._action_log_handle.flush()
+
+    @staticmethod
+    def _format_log_payload(payload: Any, max_chars: int = 4000) -> str:
+        try:
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            text = str(payload)
+        if len(text) > max_chars:
+            return text[:max_chars] + "... [truncated]"
+        return text
 
     # ------------------------------------------------------------------
     # Tool registration
@@ -912,6 +1026,11 @@ class BobSession:
     async def submit(self, op: Op) -> str:
         sub = Submission(op=op)
         await self._sq.put(sub)
+        op_type = getattr(op, "type", op.__class__.__name__)
+        payload = op.model_dump() if hasattr(op, "model_dump") else str(op)
+        self._log_action_line(
+            f"[submit] id={sub.id} type={op_type} payload={self._format_log_payload(payload)}"
+        )
         return sub.id
 
     async def events(self) -> AsyncIterator[Event]:
@@ -929,6 +1048,12 @@ class BobSession:
             self._eq.put_nowait(event)
         except asyncio.QueueFull:
             await self._eq.put(event)
+
+        msg_type = event.msg.type if hasattr(event.msg, "type") else event.msg.__class__.__name__
+        payload = event.msg.model_dump() if hasattr(event.msg, "model_dump") else str(event.msg)
+        self._log_action_line(
+            f"[event] id={event.id} type={msg_type} payload={self._format_log_payload(payload)}"
+        )
 
         if self._recorder:
             await self._recorder.write({
@@ -1164,6 +1289,7 @@ class BobSession:
 
     async def shutdown(self) -> None:
         self._shutdown_event.set()
+        self._log_action_line("[session] shutdown requested")
         if self._thread_manager is not None:
             try:
                 await self._thread_manager.shutdown_all()
@@ -1192,6 +1318,11 @@ class BobSession:
                 )
             ))
         except asyncio.QueueFull:
+            pass
+        try:
+            self._log_action_line("[session] action log closed")
+            self._action_log_handle.close()
+        except Exception:
             pass
 
     async def get_approval(self, call_id: str) -> Any:
@@ -1320,6 +1451,7 @@ class BobSession:
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
+            SwarmAuthorizationOp, RunSwarmOp,
         )
         from bob.protocol.events import (
             SessionEndedEvent, ThreadNameSetEvent,
@@ -1327,6 +1459,7 @@ class BobSession:
         )
 
         current_turn_task: Optional[asyncio.Task] = None
+        current_turn_preview = ""
 
         while not self._shutdown_event.is_set():
             try:
@@ -1336,6 +1469,24 @@ class BobSession:
 
             op = submission.op
             sub_id = submission.id
+
+            if current_turn_task is not None and current_turn_task.done():
+                try:
+                    exc = current_turn_task.exception()
+                    if exc is not None:
+                        from bob.protocol.events import ErrorEvent
+                        await self._emit(Event(
+                            id=sub_id,
+                            msg=ErrorEvent(type="error", message=str(exc))
+                        ))
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    if current_turn_preview:
+                        await self._touch_session_activity(current_turn_preview, turn_completed=True)
+                    current_turn_preview = ""
+                    current_turn_task = None
+                    self._current_turn_cancel = None
 
             # ----------------------------------------------------------------
             # Shutdown
@@ -1388,6 +1539,15 @@ class BobSession:
 
             if isinstance(op, DynamicToolResponseOp):
                 self.resolve_dynamic_tool(op.tool_call_id, op.result)
+                continue
+
+            # ----------------------------------------------------------------
+            # Swarm authorization (resolves both offer gate and plan gate)
+            # ----------------------------------------------------------------
+            if isinstance(op, SwarmAuthorizationOp):
+                fut = self._pending_swarm_authorizations.get(op.run_id)
+                if fut and not fut.done():
+                    fut.set_result((op.approved, op.feedback))
                 continue
 
             # ----------------------------------------------------------------
@@ -1569,86 +1729,135 @@ class BobSession:
             # ----------------------------------------------------------------
             # User turn â€” the main path
             # ----------------------------------------------------------------
-            if isinstance(op, UserTurnOp):
+            if isinstance(op, RunSwarmOp):
+                if current_turn_task is not None and not current_turn_task.done():
+                    from bob.protocol.events import ErrorEvent
+                    await self._emit(Event(
+                        id=sub_id,
+                        msg=ErrorEvent(type="error", message="A turn is already running.")
+                    ))
+                    continue
+                user_preview = op.task[:100]
+                current_turn_preview = user_preview
+                cancel_ev = asyncio.Event()
+                self._current_turn_cancel = cancel_ev
+                current_turn_task = asyncio.create_task(
+                    _run_swarm_task(self, sub_id, op.task, cancel_ev)
+                )
+            elif isinstance(op, UserTurnOp):
+                if current_turn_task is not None and not current_turn_task.done():
+                    from bob.protocol.events import ErrorEvent
+                    await self._emit(Event(
+                        id=sub_id,
+                        msg=ErrorEvent(type="error", message="A turn is already running.")
+                    ))
+                    continue
                 await self.manage_context_pre_turn(sub_id)
                 user_preview = self._preview_from_user_turn(op)
+                current_turn_preview = user_preview
 
                 cancel_ev = asyncio.Event()
                 self._current_turn_cancel = cancel_ev
 
-                current_turn_task = asyncio.create_task(
-                    run_turn(self, sub_id, op, cancel_ev)
-                )
-
-                # IMPORTANT: Do NOT await the turn task directly â€” that would
-                # block the loop and create a deadlock when an approval future
-                # is waiting for an ExecApprovalOp to arrive in the queue.
-                # Instead, poll the queue while the turn is running so we can
-                # route approval/interrupt ops without stalling.
-                try:
-                    while not current_turn_task.done():
-                        try:
-                            inner_sub = await asyncio.wait_for(
-                                self._sq.get(), timeout=0.05
+                swarm_cfg = getattr(self.config, "swarm", None)
+                if swarm_cfg and swarm_cfg.enabled and swarm_cfg.auto_detect and user_preview:
+                    from bob.swarm.complexity import TaskComplexityAnalyzer
+                    from bob.swarm.models import TaskComplexity as _TC
+                    _cx, _reason = TaskComplexityAnalyzer().classify(user_preview)
+                    _thresh = getattr(swarm_cfg, "auto_detect_threshold", "moderate")
+                    _offer = (
+                        (_thresh == "moderate" and _cx in (_TC.MODERATE, _TC.COMPLEX))
+                        or (_thresh == "complex" and _cx == _TC.COMPLEX)
+                    )
+                    if _offer:
+                        current_turn_task = asyncio.create_task(
+                            _run_with_swarm_offer(
+                                self, sub_id, op, cancel_ev,
+                                _cx.value, _reason, user_preview,
                             )
-                        except asyncio.TimeoutError:
-                            continue
+                        )
+                    else:
+                        current_turn_task = asyncio.create_task(
+                            run_turn(self, sub_id, op, cancel_ev)
+                        )
+                else:
+                    current_turn_task = asyncio.create_task(
+                        run_turn(self, sub_id, op, cancel_ev)
+                    )
+            else:
+                continue  # op already handled earlier in the loop
 
-                        inner_op = inner_sub.op
+            if current_turn_task is None:
+                continue
 
-                        if isinstance(inner_op, ExecApprovalOp):
-                            fut = self._pending_approvals.get(inner_op.tool_call_id)
-                            if fut and not fut.done():
-                                fut.set_result(inner_op.decision)
-
-                        elif isinstance(inner_op, PatchApprovalOp):
-                            fut = self._pending_approvals.get(inner_op.tool_call_id)
-                            if fut and not fut.done():
-                                fut.set_result(inner_op.decision)
-
-                        elif isinstance(inner_op, NetworkApprovalOp):
-                            fut = self._pending_network_approvals.get(inner_op.request_id)
-                            if fut and not fut.done():
-                                fut.set_result({
-                                    "approved": inner_op.approved,
-                                    "approve_always": inner_op.approve_always,
-                                })
-                            if inner_op.approve_always:
-                                self._network_policy.approve_domain(inner_op.domain, session_only=True)
-
-                        elif isinstance(inner_op, DynamicToolResponseOp):
-                            self.resolve_dynamic_tool(inner_op.tool_call_id, inner_op.result)
-
-                        elif isinstance(inner_op, UserInputAnswerOp):
-                            fut = self._pending_user_inputs.get(inner_op.request_id)
-                            if fut and not fut.done():
-                                fut.set_result(inner_op.answer)
-
-                        elif isinstance(inner_op, InterruptOp):
-                            cancel_ev.set()
-
-                        # Drain any other ops silently while turn is running
-                        # (they will be re-queued or discarded as appropriate)
-
-                    # Collect any exception from the turn task
-                    exc = current_turn_task.exception()
-                    if exc is not None:
-                        from bob.protocol.events import ErrorEvent
-                        await self._emit(Event(
-                            id=sub_id,
-                            msg=ErrorEvent(type="error", message=str(exc))
-                        ))
-
-                except asyncio.CancelledError:
-                    current_turn_task.cancel()
+            # Keep polling the submission queue while the turn is running so
+            # approval, interrupt, and swarm authorization ops can resolve the
+            # futures the active turn is waiting on.
+            try:
+                while not current_turn_task.done():
                     try:
-                        await current_turn_task
-                    except asyncio.CancelledError:
-                        pass
-                finally:
-                    self._current_turn_cancel = None
-                    current_turn_task = None
-                    await self._touch_session_activity(user_preview, turn_completed=True)
+                        inner_sub = await asyncio.wait_for(
+                            self._sq.get(), timeout=0.05
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
+                    inner_op = inner_sub.op
+
+                    if isinstance(inner_op, ExecApprovalOp):
+                        fut = self._pending_approvals.get(inner_op.tool_call_id)
+                        if fut and not fut.done():
+                            fut.set_result(inner_op.decision)
+
+                    elif isinstance(inner_op, PatchApprovalOp):
+                        fut = self._pending_approvals.get(inner_op.tool_call_id)
+                        if fut and not fut.done():
+                            fut.set_result(inner_op.decision)
+
+                    elif isinstance(inner_op, NetworkApprovalOp):
+                        fut = self._pending_network_approvals.get(inner_op.request_id)
+                        if fut and not fut.done():
+                            fut.set_result({
+                                "approved": inner_op.approved,
+                                "approve_always": inner_op.approve_always,
+                            })
+                        if inner_op.approve_always:
+                            self._network_policy.approve_domain(inner_op.domain, session_only=True)
+
+                    elif isinstance(inner_op, DynamicToolResponseOp):
+                        self.resolve_dynamic_tool(inner_op.tool_call_id, inner_op.result)
+
+                    elif isinstance(inner_op, UserInputAnswerOp):
+                        fut = self._pending_user_inputs.get(inner_op.request_id)
+                        if fut and not fut.done():
+                            fut.set_result(inner_op.answer)
+
+                    elif isinstance(inner_op, InterruptOp):
+                        cancel_ev.set()
+
+                    elif isinstance(inner_op, SwarmAuthorizationOp):
+                        _sfut = self._pending_swarm_authorizations.get(inner_op.run_id)
+                        if _sfut and not _sfut.done():
+                            _sfut.set_result((inner_op.approved, inner_op.feedback))
+
+                exc = current_turn_task.exception()
+                if exc is not None:
+                    from bob.protocol.events import ErrorEvent
+                    await self._emit(Event(
+                        id=sub_id,
+                        msg=ErrorEvent(type="error", message=str(exc))
+                    ))
+
+            except asyncio.CancelledError:
+                current_turn_task.cancel()
+                try:
+                    await current_turn_task
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                self._current_turn_cancel = None
+                current_turn_task = None
+                await self._touch_session_activity(user_preview, turn_completed=True)
 
     # ------------------------------------------------------------------
     # Shell execution helper (user shell commands, outside agent turns)

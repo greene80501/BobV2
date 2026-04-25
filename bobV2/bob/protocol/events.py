@@ -633,6 +633,75 @@ class CostEstimateEvent(BaseModel):
 
 
 # ===========================================================================
+# Swarm
+# ===========================================================================
+
+class SwarmOfferEvent(BaseModel):
+    """Emitted when Bob detects a complex task and offers swarm mode."""
+    type: Literal["swarm_offer"] = "swarm_offer"
+    offer_id: str   # matches the submission id — used to resolve the authorization future
+    task_preview: str
+    complexity: str  # "moderate" | "complex"
+    reason: str
+
+
+class SwarmStartedEvent(BaseModel):
+    type: Literal["swarm_started"] = "swarm_started"
+    run_id: str
+    task: str
+
+
+class SwarmPlanReadyEvent(BaseModel):
+    type: Literal["swarm_plan_ready"] = "swarm_plan_ready"
+    run_id: str
+    plan: dict[str, Any]
+
+
+class SwarmAuthorizedEvent(BaseModel):
+    type: Literal["swarm_authorized"] = "swarm_authorized"
+    run_id: str
+
+
+class SwarmProgressEvent(BaseModel):
+    type: Literal["swarm_progress"] = "swarm_progress"
+    run_id: str
+    agents_total: int
+    agents_done: int
+    agents_running: int
+    current_phase: str
+    message: str
+
+
+class SwarmAgentCompletedEvent(BaseModel):
+    type: Literal["swarm_agent_completed"] = "swarm_agent_completed"
+    run_id: str
+    agent_id: str
+    role: str
+    files_modified: list[str] = Field(default_factory=list)
+
+
+class SwarmPatchReadyEvent(BaseModel):
+    type: Literal["swarm_patch_ready"] = "swarm_patch_ready"
+    run_id: str
+    files_changed: list[str]
+    summary: str
+    patch_text: str
+
+
+class SwarmCompletedEvent(BaseModel):
+    type: Literal["swarm_completed"] = "swarm_completed"
+    run_id: str
+    success: bool
+    message: str
+
+
+class SwarmCancelledEvent(BaseModel):
+    type: Literal["swarm_cancelled"] = "swarm_cancelled"
+    run_id: str
+    reason: str
+
+
+# ===========================================================================
 # IDE integration
 # ===========================================================================
 
@@ -751,6 +820,16 @@ EventMsg = Annotated[
         # Token budget / cost
         TokenBudgetEvent,
         CostEstimateEvent,
+        # Swarm
+        SwarmOfferEvent,
+        SwarmStartedEvent,
+        SwarmPlanReadyEvent,
+        SwarmAuthorizedEvent,
+        SwarmProgressEvent,
+        SwarmAgentCompletedEvent,
+        SwarmPatchReadyEvent,
+        SwarmCompletedEvent,
+        SwarmCancelledEvent,
         # IDE integration
         IDEShowDiffEvent,
     ],

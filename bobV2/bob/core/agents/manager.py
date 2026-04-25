@@ -32,6 +32,8 @@ class AgentManager:
         parent_agent_id: Optional[str] = None,
         role: Optional[str] = None,
         task_name: Optional[str] = None,
+        allowed_tools: Optional[list[str]] = None,
+        allow_mutating_tools: Optional[bool] = None,
     ) -> str:
         mode_name = (mode or "default").strip().lower()
         mode_cfg = MODES.get(mode_name)
@@ -47,9 +49,15 @@ class AgentManager:
             if cwd not in self.policy.allowed_cwds:
                 raise invalid_params("cwd is not allowed by policy", cwd=cwd)
 
-        allowed_tools: list[str] | None = None
+        resolved_allowed_tools: list[str] | None = None
         if self.policy.allowed_tools is not None:
-            allowed_tools = list(self.policy.allowed_tools)
+            resolved_allowed_tools = list(self.policy.allowed_tools)
+        if allowed_tools is not None:
+            requested = list(allowed_tools)
+            if resolved_allowed_tools is None:
+                resolved_allowed_tools = requested
+            else:
+                resolved_allowed_tools = sorted(set(resolved_allowed_tools).intersection(requested))
 
         if mode_cfg.template:
             from bob.core.agent_templates import get_template
@@ -57,10 +65,10 @@ class AgentManager:
             tmpl = get_template(mode_cfg.template)
             if tmpl and tmpl.allowed_tools:
                 tmpl_allowed = set(tmpl.allowed_tools)
-                if allowed_tools is None:
-                    allowed_tools = sorted(tmpl_allowed)
+                if resolved_allowed_tools is None:
+                    resolved_allowed_tools = sorted(tmpl_allowed)
                 else:
-                    allowed_tools = sorted(tmpl_allowed.intersection(allowed_tools))
+                    resolved_allowed_tools = sorted(tmpl_allowed.intersection(resolved_allowed_tools))
 
         runtime_ttl_seconds = min(
             int(mode_cfg.max_runtime_seconds),
@@ -68,6 +76,11 @@ class AgentManager:
         )
         if runtime_ttl_seconds <= 0:
             runtime_ttl_seconds = int(mode_cfg.max_runtime_seconds)
+        resolved_allow_mutating = (
+            mode_cfg.allow_mutating_tools
+            if allow_mutating_tools is None
+            else bool(allow_mutating_tools)
+        )
 
         return await thread_manager.spawn(
             task=task,
@@ -78,9 +91,9 @@ class AgentManager:
             parent_agent_id=parent_agent_id,
             role=role,
             max_depth=self.policy.max_depth,
-            allowed_tools=allowed_tools,
+            allowed_tools=resolved_allowed_tools,
             runtime_ttl_seconds=runtime_ttl_seconds,
-            allow_mutating_tools=mode_cfg.allow_mutating_tools,
+            allow_mutating_tools=resolved_allow_mutating,
             task_name=task_name,
         )
 

@@ -724,10 +724,12 @@ class ThreadManager:
 
         self._bump_state()
         self._persist_tree()
+        if reason and reason.startswith("workflow_node_complete:"):
+            return
         try:
             from bob.protocol.events import AgentStatusEvent, Event
             display_name = f"{rec.name} agent" if rec.name else rec.id[:8]
-            activity = f"Closed · {reason}" if reason else "Closed"
+            activity = f"Closed - {reason}" if reason else "Closed"
             await self.parent_session._emit(Event(
                 id="subagent",
                 msg=AgentStatusEvent(
