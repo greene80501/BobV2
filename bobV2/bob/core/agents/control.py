@@ -10,7 +10,6 @@ if TYPE_CHECKING:
 from bob.core.agents.registry import AgentPath, AgentRegistry, AgentRecord, AgentStatus
 from bob.core.agents.mailbox import InterAgentMessage
 from bob.core.agents.sub_agent import BobSubAgent
-from bob.core.agents.worktree import WorktreeManager
 
 
 class AgentControl:
@@ -28,7 +27,6 @@ class AgentControl:
         self._parent = parent
         max_agents = getattr(parent.config, "multi_agent_max_agents", 8)
         self._registry = AgentRegistry(max_agents=max_agents, max_depth=1)
-        self._worktree_mgr = WorktreeManager(parent.cwd)
         self._agents: dict[str, BobSubAgent] = {}   # agent_id → agent
         self._completion_queue: asyncio.Queue[str] = asyncio.Queue()
         self._root_path = AgentPath.root()
@@ -56,16 +54,10 @@ class AgentControl:
 
         child_session = self._make_child_session(model=model, fork_mode=fork_mode)
 
-        worktree_path = self._worktree_mgr.create(record.agent_id)
-        if worktree_path:
-            child_session.cwd = worktree_path
-
         agent = BobSubAgent(
             record=record,
             session=child_session,
             parent_session=self._parent,
-            worktree_path=worktree_path,
-            worktree_manager=self._worktree_mgr if worktree_path else None,
             completion_queue=self._completion_queue,
         )
         self._agents[record.agent_id] = agent

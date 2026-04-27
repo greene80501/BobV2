@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from bob.core.session import BobSession
     from bob.core.agents.registry import AgentRecord
-    from bob.core.agents.worktree import WorktreeManager
 
 from bob.core.agents.mailbox import Mailbox, InterAgentMessage
-from bob.core.agents.registry import AgentStatus, AgentProgress
+from bob.core.agents.registry import AgentStatus
 
 
 class BobSubAgent:
@@ -28,8 +26,6 @@ class BobSubAgent:
         record: "AgentRecord",
         session: "BobSession",
         parent_session: "BobSession",
-        worktree_path: Optional[Path],
-        worktree_manager: Optional["WorktreeManager"],
         completion_queue: asyncio.Queue,
     ) -> None:
         self.agent_id = record.agent_id
@@ -38,8 +34,6 @@ class BobSubAgent:
         self._record = record
         self._session = session
         self._parent = parent_session
-        self._worktree_path = worktree_path
-        self._worktree_manager = worktree_manager
         self._completion_queue = completion_queue
         self.mailbox = Mailbox()
         self._asyncio_task: Optional[asyncio.Task] = None
@@ -149,31 +143,19 @@ class BobSubAgent:
                     else:
                         await self._session.shutdown()
 
-            # Auto-merge worktree changes
-            merge_msg = ""
-            if self._worktree_manager and self._worktree_path:
-                _, merge_msg = self._worktree_manager.merge_and_cleanup(self.agent_id)
-
             result = final_text or "Task completed."
-            if merge_msg and merge_msg != "no changes":
-                result += f"\n[{merge_msg}]"
-
             await self._set_status(AgentStatus.COMPLETED, result=result)
             await self._emit_completed("completed", result=result)
 
         except asyncio.CancelledError:
             await self._set_status(AgentStatus.INTERRUPTED)
             await self._emit_completed("interrupted")
-            if self._worktree_manager:
-                self._worktree_manager.cleanup_no_merge(self.agent_id)
             raise
 
         except Exception as exc:
             err = str(exc)
             await self._set_status(AgentStatus.ERRORED, error=err)
             await self._emit_completed("errored", error=err)
-            if self._worktree_manager:
-                self._worktree_manager.cleanup_no_merge(self.agent_id)
 
         finally:
             try:
