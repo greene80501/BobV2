@@ -22,11 +22,10 @@ class CommandRuntimeRecord:
 
 
 class TaskRuntime:
-    def __init__(self, *, db_path: Path, event_bus: Any, registry: Any, agent_runtime: Any) -> None:
+    def __init__(self, *, db_path: Path, event_bus: Any, registry: Any) -> None:
         self.store = TaskStore(db_path)
         self.event_bus = event_bus
         self.registry = registry
-        self.agent_runtime = agent_runtime
         self.worker = TaskWorker(self)
         self.scheduler = CronScheduler(self)
         self._commands: dict[str, CommandRuntimeRecord] = {}
@@ -141,4 +140,3 @@ class TaskRuntime:
             "timeout_seconds": rec.timeout_seconds,
             "run_at_ts": rec.run_at_ts,
         }
-

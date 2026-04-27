@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import sys
+import time
 from types import SimpleNamespace
 
+import pytest
+
 from bob.llm.client import (
+    CompletedEvent,
+    LiteLLMClient,
+    StreamErrorEvent,
+    TextDeltaEvent,
     _extract_tool_call_provider_specific_fields,
     _to_chat_messages,
 )
@@ -80,8 +88,8 @@ def test_to_chat_messages_preserves_tool_call_provider_specific_fields() -> None
         {
             "type": "function_call",
             "call_id": "call_1",
-            "name": "spawn_agent",
-            "arguments": "{\"task\":\"inspect\"}",
+            "name": "read_file",
+            "arguments": "{\"path\":\"README.md\"}",
             "provider_specific_fields": {"thought_signature": "sig-123"},
         },
     ]
@@ -97,8 +105,8 @@ def test_to_chat_messages_preserves_tool_call_provider_specific_fields() -> None
                     "id": "call_1",
                     "type": "function",
                     "function": {
-                        "name": "spawn_agent",
-                        "arguments": "{\"task\":\"inspect\"}",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}",
                     },
                     "provider_specific_fields": {"thought_signature": "sig-123"},
                 }
@@ -123,3 +131,110 @@ def test_extract_tool_call_provider_specific_fields_merges_tool_and_function_lev
         "thought_signature": "sig-123",
         "other": "value",
     }
+
+
+class _AsyncChunkStream:
+    def __init__(self, chunks) -> None:
+        self._chunks = list(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_times_out_when_litellm_blocks_before_first_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, float] = {}
+
+    async def _blocking_acompletion(**kwargs):
+        captured["timeout"] = float(kwargs["timeout"])
+        time.sleep(0.3)
+        return _AsyncChunkStream([])
+
+    fake_litellm = SimpleNamespace(
+        acompletion=_blocking_acompletion,
+        model_list=[],
+        drop_params=False,
+        suppress_debug_info=False,
+    )
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    client = LiteLLMClient(model="openai/test-model")
+    events = [
+        ev
+        async for ev in client.stream_turn(
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            instructions="Be concise.",
+            tools=[],
+            max_retries=0,
+            extra_params={"timeout": 0.1},
+        )
+    ]
+
+    assert captured["timeout"] == pytest.approx(0.1)
+    assert len(events) == 1
+    assert isinstance(events[0], StreamErrorEvent)
+    assert "Provider stream stalled after 0s with no progress" in events[0].message
+
+
+@pytest.mark.asyncio
+async def test_stream_turn_yields_text_and_completion_events_via_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _ok_acompletion(**_kwargs):
+        return _AsyncChunkStream(
+            [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content="hello",
+                                thinking=None,
+                                reasoning_content=None,
+                                tool_calls=None,
+                            )
+                        )
+                    ],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    choices=[],
+                    usage=SimpleNamespace(
+                        prompt_tokens=3,
+                        completion_tokens=5,
+                        total_tokens=8,
+                    ),
+                ),
+            ]
+        )
+
+    fake_litellm = SimpleNamespace(
+        acompletion=_ok_acompletion,
+        model_list=[],
+        drop_params=False,
+        suppress_debug_info=False,
+    )
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    client = LiteLLMClient(model="openai/test-model")
+    events = [
+        ev
+        async for ev in client.stream_turn(
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            instructions="Be concise.",
+            tools=[],
+            max_retries=0,
+            extra_params={"timeout": 0.2},
+        )
+    ]
+
+    assert isinstance(events[0], TextDeltaEvent)
+    assert events[0].delta == "hello"
+    assert isinstance(events[-1], CompletedEvent)
+    assert events[-1].total_tokens == 8

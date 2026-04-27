@@ -1,4 +1,4 @@
-from bob.app_server.routes import agents, config, dynamic_tools, exec, files, legacy, realtime, review, tasks, threads, turns
+from bob.app_server.routes import config, dynamic_tools, exec, files, legacy, realtime, review, tasks, threads, turns
 
 ALL_ROUTE_MODULES = [
     legacy,
@@ -8,7 +8,6 @@ ALL_ROUTE_MODULES = [
     files,
     exec,
     dynamic_tools,
-    agents,
     tasks,
     review,
     realtime,

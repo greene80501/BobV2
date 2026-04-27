@@ -215,27 +215,6 @@ class ShutdownOp(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# SwarmAuthorizationOp — user's response to a SwarmOfferEvent or SwarmPlanReadyEvent
-# ---------------------------------------------------------------------------
-
-class SwarmAuthorizationOp(BaseModel):
-    type: Literal["swarm_authorization"] = "swarm_authorization"
-    # run_id matches the offer_id from SwarmOfferEvent or run_id from SwarmPlanReadyEvent
-    run_id: str
-    approved: bool
-    feedback: str = ""  # optional reason when declined
-
-
-# ---------------------------------------------------------------------------
-# RunSwarmOp — explicit user invocation of swarm mode (e.g. /swarm <task>)
-# ---------------------------------------------------------------------------
-
-class RunSwarmOp(BaseModel):
-    type: Literal["run_swarm"] = "run_swarm"
-    task: str
-
-
-# ---------------------------------------------------------------------------
 # ReviewOp
 # ---------------------------------------------------------------------------
 
@@ -432,8 +411,6 @@ Op = Annotated[
         RealtimeConversationAudioOp,
         RealtimeConversationTextOp,
         RealtimeConversationCloseOp,
-        SwarmAuthorizationOp,
-        RunSwarmOp,
     ],
     Field(discriminator="type"),
 ]

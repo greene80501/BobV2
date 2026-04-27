@@ -23,7 +23,6 @@ class GranularApproval(BaseModel):
 
 class ApprovalsReviewer(str, Enum):
     USER = "user"
-    GUARDIAN_SUBAGENT = "guardian_subagent"
 
 
 class SandboxMode(str, Enum):

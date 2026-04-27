@@ -1,13 +1,14 @@
-from bob.core.agents.manager import AgentManager, AgentPolicy
-from bob.core.agents.modes import MODES, CollaborationMode
-from bob.core.agents.supervisor import AgentSupervisor, WorkflowNode
+from bob.core.agents.registry import AgentPath, AgentStatus, AgentProgress, AgentRecord, AgentRegistry
+from bob.core.agents.mailbox import InterAgentMessage, Mailbox
+from bob.core.agents.control import AgentControl
 
 __all__ = [
-    "AgentManager",
-    "AgentPolicy",
-    "AgentSupervisor",
-    "WorkflowNode",
-    "CollaborationMode",
-    "MODES",
+    "AgentPath",
+    "AgentStatus",
+    "AgentProgress",
+    "AgentRecord",
+    "AgentRegistry",
+    "InterAgentMessage",
+    "Mailbox",
+    "AgentControl",
 ]
-

@@ -16,14 +16,7 @@ from bob.app_server.registry import SessionRegistry
 from bob.app_server.router import RpcRouter
 from bob.app_server.routes import ALL_ROUTE_MODULES
 from bob.app_server.schemas import JsonRpcRequest, JsonRpcResponse
-from bob.core.agents import AgentManager, AgentSupervisor
 from bob.core.tasks import TaskRuntime
-
-
-class AgentRuntime:
-    def __init__(self) -> None:
-        self.manager = AgentManager()
-        self.supervisor = AgentSupervisor(self.manager)
 
 
 class AppServer:
@@ -32,12 +25,10 @@ class AppServer:
         self.router = RpcRouter()
         self.event_bus = EventBus(Path.home() / ".bob" / "app_events.sqlite")
         self.registry = SessionRegistry(self.event_bus)
-        self.agent_runtime = AgentRuntime()
         self.task_runtime = TaskRuntime(
             db_path=Path.home() / ".bob" / "tasks_runtime.sqlite",
             event_bus=self.event_bus,
             registry=self.registry,
-            agent_runtime=self.agent_runtime,
         )
         self.middleware = [validation_middleware, auth_middleware, tracing_middleware]
         self._started = False
@@ -78,7 +69,6 @@ class AppServer:
             registry=self.registry,
             event_bus=self.event_bus,
             task_runtime=self.task_runtime,
-            agent_runtime=self.agent_runtime,
             router=self.router,
             connection=connection,
             logger=self.logger,
@@ -237,4 +227,3 @@ async def run_server(stdio: bool = False, port: int = 8765, host: str = "localho
         await run_stdio_server()
     else:
         await run_websocket_server(port=port, host=host)
-

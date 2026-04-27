@@ -205,6 +205,7 @@ class ToolOrchestrator:
                 cmd = raw_cmd.split()
         else:
             cmd = [str(x) for x in raw_cmd]
+        cmd, _ = self._normalize_windows_shell_command(cmd)
         if is_safe_command(cmd):
             return True
         if not cmd:
@@ -229,6 +230,29 @@ class ToolOrchestrator:
         if cmd0 in {"python", "python3"} and cmd1 == "-m":
             return True
         return False
+
+    @staticmethod
+    def _normalize_windows_shell_command(command: list[str]) -> tuple[list[str], str | None]:
+        if not command:
+            return command, None
+
+        cmd0 = str(command[0]).lower()
+        if cmd0 != "dir":
+            return command, None
+
+        flags = {str(part).lower() for part in command[1:] if str(part).startswith("/")}
+        if not ("/s" in flags or "/b" in flags):
+            return command, None
+
+        paths = [str(part) for part in command[1:] if not str(part).startswith("/")]
+        normalized = ["Get-ChildItem"]
+        if "/s" in flags:
+            normalized.append("-Recurse")
+        if "/b" in flags:
+            normalized.append("-Name")
+        if paths:
+            normalized.extend(paths)
+        return normalized, "normalized_windows_dir_flags"
 
     async def _filter_tool_policy(self, tool_calls: list[Any], tool_results: list[dict]) -> list[Any]:
         allowed_tools: set[str] | None = getattr(self.session, "_allowed_tools", None)
@@ -289,7 +313,6 @@ class ToolOrchestrator:
         ctx = ToolContext(self.session)
         ctx.on_output_delta = self.on_output_delta
         ctx.on_plan_update = self.on_plan_update
-        ctx.thread_manager = self.session.ensure_thread_manager()
         ctx.on_request_user_input = self.session.request_user_input
         return ctx
 
@@ -355,6 +378,11 @@ class ToolOrchestrator:
             command: list[str] = raw_cmd.split()
         else:
             command = list(raw_cmd)
+        command, normalization_reason = self._normalize_windows_shell_command(command)
+        if normalization_reason and hasattr(self.session, "_log_action_line"):
+            self.session._log_action_line(
+                f"[shell] normalized reason={normalization_reason} command={' '.join(command)}"
+            )
 
         exec_cwd = self.session.cwd
         workdir = tool_input.get("workdir")

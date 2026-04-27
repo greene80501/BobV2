@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Any
 
-from bob.core.tasks.executors import ContainerExecutor, LocalAgentExecutor, LocalExecutor, SshExecutor
+from bob.core.tasks.executors import LocalExecutor, SshExecutor
 from bob.core.tasks.queue import TaskQueue
 
 
@@ -19,9 +19,7 @@ class TaskWorker:
         self._stop = asyncio.Event()
         self.executors = {
             "local_shell": LocalExecutor(),
-            "local_agent": LocalAgentExecutor(),
             "remote_shell": SshExecutor(),
-            "remote_agent": ContainerExecutor(),
             "cron_triggered": LocalExecutor(),
         }
 
@@ -85,4 +83,3 @@ class TaskWorker:
                     [f"task:{rec.id}"],
                     {"task_id": rec.id, "event": {"type": "task.failed", "error": str(exc)}},
                 )
-

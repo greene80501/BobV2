@@ -103,62 +103,6 @@ class ExecTerminateParams(BaseModel):
     command_id: str
 
 
-class AgentsSpawnParams(BaseModel):
-    thread_id: str
-    task: str
-    task_name: Optional[str] = None
-    model: Optional[str] = None
-    cwd: Optional[str] = None
-    mode: Optional[str] = None
-    name: Optional[str] = None
-    parent_agent_id: Optional[str] = None
-    parent_agent_ref: Optional[str] = None
-    role: Optional[str] = None
-
-
-class AgentsSendParams(BaseModel):
-    thread_id: str
-    agent_id: Optional[str] = None
-    agent_ref: Optional[str] = None
-    message: str
-
-
-class AgentsWaitParams(BaseModel):
-    thread_id: str
-    agent_id: Optional[str] = None
-    agent_ids: list[str] = Field(default_factory=list)
-    timeout_seconds: Optional[float] = None
-    any_target: bool = True
-    wait_for_states: list[str] = Field(default_factory=lambda: ["idle", "failed", "closed"])
-
-
-class AgentsCloseParams(BaseModel):
-    thread_id: str
-    agent_id: str
-    reason: Optional[str] = None
-
-
-class AgentsListParams(BaseModel):
-    thread_id: str
-    include_completed: bool = False
-
-
-class AgentsAssignParams(BaseModel):
-    thread_id: str
-    agent_id: Optional[str] = None
-    agent_ref: Optional[str] = None
-    task: str
-    task_name: Optional[str] = None
-    interrupt_running: bool = False
-    clear_queue: bool = False
-
-
-class AgentsResumeParams(BaseModel):
-    thread_id: str
-    agent_id: str
-    task: Optional[str] = None
-
-
 class DynamicToolDescriptor(BaseModel):
     name: str
     description: str

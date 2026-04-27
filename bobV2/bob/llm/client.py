@@ -6,16 +6,18 @@ Drop-in replacement for bob.client.openai_client.BobClient.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 import logging
 import os
 import re
+import threading
 from typing import Any, AsyncIterator, Optional, Union
 
 logger = logging.getLogger(__name__)
-_ENV_OVERRIDE_LOCK: asyncio.Lock | None = None
+_ENV_OVERRIDE_LOCK: threading.Lock | None = None
+_DEFAULT_PROVIDER_TIMEOUT_SECONDS = 45.0
 
 _SAFE_TOOL_NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]*$')
 
@@ -157,21 +159,21 @@ class StreamErrorEvent:
     retry_count: int
 
 
-def _get_env_override_lock() -> asyncio.Lock:
+def _get_env_override_lock() -> threading.Lock:
     global _ENV_OVERRIDE_LOCK
     if _ENV_OVERRIDE_LOCK is None:
-        _ENV_OVERRIDE_LOCK = asyncio.Lock()
+        _ENV_OVERRIDE_LOCK = threading.Lock()
     return _ENV_OVERRIDE_LOCK
 
 
-@asynccontextmanager
-async def _temporary_env(overrides: dict[str, str]):
+@contextmanager
+def _temporary_env(overrides: dict[str, str]):
     if not overrides:
         yield
         return
 
     lock = _get_env_override_lock()
-    async with lock:
+    with lock:
         previous: dict[str, str | None] = {}
         try:
             for key, value in overrides.items():
@@ -184,6 +186,26 @@ async def _temporary_env(overrides: dict[str, str]):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = old_value
+
+
+def _provider_timeout_seconds(extra_params: dict[str, Any]) -> float:
+    for key in ("timeout", "request_timeout"):
+        raw = extra_params.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(0.1, min(float(raw), 900.0))
+        except (TypeError, ValueError):
+            continue
+    return _DEFAULT_PROVIDER_TIMEOUT_SECONDS
+
+
+def _emit_threadsafe(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, kind: str, payload: Any) -> None:
+    try:
+        loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+    except RuntimeError:
+        # The consumer loop may already be closed after a timeout/failure.
+        return
 
 
 def _to_chat_messages(
@@ -401,6 +423,7 @@ class LiteLLMClient:
                 return
             except Exception as exc:
                 exc_name = type(exc).__name__.lower()
+                exc_text = str(exc).lower()
                 is_transient = any(
                     key in exc_name
                     for key in (
@@ -412,6 +435,8 @@ class LiteLLMClient:
                         "apierror",
                     )
                 )
+                if "provider stream stalled after" in exc_text:
+                    is_transient = False
                 if is_transient and retry_count < max_retries:
                     retry_count += 1
                     delay = base_delay * (2 ** (retry_count - 1))
@@ -441,15 +466,6 @@ class LiteLLMClient:
         max_output_tokens: Optional[int],
         extra_params: dict[str, Any],
     ) -> AsyncIterator:
-        try:
-            import litellm
-        except ImportError as exc:
-            yield StreamErrorEvent(
-                message="litellm is not installed. Run: pip install litellm",
-                retry_count=0,
-            )
-            raise StopAsyncIteration from exc
-
         enable_caching = bool(extra_params.get("prompt_caching", False))
         messages = _to_chat_messages(
             instructions,
@@ -481,110 +497,203 @@ class LiteLLMClient:
             kwargs["api_key"] = self._api_key
         kwargs.update(self._provider_kwargs)
         kwargs["stream_options"] = {"include_usage": True}
+        provider_timeout_seconds = _provider_timeout_seconds(kwargs)
+        kwargs.setdefault("timeout", provider_timeout_seconds)
+
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
+
+        def _worker() -> None:
+            asyncio.run(
+                self._stream_once_worker(
+                    kwargs=kwargs,
+                    tool_name_map=tool_name_map,
+                    queue=queue,
+                    loop=loop,
+                    stop_event=stop_event,
+                    provider_timeout_seconds=provider_timeout_seconds,
+                )
+            )
+
+        thread = threading.Thread(
+            target=_worker,
+            name=f"bob-litellm-{self.model.replace('/', '-')}",
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=provider_timeout_seconds,
+                    )
+                except asyncio.TimeoutError as exc:
+                    stop_event.set()
+                    raise TimeoutError(
+                        f"Provider stream stalled after {int(provider_timeout_seconds)}s with no progress "
+                        f"from model '{self.model}'."
+                    ) from exc
+
+                if kind == "event":
+                    yield payload
+                    continue
+                if kind == "error":
+                    raise payload
+                if kind == "done":
+                    break
+        finally:
+            stop_event.set()
+
+    async def _stream_once_worker(
+        self,
+        *,
+        kwargs: dict[str, Any],
+        tool_name_map: dict[str, str],
+        queue: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+        stop_event: threading.Event,
+        provider_timeout_seconds: float,
+    ) -> None:
+        try:
+            import litellm
+        except ImportError:
+            _emit_threadsafe(
+                loop,
+                queue,
+                "event",
+                StreamErrorEvent(
+                    message="litellm is not installed. Run: pip install litellm",
+                    retry_count=0,
+                ),
+            )
+            _emit_threadsafe(loop, queue, "done", None)
+            return
 
         tool_buffers: dict[int, dict[str, Any]] = {}
         final_usage: Any = None
         reasoning_parts: list[str] = []
 
-        async with _temporary_env(self._env_overrides):
-            response = await litellm.acompletion(**kwargs)
-
-            async for chunk in response:
-                if not getattr(chunk, "choices", None):
-                    usage = getattr(chunk, "usage", None)
-                    if usage:
-                        final_usage = usage
-                    continue
-
-                choice = chunk.choices[0]
-                delta = getattr(choice, "delta", None)
-                if delta is None:
-                    continue
-
-                content = getattr(delta, "content", None)
-                if content:
-                    yield TextDeltaEvent(delta=content)
-
-                thinking = getattr(delta, "thinking", None)
-                if thinking:
-                    reasoning_parts.append(str(thinking))
-                    yield ReasoningDeltaEvent(delta=thinking)
-
-                reasoning_content = getattr(delta, "reasoning_content", None)
-                if reasoning_content:
-                    reasoning_text = str(reasoning_content)
-                    reasoning_parts.append(reasoning_text)
-                    yield ReasoningDeltaEvent(delta=reasoning_text)
-
-                tc_deltas = getattr(delta, "tool_calls", None)
-                if tc_deltas:
-                    for tc in tc_deltas:
-                        idx = int(getattr(tc, "index", 0) or 0)
-                        fn = getattr(tc, "function", None)
-                        fn_name = getattr(fn, "name", None) if fn else None
-                        fn_args = getattr(fn, "arguments", None) if fn else None
-                        tc_id = getattr(tc, "id", None)
-
-                        # Some providers (e.g. Gemini via VertexAI) send all
-                        # parallel tool calls with index=0 instead of distinct
-                        # indices. When a new name arrives on an already-named
-                        # buffer, allocate a fresh slot rather than concatenating.
-                        if fn_name and idx in tool_buffers and tool_buffers[idx]["name"]:
-                            idx = max(tool_buffers.keys()) + 1
-
-                        if idx not in tool_buffers:
-                            tool_buffers[idx] = {"id": "", "name": "", "args": ""}
-                        buf = tool_buffers[idx]
-                        if tc_id:
-                            buf["id"] = tc_id
-                        if fn_name:
-                            buf["name"] += fn_name
-                        if fn_args:
-                            buf["args"] += fn_args
-                        provider_specific_fields = _extract_tool_call_provider_specific_fields(tc, fn)
-                        if provider_specific_fields:
-                            buf["provider_specific_fields"] = _merge_provider_specific_fields(
-                                buf.get("provider_specific_fields"),
-                                provider_specific_fields,
-                            )
-
-                usage = getattr(chunk, "usage", None)
-                if usage and (
-                    getattr(usage, "prompt_tokens", None)
-                    or getattr(usage, "total_tokens", None)
-                ):
-                    final_usage = usage
-
-        for idx in sorted(tool_buffers):
-            buf = tool_buffers[idx]
-            raw_args = buf["args"]
-            try:
-                parsed: dict[str, Any] = json.loads(raw_args) if raw_args else {}
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Failed to parse tool args for %r: %r",
-                    buf["name"],
-                    raw_args,
+        try:
+            with _temporary_env(self._env_overrides):
+                response = await asyncio.wait_for(
+                    litellm.acompletion(**kwargs),
+                    timeout=provider_timeout_seconds + 5.0,
                 )
-                parsed = {"_raw": raw_args}
-            # Restore original name if it was sanitized
-            original_name = tool_name_map.get(buf["name"], buf["name"])
-            yield ToolCallEvent(
-                id=buf["id"],
-                name=original_name,
-                input=parsed,
-                reasoning_content="".join(reasoning_parts),
-                provider_specific_fields=buf.get("provider_specific_fields"),
-            )
 
-        if final_usage is not None:
-            yield CompletedEvent(
-                input_tokens=int(getattr(final_usage, "prompt_tokens", 0) or 0),
-                output_tokens=int(getattr(final_usage, "completion_tokens", 0) or 0),
-                total_tokens=int(getattr(final_usage, "total_tokens", 0) or 0),
+                async for chunk in response:
+                    if stop_event.is_set():
+                        return
+                    if not getattr(chunk, "choices", None):
+                        usage = getattr(chunk, "usage", None)
+                        if usage:
+                            final_usage = usage
+                        continue
+
+                    choice = chunk.choices[0]
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
+                        continue
+
+                    content = getattr(delta, "content", None)
+                    if content:
+                        _emit_threadsafe(loop, queue, "event", TextDeltaEvent(delta=content))
+
+                    thinking = getattr(delta, "thinking", None)
+                    if thinking:
+                        reasoning_parts.append(str(thinking))
+                        _emit_threadsafe(loop, queue, "event", ReasoningDeltaEvent(delta=thinking))
+
+                    reasoning_content = getattr(delta, "reasoning_content", None)
+                    if reasoning_content:
+                        reasoning_text = str(reasoning_content)
+                        reasoning_parts.append(reasoning_text)
+                        _emit_threadsafe(
+                            loop,
+                            queue,
+                            "event",
+                            ReasoningDeltaEvent(delta=reasoning_text),
+                        )
+
+                    tc_deltas = getattr(delta, "tool_calls", None)
+                    if tc_deltas:
+                        for tc in tc_deltas:
+                            idx = int(getattr(tc, "index", 0) or 0)
+                            fn = getattr(tc, "function", None)
+                            fn_name = getattr(fn, "name", None) if fn else None
+                            fn_args = getattr(fn, "arguments", None) if fn else None
+                            tc_id = getattr(tc, "id", None)
+
+                            if fn_name and idx in tool_buffers and tool_buffers[idx]["name"]:
+                                idx = max(tool_buffers.keys()) + 1
+
+                            if idx not in tool_buffers:
+                                tool_buffers[idx] = {"id": "", "name": "", "args": ""}
+                            buf = tool_buffers[idx]
+                            if tc_id:
+                                buf["id"] = tc_id
+                            if fn_name:
+                                buf["name"] += fn_name
+                            if fn_args:
+                                buf["args"] += fn_args
+                            provider_specific_fields = _extract_tool_call_provider_specific_fields(tc, fn)
+                            if provider_specific_fields:
+                                buf["provider_specific_fields"] = _merge_provider_specific_fields(
+                                    buf.get("provider_specific_fields"),
+                                    provider_specific_fields,
+                                )
+
+                    usage = getattr(chunk, "usage", None)
+                    if usage and (
+                        getattr(usage, "prompt_tokens", None)
+                        or getattr(usage, "total_tokens", None)
+                    ):
+                        final_usage = usage
+
+            for idx in sorted(tool_buffers):
+                if stop_event.is_set():
+                    return
+                buf = tool_buffers[idx]
+                raw_args = buf["args"]
+                try:
+                    parsed: dict[str, Any] = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Failed to parse tool args for %r: %r",
+                        buf["name"],
+                        raw_args,
+                    )
+                    parsed = {"_raw": raw_args}
+                original_name = tool_name_map.get(buf["name"], buf["name"])
+                _emit_threadsafe(
+                    loop,
+                    queue,
+                    "event",
+                    ToolCallEvent(
+                        id=buf["id"],
+                        name=original_name,
+                        input=parsed,
+                        reasoning_content="".join(reasoning_parts),
+                        provider_specific_fields=buf.get("provider_specific_fields"),
+                    ),
+                )
+
+            completed = (
+                CompletedEvent(
+                    input_tokens=int(getattr(final_usage, "prompt_tokens", 0) or 0),
+                    output_tokens=int(getattr(final_usage, "completion_tokens", 0) or 0),
+                    total_tokens=int(getattr(final_usage, "total_tokens", 0) or 0),
+                )
+                if final_usage is not None
+                else CompletedEvent(input_tokens=0, output_tokens=0, total_tokens=0)
             )
-        else:
-            yield CompletedEvent(input_tokens=0, output_tokens=0, total_tokens=0)
+            _emit_threadsafe(loop, queue, "event", completed)
+        except Exception as exc:
+            _emit_threadsafe(loop, queue, "error", exc)
+        finally:
+            _emit_threadsafe(loop, queue, "done", None)
 
     async def list_models(self) -> list[str]:
         try:

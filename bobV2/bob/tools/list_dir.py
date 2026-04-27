@@ -51,15 +51,26 @@ async def list_dir_handler(tool_input: dict, context: Any) -> str:
 
     for entry in all_entries:
         name = entry.name
-        if entry.is_dir(follow_symlinks=False):
+        is_link = entry.is_symlink()
+        try:
+            is_dir = entry.is_dir() if is_link else entry.is_dir()
+        except OSError:
+            is_dir = False
+
+        if is_dir and not is_link:
             # Annotate with "/" and mark skippable noise dirs
             if name in _SKIP_NAMES:
                 dirs.append(f"{name}/ (skipped)")
             else:
                 dirs.append(f"{name}/")
-        elif entry.is_symlink():
-            target = entry.resolve()
-            if target.is_dir():
+        elif is_link:
+            try:
+                target = entry.resolve()
+                target_is_dir = target.is_dir()
+            except OSError:
+                target = Path("<unresolved>")
+                target_is_dir = False
+            if target_is_dir:
                 dirs.append(f"{name}@ -> {target}")
             else:
                 files.append(f"{name}@ -> {target}")

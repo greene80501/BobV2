@@ -16,82 +16,6 @@ from bob.protocol.events import Event, EventMsg
 
 
 # ---------------------------------------------------------------------------
-# Swarm task coroutines (module-level so they can run as asyncio.Tasks)
-# ---------------------------------------------------------------------------
-
-async def _run_swarm_task(session, sub_id: str, task: str, cancel_ev) -> None:
-    """Run SwarmOrchestrator as a turn-equivalent task."""
-    from bob.swarm.orchestrator import SwarmOrchestrator
-    from bob.protocol.events import Event, TurnEndedEvent, TurnStartedEvent
-    try:
-        await session._emit(Event(
-            id=sub_id,
-            msg=TurnStartedEvent(type="turn_started", turn_id=sub_id),
-        ))
-        await SwarmOrchestrator(session).run(task)
-        await session._emit(Event(
-            id=sub_id,
-            msg=TurnEndedEvent(type="turn_ended", turn_id=sub_id),
-        ))
-    except asyncio.CancelledError:
-        from bob.protocol.events import TurnInterruptedEvent
-        await session._emit(Event(
-            id=sub_id,
-            msg=TurnInterruptedEvent(type="turn_interrupted", turn_id=sub_id, graceful=True),
-        ))
-        raise
-    except Exception as exc:
-        from bob.protocol.events import ErrorEvent
-        await session._emit(Event(id=sub_id, msg=ErrorEvent(
-            type="error", message=f"Swarm error: {exc}"
-        )))
-
-
-async def _run_with_swarm_offer(
-    session,
-    sub_id: str,
-    op,
-    cancel_ev,
-    complexity: str,
-    reason: str,
-    user_preview: str,
-) -> None:
-    """Emit a SwarmOfferEvent, wait for user's y/n, then run swarm or normal turn."""
-    from bob.protocol.events import SwarmOfferEvent
-    from bob.core.turn import run_turn
-    from bob.swarm.orchestrator import SwarmOrchestrator
-
-    offer_id = sub_id
-    await session._emit(Event(
-        id=sub_id,
-        msg=SwarmOfferEvent(
-            offer_id=offer_id,
-            task_preview=user_preview[:200],
-            complexity=complexity,
-            reason=reason,
-        ),
-    ))
-
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    if not hasattr(session, "_pending_swarm_authorizations"):
-        session._pending_swarm_authorizations = {}
-    session._pending_swarm_authorizations[offer_id] = fut
-
-    try:
-        approved, _ = await asyncio.wait_for(fut, timeout=60.0)
-    except asyncio.TimeoutError:
-        approved = False
-    finally:
-        session._pending_swarm_authorizations.pop(offer_id, None)
-
-    if approved:
-        await _run_swarm_task(session, sub_id, user_preview, cancel_ev)
-    else:
-        await run_turn(session, sub_id, op, cancel_ev)
-
-
-# ---------------------------------------------------------------------------
 
 class ToolContext:
     """Passed to tool handlers â€” contains session state they need."""
@@ -101,7 +25,6 @@ class ToolContext:
         self.sandbox = session._sandbox_runner
         self.cancel_event = session._cancel_event
         self.approval_policy = session.config.ask_for_approval
-        self.thread_manager = None   # set per-turn for multi-agent
         self.on_output_delta = None  # set per-turn
         self.on_plan_update = None   # set per-turn
         self.on_request_user_input = None
@@ -137,9 +60,6 @@ class BobSession:
         # Domains approved for web access this session (key = request_id â†’ Future)
         self._pending_network_approvals: dict[str, asyncio.Future] = {}
         self._pending_dynamic_tool_calls: dict[str, asyncio.Future] = {}
-        # Swarm authorization futures — keyed by offer_id or swarm run_id
-        self._pending_swarm_authorizations: dict[str, asyncio.Future] = {}
-
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
         self._current_on_plan_update = None
@@ -185,11 +105,6 @@ class BobSession:
         # Plan mode: when True, write tools are filtered out of tool specs
         self._plan_mode: bool = False
 
-        # Multi-agent thread manager (lazy)
-        self._thread_manager = None
-        # Team manager (lazy)
-        self._team_manager = None
-
         # Pending user-input futures keyed by request_id
         self._pending_user_inputs: dict[str, asyncio.Future] = {}
 
@@ -204,9 +119,16 @@ class BobSession:
         # Task database
         from bob.core.task_db import TaskDB
         self._task_db = TaskDB(self.bob_home / "tasks.db")
+
+        # Agent control — multi-agent orchestration (parent sessions only)
+        if not ephemeral:
+            from bob.core.agents.control import AgentControl
+            self.agent_control: "AgentControl | None" = AgentControl(self)
+        else:
+            self.agent_control = None
         self._action_log_path = self._make_action_log_path()
         self._action_log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._action_log_handle = self._action_log_path.open("a", encoding="utf-8", buffering=1)
+        self._action_log_handle = self._action_log_path.open("a", encoding="utf-8-sig", buffering=1)
         self._log_action_line(
             f"[session] action log started session={self.session_id} cwd={self.cwd} model={self.config.model}"
         )
@@ -303,30 +225,6 @@ class BobSession:
         )
         from bob.tools.notebook_edit import (
             notebook_edit_handler, NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA,
-        )
-        from bob.tools.multi_agent.spawn_agent import (
-            spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
-        )
-        from bob.tools.multi_agent.send_message import (
-            send_message_handler, SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
-        )
-        from bob.tools.multi_agent.wait_agent import (
-            wait_agent_handler, WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
-        )
-        from bob.tools.multi_agent.list_agents import (
-            list_agents_handler, LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
-        )
-        from bob.tools.multi_agent.close_agent import (
-            close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
-        )
-        from bob.tools.multi_agent.assign_task import (
-            assign_task_handler, ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
-        )
-        from bob.tools.multi_agent.resume_agent import (
-            resume_agent_handler, RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA,
-        )
-        from bob.tools.multi_agent.run_workflow import (
-            run_workflow_handler, RUN_WORKFLOW_DESCRIPTION, RUN_WORKFLOW_SCHEMA,
         )
         from bob.tools.task_create import (
             task_create_handler, TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA,
@@ -475,34 +373,6 @@ class BobSession:
             "notebook_edit", NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA, notebook_edit_handler
         )
         # Phase 4 â€” multi-agent
-        self.tool_registry.register(
-            "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA, spawn_agent_handler
-        )
-        self.tool_registry.register(
-            "send_message", SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA, send_message_handler
-        )
-        self.tool_registry.register(
-            "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA, wait_agent_handler,
-            is_mutating=False,
-            supports_parallel=False,
-        )
-        self.tool_registry.register(
-            "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA, list_agents_handler,
-            is_mutating=False,
-            supports_parallel=True,
-        )
-        self.tool_registry.register(
-            "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA, close_agent_handler
-        )
-        self.tool_registry.register(
-            "assign_task", ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA, assign_task_handler
-        )
-        self.tool_registry.register(
-            "resume_agent", RESUME_AGENT_DESCRIPTION, RESUME_AGENT_SCHEMA, resume_agent_handler
-        )
-        self.tool_registry.register(
-            "run_workflow", RUN_WORKFLOW_DESCRIPTION, RUN_WORKFLOW_SCHEMA, run_workflow_handler
-        )
         # Task management tools
         self.tool_registry.register(
             "task_create", TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA, task_create_handler
@@ -636,31 +506,65 @@ class BobSession:
             mcp_authenticate_handler,
             source="mcp",
         )
-        # Team / swarm tools
-        from bob.tools.team_tools import (
-            team_create_handler, TEAM_CREATE_DESCRIPTION, TEAM_CREATE_SCHEMA,
-            team_spawn_agent_handler, TEAM_SPAWN_AGENT_DESCRIPTION, TEAM_SPAWN_AGENT_SCHEMA,
-            team_list_handler, TEAM_LIST_DESCRIPTION, TEAM_LIST_SCHEMA,
-            team_delete_handler, TEAM_DELETE_DESCRIPTION, TEAM_DELETE_SCHEMA,
-        )
-        self.tool_registry.register(
-            "team_create", TEAM_CREATE_DESCRIPTION, TEAM_CREATE_SCHEMA,
-            team_create_handler,
-        )
-        self.tool_registry.register(
-            "team_spawn_agent", TEAM_SPAWN_AGENT_DESCRIPTION, TEAM_SPAWN_AGENT_SCHEMA,
-            team_spawn_agent_handler,
-        )
-        self.tool_registry.register(
-            "team_list", TEAM_LIST_DESCRIPTION, TEAM_LIST_SCHEMA,
-            team_list_handler,
-            is_mutating=False,
-            supports_parallel=True,
-        )
-        self.tool_registry.register(
-            "team_delete", TEAM_DELETE_DESCRIPTION, TEAM_DELETE_SCHEMA,
-            team_delete_handler,
-        )
+        # Multi-agent tools (only for non-ephemeral sessions)
+        if not self.ephemeral:
+            from bob.tools.agents import (
+                spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
+                wait_agent_handler, WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
+                send_message_handler, SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
+                assign_task_handler, ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
+                close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
+                list_agents_handler, LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
+            )
+            self.tool_registry.register(
+                "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
+                spawn_agent_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agent", "parallel", "spawn", "worker", "background"],
+            )
+            self.tool_registry.register(
+                "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
+                wait_agent_handler,
+                is_mutating=False,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agent", "wait", "join", "result"],
+            )
+            self.tool_registry.register(
+                "send_message", SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
+                send_message_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agent", "message", "communicate"],
+            )
+            self.tool_registry.register(
+                "assign_task", ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
+                assign_task_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agent", "task", "assign", "redirect"],
+            )
+            self.tool_registry.register(
+                "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
+                close_agent_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agent", "close", "cancel", "stop", "kill"],
+            )
+            self.tool_registry.register(
+                "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
+                list_agents_handler,
+                is_mutating=False,
+                supports_parallel=True,
+                source="agents",
+                keywords=["agent", "list", "status", "running"],
+            )
+
         # MCP resource tools
         from bob.tools.mcp_resource_tools import (
             mcp_list_resources_handler, MCP_LIST_RESOURCES_DESCRIPTION, MCP_LIST_RESOURCES_SCHEMA,
@@ -680,20 +584,6 @@ class BobSession:
             supports_parallel=True,
             source="mcp",
         )
-
-    def ensure_thread_manager(self):
-        """Lazily create and cache the ThreadManager."""
-        if self._thread_manager is None:
-            from bob.core.thread_manager import ThreadManager
-            self._thread_manager = ThreadManager(self)
-        return self._thread_manager
-
-    def ensure_team_manager(self):
-        """Lazily create and cache the TeamManager."""
-        if self._team_manager is None:
-            from bob.core.team import TeamManager
-            self._team_manager = TeamManager(self)
-        return self._team_manager
 
     async def request_user_input(self, request_id: str, prompt: str, fields: list) -> str:
         """Called by ask_user tool â€” creates a future and waits for UserInputAnswerOp."""
@@ -1290,11 +1180,6 @@ class BobSession:
     async def shutdown(self) -> None:
         self._shutdown_event.set()
         self._log_action_line("[session] shutdown requested")
-        if self._thread_manager is not None:
-            try:
-                await self._thread_manager.shutdown_all()
-            except Exception:
-                pass
         if self._agent_task:
             self._agent_task.cancel()
             try:
@@ -1451,7 +1336,6 @@ class BobSession:
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
-            SwarmAuthorizationOp, RunSwarmOp,
         )
         from bob.protocol.events import (
             SessionEndedEvent, ThreadNameSetEvent,
@@ -1539,15 +1423,6 @@ class BobSession:
 
             if isinstance(op, DynamicToolResponseOp):
                 self.resolve_dynamic_tool(op.tool_call_id, op.result)
-                continue
-
-            # ----------------------------------------------------------------
-            # Swarm authorization (resolves both offer gate and plan gate)
-            # ----------------------------------------------------------------
-            if isinstance(op, SwarmAuthorizationOp):
-                fut = self._pending_swarm_authorizations.get(op.run_id)
-                if fut and not fut.done():
-                    fut.set_result((op.approved, op.feedback))
                 continue
 
             # ----------------------------------------------------------------
@@ -1729,22 +1604,7 @@ class BobSession:
             # ----------------------------------------------------------------
             # User turn â€” the main path
             # ----------------------------------------------------------------
-            if isinstance(op, RunSwarmOp):
-                if current_turn_task is not None and not current_turn_task.done():
-                    from bob.protocol.events import ErrorEvent
-                    await self._emit(Event(
-                        id=sub_id,
-                        msg=ErrorEvent(type="error", message="A turn is already running.")
-                    ))
-                    continue
-                user_preview = op.task[:100]
-                current_turn_preview = user_preview
-                cancel_ev = asyncio.Event()
-                self._current_turn_cancel = cancel_ev
-                current_turn_task = asyncio.create_task(
-                    _run_swarm_task(self, sub_id, op.task, cancel_ev)
-                )
-            elif isinstance(op, UserTurnOp):
+            if isinstance(op, UserTurnOp):
                 if current_turn_task is not None and not current_turn_task.done():
                     from bob.protocol.events import ErrorEvent
                     await self._emit(Event(
@@ -1758,32 +1618,9 @@ class BobSession:
 
                 cancel_ev = asyncio.Event()
                 self._current_turn_cancel = cancel_ev
-
-                swarm_cfg = getattr(self.config, "swarm", None)
-                if swarm_cfg and swarm_cfg.enabled and swarm_cfg.auto_detect and user_preview:
-                    from bob.swarm.complexity import TaskComplexityAnalyzer
-                    from bob.swarm.models import TaskComplexity as _TC
-                    _cx, _reason = TaskComplexityAnalyzer().classify(user_preview)
-                    _thresh = getattr(swarm_cfg, "auto_detect_threshold", "moderate")
-                    _offer = (
-                        (_thresh == "moderate" and _cx in (_TC.MODERATE, _TC.COMPLEX))
-                        or (_thresh == "complex" and _cx == _TC.COMPLEX)
-                    )
-                    if _offer:
-                        current_turn_task = asyncio.create_task(
-                            _run_with_swarm_offer(
-                                self, sub_id, op, cancel_ev,
-                                _cx.value, _reason, user_preview,
-                            )
-                        )
-                    else:
-                        current_turn_task = asyncio.create_task(
-                            run_turn(self, sub_id, op, cancel_ev)
-                        )
-                else:
-                    current_turn_task = asyncio.create_task(
-                        run_turn(self, sub_id, op, cancel_ev)
-                    )
+                current_turn_task = asyncio.create_task(
+                    run_turn(self, sub_id, op, cancel_ev)
+                )
             else:
                 continue  # op already handled earlier in the loop
 
@@ -1791,8 +1628,8 @@ class BobSession:
                 continue
 
             # Keep polling the submission queue while the turn is running so
-            # approval, interrupt, and swarm authorization ops can resolve the
-            # futures the active turn is waiting on.
+            # approval and interrupt ops can resolve the futures the active
+            # turn is waiting on.
             try:
                 while not current_turn_task.done():
                     try:
@@ -1834,11 +1671,6 @@ class BobSession:
 
                     elif isinstance(inner_op, InterruptOp):
                         cancel_ev.set()
-
-                    elif isinstance(inner_op, SwarmAuthorizationOp):
-                        _sfut = self._pending_swarm_authorizations.get(inner_op.run_id)
-                        if _sfut and not _sfut.done():
-                            _sfut.set_result((inner_op.approved, inner_op.feedback))
 
                 exc = current_turn_task.exception()
                 if exc is not None:

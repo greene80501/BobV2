@@ -17,8 +17,6 @@ class RequestContext:
     registry: Any
     event_bus: Any
     task_runtime: Any
-    agent_runtime: Any
     router: Any
     connection: Optional[ConnectionContext] = None
     logger: Any = None
-

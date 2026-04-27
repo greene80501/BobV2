@@ -24,7 +24,6 @@ class SlashCommand(str, Enum):
     COMPACT = "compact"
     PLAN = "plan"
     COLLAB = "collab"
-    AGENT = "agent"
     DIFF = "diff"
     COPY = "copy"
     MENTION = "mention"
@@ -47,7 +46,6 @@ class SlashCommand(str, Enum):
     PERSONALITY = "personality"
     REALTIME = "realtime"
     SETTINGS = "settings"
-    SUBAGENTS = "subagents"
     DEBUG_M_DROP = "debug-m-drop"
     DEBUG_M_UPDATE = "debug-m-update"
     # Phase 1 additions
@@ -70,8 +68,6 @@ class SlashCommand(str, Enum):
     THINK = "think"
     BRIEF = "brief"
     TASKS = "tasks"
-    # Swarm
-    SWARM = "swarm"
 
 
 COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
@@ -92,7 +88,6 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.COMPACT: "summarize conversation to prevent hitting the context limit",
     SlashCommand.PLAN: "switch to Plan mode",
     SlashCommand.COLLAB: "change collaboration mode (experimental)",
-    SlashCommand.AGENT: "switch the active agent thread",
     SlashCommand.DIFF: "show git diff (including untracked files)",
     SlashCommand.COPY: "copy the latest bob output to your clipboard",
     SlashCommand.MENTION: "mention a file",
@@ -115,7 +110,6 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.PERSONALITY: "choose a communication style for bob",
     SlashCommand.REALTIME: "toggle realtime voice mode (experimental)",
     SlashCommand.SETTINGS: "configure realtime microphone/speaker",
-    SlashCommand.SUBAGENTS: "switch the active agent thread",
     SlashCommand.DEBUG_M_DROP: "drop all memories (debug)",
     SlashCommand.DEBUG_M_UPDATE: "update memories (debug)",
     # Phase 1
@@ -138,7 +132,6 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.THINK: "set thinking budget for next turn: /think [tokens]",
     SlashCommand.BRIEF: "alias for /output-style brief",
     SlashCommand.TASKS: "list all tasks or filter by status: /tasks [status]",
-    SlashCommand.SWARM: "run task as coordinated agent swarm: /swarm [task]",
 }
 
 AVAILABLE_DURING_TASK: set[SlashCommand] = {
@@ -148,7 +141,7 @@ AVAILABLE_DURING_TASK: set[SlashCommand] = {
     SlashCommand.MCP, SlashCommand.APPS, SlashCommand.PLUGINS,
     SlashCommand.FEEDBACK, SlashCommand.QUIT, SlashCommand.EXIT,
     SlashCommand.ROLLOUT, SlashCommand.REALTIME, SlashCommand.SETTINGS,
-    SlashCommand.COLLAB, SlashCommand.AGENT, SlashCommand.SUBAGENTS,
+    SlashCommand.COLLAB,
 }
 
 SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
@@ -156,7 +149,7 @@ SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.FAST, SlashCommand.SANDBOX_READ_ROOT,
     SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.BRANCH,
     SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
-    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK, SlashCommand.SWARM,
+    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK,
 }
 
 

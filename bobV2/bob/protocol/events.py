@@ -518,6 +518,41 @@ class BackgroundTerminalsCleanedEvent(BaseModel):
 
 
 # ===========================================================================
+# Sub-agent system
+# ===========================================================================
+
+class AgentSpawnedEvent(BaseModel):
+    type: Literal["agent_spawned"] = "agent_spawned"
+    agent_id: str
+    path: str
+    name: str
+    task: str
+
+
+class AgentProgressEvent(BaseModel):
+    type: Literal["agent_progress"] = "agent_progress"
+    agent_id: str
+    path: str
+    name: str
+    status: str
+    last_activity: str
+    tool_use_count: int
+    token_count: int
+
+
+class AgentCompletedEvent(BaseModel):
+    type: Literal["agent_completed"] = "agent_completed"
+    agent_id: str
+    path: str
+    name: str
+    status: str   # "completed" | "errored" | "interrupted"
+    result: Optional[str] = None
+    error: Optional[str] = None
+    tool_use_count: int = 0
+    token_count: int = 0
+
+
+# ===========================================================================
 # Inter-agent communication
 # ===========================================================================
 
@@ -602,16 +637,6 @@ class DebugEvent(BaseModel):
     data: Optional[dict[str, Any]] = None
 
 
-class AgentStatusEvent(BaseModel):
-    type: Literal["agent_status"] = "agent_status"
-    agent_id: str = ""     # short 8-char ID
-    display_name: str = "" # human-readable agent label
-    color: str = ""        # ANSI color code assigned to this agent
-    status: str = ""       # "running" | "tool_use" | "done" | "closed" | "error"
-    activity: str = ""     # human-readable: "Thinking…", "Read File…", "Done · 312 tok"
-    tokens: int = 0        # cumulative output token count
-
-
 # ===========================================================================
 # Token budget / cost
 # ===========================================================================
@@ -630,75 +655,6 @@ class CostEstimateEvent(BaseModel):
     estimated_cost_usd: float
     input_tokens: int
     output_tokens: int
-
-
-# ===========================================================================
-# Swarm
-# ===========================================================================
-
-class SwarmOfferEvent(BaseModel):
-    """Emitted when Bob detects a complex task and offers swarm mode."""
-    type: Literal["swarm_offer"] = "swarm_offer"
-    offer_id: str   # matches the submission id — used to resolve the authorization future
-    task_preview: str
-    complexity: str  # "moderate" | "complex"
-    reason: str
-
-
-class SwarmStartedEvent(BaseModel):
-    type: Literal["swarm_started"] = "swarm_started"
-    run_id: str
-    task: str
-
-
-class SwarmPlanReadyEvent(BaseModel):
-    type: Literal["swarm_plan_ready"] = "swarm_plan_ready"
-    run_id: str
-    plan: dict[str, Any]
-
-
-class SwarmAuthorizedEvent(BaseModel):
-    type: Literal["swarm_authorized"] = "swarm_authorized"
-    run_id: str
-
-
-class SwarmProgressEvent(BaseModel):
-    type: Literal["swarm_progress"] = "swarm_progress"
-    run_id: str
-    agents_total: int
-    agents_done: int
-    agents_running: int
-    current_phase: str
-    message: str
-
-
-class SwarmAgentCompletedEvent(BaseModel):
-    type: Literal["swarm_agent_completed"] = "swarm_agent_completed"
-    run_id: str
-    agent_id: str
-    role: str
-    files_modified: list[str] = Field(default_factory=list)
-
-
-class SwarmPatchReadyEvent(BaseModel):
-    type: Literal["swarm_patch_ready"] = "swarm_patch_ready"
-    run_id: str
-    files_changed: list[str]
-    summary: str
-    patch_text: str
-
-
-class SwarmCompletedEvent(BaseModel):
-    type: Literal["swarm_completed"] = "swarm_completed"
-    run_id: str
-    success: bool
-    message: str
-
-
-class SwarmCancelledEvent(BaseModel):
-    type: Literal["swarm_cancelled"] = "swarm_cancelled"
-    run_id: str
-    reason: str
 
 
 # ===========================================================================
@@ -801,6 +757,10 @@ EventMsg = Annotated[
         # Background terminals
         BackgroundTerminalOutputEvent,
         BackgroundTerminalsCleanedEvent,
+        # Sub-agent system
+        AgentSpawnedEvent,
+        AgentProgressEvent,
+        AgentCompletedEvent,
         # Inter-agent
         InterAgentMessageEvent,
         InterAgentResponseEvent,
@@ -816,20 +776,9 @@ EventMsg = Annotated[
         WarningEvent,
         InfoEvent,
         DebugEvent,
-        AgentStatusEvent,
         # Token budget / cost
         TokenBudgetEvent,
         CostEstimateEvent,
-        # Swarm
-        SwarmOfferEvent,
-        SwarmStartedEvent,
-        SwarmPlanReadyEvent,
-        SwarmAuthorizedEvent,
-        SwarmProgressEvent,
-        SwarmAgentCompletedEvent,
-        SwarmPatchReadyEvent,
-        SwarmCompletedEvent,
-        SwarmCancelledEvent,
         # IDE integration
         IDEShowDiffEvent,
     ],

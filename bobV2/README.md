@@ -166,8 +166,6 @@ Type `/` and press Tab to autocomplete. Full list:
 | `/mention` | Mention a file |
 | `/approvals` | Configure what bob is allowed to do |
 | `/sandbox-add-read-dir <path>` | Allow sandbox to read a directory |
-| `/agent` | Switch active agent thread |
-| `/subagents` | Manage agent threads |
 | `/collab` | Change collaboration mode |
 | `/skills` | Manage skills |
 | `/hooks` | List configured hooks |

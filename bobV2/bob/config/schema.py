@@ -42,6 +42,12 @@ class WebSearchToolConfig(BaseModel):
     context_size: Optional[WebSearchContextSize] = None
     allowed_domains: Optional[list[str]] = None
     location: Optional[str] = None
+    default_max_results: int = 10
+    max_results_cap: int = 50
+    default_fetch_pages: bool = False
+    default_fetch_per_query: int = 3
+    max_concurrency: int = 8
+    fetch_timeout_seconds: float = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -89,32 +95,6 @@ class ProviderConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Swarm configuration
-# ---------------------------------------------------------------------------
-
-class SwarmConfig(BaseModel):
-    enabled: bool = True
-    # Auto-detect complex tasks and offer swarm mode
-    auto_detect: bool = True
-    # Minimum complexity level to trigger the offer: "moderate" or "complex"
-    auto_detect_threshold: str = "moderate"
-    # Max parallel execution agents
-    max_agents: int = 20
-    # Per-agent wall-clock timeout in seconds
-    agent_timeout_seconds: int = 300
-    # Turns with no file/turn activity before flagging as stalled
-    stall_threshold_turns: int = 5
-    # Delete agent temp dirs after the run completes
-    workspace_cleanup: bool = True
-    # Planner attempts before falling back
-    planning_max_retries: int = 2
-    # Allow executing fallback plans for broad tasks when structured planning fails
-    allow_unsafe_fallback_execution: bool = False
-    # Audit log directory (None = ~/.bob/swarm_runs)
-    audit_log_dir: Optional[Path] = None
-
-
-# ---------------------------------------------------------------------------
 # Full BobConfig
 # ---------------------------------------------------------------------------
 
@@ -157,7 +137,7 @@ class BobConfig(BaseModel):
     # ------------------------------------------------------------------
     sandbox_mode: SandboxMode = SandboxMode.WORKSPACE_WRITE
     writable_roots: list[Path] = Field(default_factory=list)
-    network_access: bool = False
+    network_access: bool = True
     # Domain patterns that may bypass per-request network approval
     # (e.g. "github.com", "*.openai.com").
     approved_network_domains: list[str] = Field(default_factory=list)
@@ -166,7 +146,7 @@ class BobConfig(BaseModel):
     network_proxy: str = ""
 
     # ------------------------------------------------------------------
-    # Collaboration / multi-agent
+    # Collaboration
     # ------------------------------------------------------------------
     collaboration_mode: CollaborationMode = Field(
         default_factory=lambda: CollaborationMode(
@@ -178,7 +158,7 @@ class BobConfig(BaseModel):
     # ------------------------------------------------------------------
     # Web search
     # ------------------------------------------------------------------
-    web_search_mode: WebSearchMode = WebSearchMode.DISABLED
+    web_search_mode: WebSearchMode = WebSearchMode.LIVE
     web_search: WebSearchToolConfig = Field(default_factory=WebSearchToolConfig)
 
     # ------------------------------------------------------------------
@@ -295,11 +275,6 @@ class BobConfig(BaseModel):
     persist_sessions: bool = True
 
     # ------------------------------------------------------------------
-    # Swarm
-    # ------------------------------------------------------------------
-    swarm: SwarmConfig = Field(default_factory=SwarmConfig)
-
-    # ------------------------------------------------------------------
     # Misc feature flags
     # ------------------------------------------------------------------
     # Enable the realtime (voice) conversation feature
@@ -308,8 +283,6 @@ class BobConfig(BaseModel):
     enable_review: bool = True
     # Enable background terminal tracking
     enable_background_terminals: bool = True
-    # Enable guardian sub-agent for approval decisions
-    enable_guardian: bool = False
     # Named feature toggles for experimental features
     feature_flags: dict[str, bool] = Field(default_factory=dict)
     # Extra arbitrary key/value pairs forwarded to plugins / tools

@@ -223,6 +223,26 @@ def detect_escalation(command: list[str]) -> str | None:
     return None
 
 
+def _stream_idle_timeout_seconds(session: "BobSession") -> float:
+    exec_timeout = float(getattr(session.config, "exec_timeout_seconds", 120) or 120)
+    return max(15.0, min(45.0, exec_timeout * 0.25))
+
+
+async def _next_stream_event(
+    events_iter,
+    *,
+    idle_timeout_seconds: float,
+    model: str,
+):
+    try:
+        return await asyncio.wait_for(events_iter.__anext__(), timeout=idle_timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"Provider stream stalled after {int(idle_timeout_seconds)}s with no progress "
+            f"from model '{model}'."
+        ) from exc
+
+
 def needs_approval(
     command: list[str],
     policy: AskForApproval,
@@ -486,12 +506,27 @@ async def run_turn(
             extra_params = build_model_request_params(session.config, compatibility)
 
             try:
-                async for ev in session.client.stream_turn(
+                stream_iter = session.client.stream_turn(
                     input=current_history,
                     instructions=session._system_prompt or "",
                     tools=tool_specs,
                     extra_params=extra_params,
-                ):
+                ).__aiter__()
+                idle_timeout_seconds = _stream_idle_timeout_seconds(session)
+                while True:
+                    try:
+                        ev = await _next_stream_event(
+                            stream_iter,
+                            idle_timeout_seconds=idle_timeout_seconds,
+                            model=session.config.model,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as exc:
+                        await emit(ErrorEvent(type="error", message=str(exc)))
+                        stream_error_message = None
+                        tool_calls = []
+                        break
                     if cancel_event.is_set():
                         break
 

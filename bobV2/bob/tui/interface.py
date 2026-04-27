@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import html
+import json
 import os
 import re
 import shutil
@@ -76,6 +77,7 @@ def _r(s: str) -> str:   return f"{_RED}{s}{_R}"
 def _g(s: str) -> str:   return f"{_GRN}{s}{_R}"
 def _y(s: str) -> str:   return f"{_YLW}{s}{_R}"
 def _c(s: str) -> str:   return f"{_PRP}{s}{_R}"
+def _cy(s: str) -> str:  return _c(s)
 def _cb(s: str) -> str:  return f"{_BLU}{_BLD}{s}{_R}"
 def _cg(s: str) -> str:  return f"{_GRN}{s}{_R}"
 def _bd(s: str) -> str:  return f"{_BRD}{s}{_R}"
@@ -1002,12 +1004,16 @@ class Interface:
         self._markdown_stream = StreamState()
         self._stream_last_flush: float = 0.0
         self._tool_call_inputs: dict[str, dict] = {}
-        # Sub-agent status strip: agent_id -> {color, activity, tokens, status, _done_at}
-        self._agent_statuses: dict[str, dict] = {}
+        # Approval-in-progress flag (keyboard reader must pause during approval prompts)
+        self._approval_active: bool = False
         self._last_spinner_snapshot: str = ""
+        self._last_terminal_mutation: str = ""
+        # Sub-agent tracking for spinner timers and inspector
+        self._active_agents: dict[str, dict] = {}  # agent_id → {name, started_at, last_activity}
+        self._task_running_for_agents: bool = False
         self._session_log_path = self._make_session_log_path()
         self._session_log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._session_log_handle = self._session_log_path.open("a", encoding="utf-8", buffering=1)
+        self._session_log_handle = self._session_log_path.open("a", encoding="utf-8-sig", buffering=1)
         self._log_ui_line(f"[session] log started for session={getattr(self._session, 'session_id', 'unknown')}")
 
     def _make_session_log_path(self) -> Path:
@@ -1031,12 +1037,16 @@ class Interface:
             self._last_spinner_snapshot = snapshot
             self._log_ui_line(snapshot)
 
-    def _log_terminal_mutation(self, action: str, **details: object) -> None:
+    def _log_terminal_mutation(self, action: str, *, dedupe: bool = False, **details: object) -> None:
         suffix = ""
         if details:
             parts = [f"{key}={value}" for key, value in details.items()]
             suffix = " " + " ".join(parts)
-        self._log_ui_line(f"[terminal] {action}{suffix}")
+        line = f"[terminal] {action}{suffix}"
+        if dedupe and line == self._last_terminal_mutation:
+            return
+        self._last_terminal_mutation = line
+        self._log_ui_line(line)
 
     def _log_terminal_block(self, label: str, lines: list[str]) -> None:
         if not lines:
@@ -1050,43 +1060,19 @@ class Interface:
             payload = msg.model_dump() if hasattr(msg, "model_dump") else str(msg)
         except Exception:
             payload = str(msg)
-        text = str(payload)
+        try:
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            text = str(payload)
         if len(text) > 4000:
             text = text[:4000] + "... [truncated]"
         self._log_ui_line(f"[event] type={event_type} payload={text}")
 
-    def _record_agent_status(
-        self,
-        agent_id: str,
-        *,
-        color: str,
-        display_name: str,
-        activity: str,
-        tokens: int,
-        status: str,
-    ) -> None:
-        import time as _time
-
-        _done_at = None
-        if status in ("done", "closed", "error"):
-            _done_at = _time.monotonic()
-        self._agent_statuses[agent_id] = {
-            "color": color,
-            "display_name": display_name or agent_id,
-            "activity": activity,
-            "tokens": tokens,
-            "status": status,
-            "_done_at": _done_at,
-        }
+    def _log_event_handler_error(self, msg: object, exc: Exception) -> None:
+        event_type = getattr(msg, "type", msg.__class__.__name__)
         self._log_ui_line(
-            f"[agent-panel] update id={agent_id} status={status} tokens={tokens} activity={_strip_ansi(activity)}"
+            f"[event-error] type={event_type} error={exc.__class__.__name__}: {exc}"
         )
-
-    def _clear_agent_statuses(self, reason: str) -> None:
-        if self._agent_statuses:
-            removed = ", ".join(sorted(self._agent_statuses.keys()))
-            self._log_ui_line(f"[agent-panel] cleared reason={reason} removed={removed}")
-        self._agent_statuses.clear()
 
     # ── Dynamic prompt & footer toolbar ──────────────────────────────────────
 
@@ -1211,7 +1197,7 @@ class Interface:
             in_t  = self._total_input_tokens
             out_t = self._total_output_tokens
             model = self._config.model
-            hint = "Enter send · Alt+Enter newline · / commands · @ files"
+            hint = "Enter to send · Alt+Enter newline · / commands · @ files"
             meta = f"{model} · in {in_t:,} · out {out_t:,}"
             pad = max(2, term_w - len(hint) - len(meta) - 2)
             return ANSI(f"{_SFT}{hint}{' ' * pad}{RST}{DIM}{meta}{RST}")
@@ -1633,251 +1619,118 @@ class Interface:
             self._spinner_stop.set()
         if self._spinner_task and not self._spinner_task.done():
             try:
-                await asyncio.wait_for(self._spinner_task, timeout=0.3)
+                await asyncio.wait_for(self._spinner_task, timeout=2.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 self._spinner_task.cancel()
         self._spinner_task = None
 
-    async def _run_spinner(self) -> None:
-        """Animate spinner + sub-agent status strip via sys.__stdout__."""
-        import time as _time
-        out    = sys.__stdout__
-        frames = _SPINNER_FRAMES
-        i = 0
-        prev_agent_lines = 0
+    # ── Agent inspector helpers ───────────────────────────────────────────────
 
-        def _clip(text: str, max_len: int) -> str:
-            text = str(text or "").strip()
-            if max_len <= 0:
-                return ""
-            if len(text) <= max_len:
-                return text
-            if max_len == 1:
-                return "…"
-            return text[: max_len - 1] + "…"
+    def _compute_spinner_label(self) -> str:
+        if not self._active_agents:
+            return self._spinner_label
+        now = time.time()
+        parts = []
+        for info in self._active_agents.values():
+            elapsed = int(now - info["started_at"])
+            timer = f"{elapsed // 60}:{elapsed % 60:02d}"
+            parts.append(f"[{info['name']}] {timer}")
+        n = len(parts)
+        if n == 1:
+            return f"agent: {parts[0]}"
+        return f"{n} agents: {' · '.join(parts)}"
 
-        def _status_badge(status: str) -> str:
-            status = (status or "").lower()
-            if status == "done":
-                return f"{_GRN}[DONE]{_R}"
-            if status == "error":
-                return f"{_RED}[ERR ]{_R}"
-            if status == "closed":
-                return f"{_DIM}[EXIT]{_R}"
-            if status == "tool_use":
-                return f"{_YLW}[TOOL]{_R}"
-            return f"{_BLU}[RUN ]{_R}"
-        try:
-            while not self._spinner_stop.is_set():
-                frame = frames[i % len(frames)]
-                label = self._spinner_label
+    def _draw_inspector_panel(self, selected: int) -> int:
+        """Draw agent inspector panel to stdout. Returns number of lines written."""
+        agent_ctrl = getattr(self._session, "agent_control", None)
+        if not agent_ctrl:
+            return 0
+        records = [r for r in agent_ctrl.registry._agents.values() if not r.status.is_terminal]
+        if not records:
+            return 0
+        selected = min(selected, len(records) - 1)
+        now = time.time()
+        out = sys.__stdout__
+        lines = 0
+        out.write(f"\r  {_DIM}── agents {'─' * 40}{_R}\n")
+        lines += 1
+        for i, rec in enumerate(records):
+            cursor = "▶" if i == selected else " "
+            info = self._active_agents.get(rec.agent_id, {})
+            t0 = info.get("started_at", now)
+            elapsed = int(now - t0)
+            timer = f"{elapsed // 60}:{elapsed % 60:02d}"
+            activity = rec.progress.last_activity[:42] if rec.progress.last_activity else "starting…"
+            out.write(f"  {cursor} {_BLD}[{rec.path.name}]{_R} {_DIM}{timer}{_R}  {activity}\n")
+            lines += 1
+        out.write(f"  {_DIM}↑↓ navigate · Enter inspect · Esc close{_R}\n")
+        lines += 1
+        out.flush()
+        return lines
 
-                # Expire agents that finished > 2 seconds ago
-                _now_mono = _time.monotonic()
-                previous_agent_ids = set(self._agent_statuses.keys())
-                to_remove = [
-                    aid for aid, info in self._agent_statuses.items()
-                    if info.get("status") in ("done", "closed", "error")
-                    and info.get("_done_at") is not None
-                    and (_now_mono - info["_done_at"]) > 2.0
-                ]
-                for aid in to_remove:
-                    del self._agent_statuses[aid]
-                removed_agent_ids = sorted(previous_agent_ids - set(self._agent_statuses.keys()))
-                if removed_agent_ids:
-                    self._log_ui_line(
-                        f"[agent-panel] removed expired entries: {', '.join(removed_agent_ids)}"
-                    )
+    def _clear_inspector_panel(self, lines: int) -> None:
+        """Erase the inspector panel by moving cursor up and clearing to end of screen."""
+        if lines <= 0:
+            return
+        out = sys.__stdout__
+        out.write(f"\033[{lines}A\033[J")
+        out.flush()
 
-                # Build one display line per active agent
-                agent_lines: list[str] = []
-                for aid, info in self._agent_statuses.items():
-                    color   = info.get("color", "")
-                    display_name = info.get("display_name", aid)
-                    activity = info.get("activity", "")
-                    tokens  = info.get("tokens", 0)
-                    status  = info.get("status", "")
-                    if status == "done":
-                        indicator = "\033[32m✓\033[0m"
-                    elif status == "error":
-                        indicator = "\033[31m✗\033[0m"
-                    else:
-                        indicator = "\033[2m·\033[0m"
-                    tok_str = f"  \033[2m{tokens:,} tok\033[0m" if tokens else ""
-                    agent_lines.append(
-                        f"  {indicator} {color}{display_name}\033[0m \033[2m{activity}\033[0m{tok_str}"
-                    )
-
-                # Move cursor back up to the spinner line from last frame
-                if prev_agent_lines > 0:
-                    out.write(f"\033[{prev_agent_lines}A")
-
-                # Draw spinner line
-                out.write(f"\r\033[2K  {frame} \033[2m{label}\033[0m")
-
-                # Draw agent lines below
-                for line in agent_lines:
-                    out.write(f"\n\r\033[2K{line}")
-                self._log_spinner_snapshot(label, agent_lines)
-
-                # Clear leftover lines from a frame that had more agents
-                extra = prev_agent_lines - len(agent_lines)
-                if extra > 0:
-                    for _ in range(extra):
-                        out.write(f"\n\r\033[2K")
-                    out.write(f"\033[{extra}A")
-
-                out.flush()
-                prev_agent_lines = len(agent_lines)
-                i += 1
-                await asyncio.sleep(0.08)
-        finally:
-            # Clear spinner line + all agent lines, leave cursor at col 0 of spinner line
-            if prev_agent_lines > 0:
-                out.write(f"\033[{prev_agent_lines}A")
-            out.write("\r\033[2K")
-            for _ in range(prev_agent_lines):
-                out.write(f"\n\r\033[2K")
-            if prev_agent_lines > 0:
-                out.write(f"\033[{prev_agent_lines}A")
-            out.write("\r")
-            out.flush()
+    def _print_agent_detail(self, selected: int) -> None:
+        """Print detailed status of the selected agent directly to stdout."""
+        agent_ctrl = getattr(self._session, "agent_control", None)
+        if not agent_ctrl:
+            return
+        records = [r for r in agent_ctrl.registry._agents.values() if not r.status.is_terminal]
+        if not records or selected >= len(records):
+            return
+        rec = records[selected]
+        info = self._active_agents.get(rec.agent_id, {})
+        t0 = info.get("started_at", time.time())
+        elapsed = int(time.time() - t0)
+        timer = f"{elapsed // 60}:{elapsed % 60:02d}"
+        out = sys.__stdout__
+        out.write(f"\r  {_BLD}── {rec.path.name} {_R}{_DIM}{'─' * 36}{_R}\n")
+        out.write(f"  {_DIM}{rec.status.value} · {rec.progress.tool_use_count} tools · {rec.progress.token_count:,} tok · {timer}{_R}\n")
+        if rec.progress.recent_activities:
+            out.write(f"  {_DIM}recent activity:{_R}\n")
+            for act in rec.progress.recent_activities[-5:]:
+                out.write(f"    {_DIM}·{_R} {act}\n")
+        if rec.task:
+            out.write(f"  {_DIM}task:{_R} {rec.task[:120]}\n")
+        out.write("\n")
+        out.flush()
 
     # ── Tool-call block helpers ───────────────────────────────────────────────
 
     async def _run_spinner(self) -> None:
-        """Animate spinner + a compact live sub-agent panel via sys.__stdout__."""
+        """Animate the spinner via sys.__stdout__."""
         import time as _time
 
         out = sys.__stdout__
         frames = _SPINNER_FRAMES
         i = 0
-        prev_agent_lines = 0
-
-        def _clip(text: str, max_len: int) -> str:
-            text = str(text or "").strip()
-            if max_len <= 0:
-                return ""
-            if len(text) <= max_len:
-                return text
-            if max_len == 1:
-                return "…"
-            return text[: max_len - 1] + "…"
-
-        def _status_badge(status: str) -> str:
-            normalized = (status or "").lower()
-            if normalized == "done":
-                return f"{_GRN}[DONE]{_R}"
-            if normalized == "error":
-                return f"{_RED}[ERR ]{_R}"
-            if normalized == "closed":
-                return f"{_DIM}[EXIT]{_R}"
-            if normalized == "tool_use":
-                return f"{_YLW}[TOOL]{_R}"
-            return f"{_BLU}[RUN ]{_R}"
 
         try:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
-                spinner_label = self._spinner_label
+                spinner_label = self._compute_spinner_label()
+                out.write(f"\r\033[2K  {frame} {_DIM}{spinner_label}{_R}")
 
-                _now_mono = _time.monotonic()
-                previous_agent_ids = set(self._agent_statuses.keys())
-                to_remove = [
-                    aid for aid, info in self._agent_statuses.items()
-                    if info.get("status") in ("done", "closed", "error")
-                    and info.get("_done_at") is not None
-                    and (_now_mono - info["_done_at"]) > 2.0
-                ]
-                for aid in to_remove:
-                    del self._agent_statuses[aid]
-                removed_agent_ids = sorted(previous_agent_ids - set(self._agent_statuses.keys()))
-                if removed_agent_ids:
-                    self._log_ui_line(
-                        f"[agent-panel] removed expired entries: {', '.join(removed_agent_ids)}"
-                    )
-
-                agent_infos = list(self._agent_statuses.items())
-                active_agents = sum(
-                    1 for _, info in agent_infos
-                    if info.get("status") not in ("done", "closed", "error")
-                )
-
-                agent_lines: list[str] = []
-                if agent_infos:
-                    spinner_label = (
-                        f"{spinner_label}  ·  {active_agents} sub-agent"
-                        f"{'s' if active_agents != 1 else ''} active"
-                    )
-                    term_w = shutil.get_terminal_size((120, 24)).columns
-                    max_name_len = max(
-                        (_visible_len(str(info.get("display_name", aid) or aid)) for aid, info in agent_infos),
-                        default=16,
-                    )
-                    name_w = max(16, min(26, max_name_len))
-                    activity_w = max(18, min(42, term_w - name_w - 24))
-                    done_agents = sum(1 for _, info in agent_infos if info.get("status") == "done")
-                    tool_agents = sum(1 for _, info in agent_infos if info.get("status") == "tool_use")
-
-                    agent_lines.append(
-                        f"  {_bd('╭─')} {_b('Agents')} "
-                        f"{_d(f'· {len(agent_infos)} total · {done_agents} done · {tool_agents} in tools')}"
-                    )
-                    for aid, info in agent_infos:
-                        color = info.get("color", "")
-                        display_name = _clip(str(info.get("display_name", aid) or aid), name_w)
-                        activity = _clip(str(info.get("activity", "") or "Idle"), activity_w)
-                        tokens = info.get("tokens", 0)
-                        status = str(info.get("status", "") or "")
-                        name_cell = _pad_visible(f"{color}{display_name}{_R}", name_w)
-                        tok_str = f"  {_d(f'{tokens:,} tok')}" if tokens else ""
-                        agent_lines.append(
-                            f"  {_bd('│')} {name_cell}  {_status_badge(status)}  {_s(activity)}{tok_str}"
-                        )
-
-                    footer_text = (
-                        f"waiting on {active_agents} running agent{'s' if active_agents != 1 else ''}"
-                        if active_agents > 0
-                        else "all sub-agents completed"
-                    )
-                    agent_lines.append(f"  {_bd('╰─')} {_d(footer_text)}")
-
-                if prev_agent_lines > 0:
-                    self._log_terminal_mutation("cursor_up", lines=prev_agent_lines)
-                    out.write(f"\033[{prev_agent_lines}A")
-
-                out.write(f"\r\033[2K  {frame} {_d(spinner_label)}")
-
-                for line in agent_lines:
-                    out.write(f"\n\r\033[2K{line}")
-                self._log_spinner_snapshot(spinner_label, agent_lines)
+                self._log_spinner_snapshot(spinner_label, [])
                 self._log_terminal_mutation(
                     "frame_drawn",
+                    dedupe=True,
                     spinner=_strip_ansi(spinner_label),
-                    panel_lines=len(agent_lines),
-                    active_agents=active_agents,
+                    panel_lines=0,
                 )
 
-                extra = prev_agent_lines - len(agent_lines)
-                if extra > 0:
-                    self._log_terminal_mutation("clear_extra_lines", count=extra)
-                    for _ in range(extra):
-                        out.write(f"\n\r\033[2K")
-                    out.write(f"\033[{extra}A")
-
                 out.flush()
-                prev_agent_lines = len(agent_lines)
                 i += 1
                 await asyncio.sleep(0.08)
         finally:
-            self._log_terminal_mutation("clear_spinner_frame", lines=prev_agent_lines + 1)
-            if prev_agent_lines > 0:
-                out.write(f"\033[{prev_agent_lines}A")
+            self._log_terminal_mutation("clear_spinner_frame", lines=1)
             out.write("\r\033[2K")
-            for _ in range(prev_agent_lines):
-                out.write(f"\n\r\033[2K")
-            if prev_agent_lines > 0:
-                out.write(f"\033[{prev_agent_lines}A")
             out.write("\r")
             out.flush()
 
@@ -1978,11 +1831,6 @@ class Interface:
         status = _g("done") if exit_code == 0 else _r(f"exit {exit_code}")
         _p(f"  {_bd('╰─')} {status}{_d(f'  ·  {duration_ms}ms')}")
 
-    def _print_turn_divider(self) -> None:
-        width = shutil.get_terminal_size((120, 24)).columns
-        span = max(18, min(34, width // 3))
-        _p(f"  {_bd('─' * span)}")
-
     # ── Event consumer ────────────────────────────────────────────────────────
 
     def _wrap_streaming_text(self, delta: str) -> str:
@@ -2055,7 +1903,9 @@ class Interface:
 
     async def _consume_events(self) -> None:  # noqa: C901
         from bob.protocol.events import (
-            AgentStatusEvent,
+            AgentSpawnedEvent,
+            AgentProgressEvent,
+            AgentCompletedEvent,
             BackgroundTerminalOutputEvent,
             HistoryCompactedEvent,
             ErrorEvent,
@@ -2284,6 +2134,7 @@ class Interface:
                     tool_label, cmd_arg = self._format_command(msg.command)
                     self._print_approval_bar(tool_label, cmd_arg)
                     self._after_tool = False
+                    self._approval_active = True
                     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
                     self._pending_approval = (msg, fut)
                     self._approval_event.set()
@@ -2291,6 +2142,7 @@ class Interface:
                     # Clear immediately so main loop doesn't pick up the stale event
                     self._approval_event.clear()
                     self._pending_approval = None
+                    self._approval_active = False
                     from bob.protocol.config_types import ReviewDecision
                     from bob.protocol.ops import ExecApprovalOp
                     _map = {
@@ -2383,6 +2235,55 @@ class Interface:
                         )
                     )
 
+                # ── Sub-agent events ──────────────────────────────────────────
+
+                elif isinstance(msg, AgentSpawnedEvent):
+                    await self._stop_spinner()
+                    _p(f"  {_c('⟳')} {_b(f'[{msg.name}]')} {_d('spawned')} {_s(f'· {msg.task[:70]}')}")
+                    self._active_agents[msg.agent_id] = {
+                        "name": msg.name,
+                        "started_at": time.time(),
+                        "last_activity": "",
+                    }
+                    if self._task_running and not self._spinner_active:
+                        await self._start_spinner()
+
+                elif isinstance(msg, AgentProgressEvent):
+                    if msg.agent_id in self._active_agents:
+                        self._active_agents[msg.agent_id]["last_activity"] = msg.last_activity
+                    else:
+                        self._active_agents[msg.agent_id] = {
+                            "name": msg.name,
+                            "started_at": time.time(),
+                            "last_activity": msg.last_activity,
+                        }
+
+                elif isinstance(msg, AgentCompletedEvent):
+                    await self._stop_spinner()
+                    if msg.status == "completed":
+                        icon = _g("✓")
+                        status_txt = _g("done")
+                    elif msg.status == "errored":
+                        icon = _r("✗")
+                        status_txt = _r("errored")
+                    else:
+                        icon = _y("·")
+                        status_txt = _y(msg.status)
+                    _p(
+                        f"  {icon} {_b(f'[{msg.name}]')} {status_txt}"
+                        f"  {_d(f'{msg.tool_use_count} tools · {msg.token_count:,} tok')}"
+                    )
+                    if msg.status == "errored" and msg.error:
+                        _p(f"  {_r('  error:')} {_d(msg.error[:120])}")
+                    self._active_agents.pop(msg.agent_id, None)
+                    agent_ctrl = getattr(self._session, "agent_control", None)
+                    still_active = agent_ctrl.count_active() if agent_ctrl else 0
+                    if still_active > 0:
+                        await self._start_spinner()
+                    elif self._task_running_for_agents:
+                        self._task_running = False
+                        self._task_running_for_agents = False
+
                 # ── Turn end ──────────────────────────────────────────────────
 
                 elif isinstance(msg, TurnEndedEvent):
@@ -2442,10 +2343,16 @@ class Interface:
                     self._last_assistant_text = self._current_buf
                     self._current_buf  = ""
                     self._after_tool   = False
-                    self._task_running = False
-                    self._clear_agent_statuses("turn_ended")
                     self._wrap_buffer = ""
                     self._wrap_column = 0
+                    # Keep spinner alive if sub-agents are still running
+                    _agent_ctrl = getattr(self._session, "agent_control", None)
+                    if _agent_ctrl and _agent_ctrl.count_active() > 0:
+                        self._task_running_for_agents = True
+                        await self._start_spinner()
+                    else:
+                        self._task_running = False
+                        self._task_running_for_agents = False
                     # Token tracking
                     in_tok  = getattr(msg, "input_tokens",  0) or 0
                     out_tok = getattr(msg, "output_tokens", 0) or 0
@@ -2455,13 +2362,6 @@ class Interface:
                     self._total_cached_input_tokens += cached_tok
                     self._last_turn_tokens = {"input": in_tok, "output": out_tok, "cached": cached_tok}
                     
-                    # Token usage — right-aligned, dim gray: in: 1,234 · out: 456
-                    if in_tok or out_tok:
-                        _tok_str = f"in: {in_tok:,} · out: {out_tok:,}"
-                        _term_w  = shutil.get_terminal_size((120, 24)).columns
-                        _pad     = max(0, _term_w - len(_tok_str))
-                        _p(f"\033[2m{' ' * _pad}{_tok_str}\033[0m")
-
                     # Run post_turn hooks and surface their stdout as a status line
                     if self._config.hooks:
                         try:
@@ -2486,9 +2386,6 @@ class Interface:
                         except Exception:
                             pass
 
-                    # Dim separator between turns
-                    self._print_turn_divider()
-
                 elif isinstance(msg, TurnInterruptedEvent):
                     await self._stop_spinner()
                     if self._current_buf and not self._current_buf.endswith("\n"):
@@ -2496,7 +2393,6 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
-                    self._clear_agent_statuses("turn_interrupted")
                     _p(f"  {_bd('·')} {_y('interrupted')}")
                     _p()
 
@@ -2509,7 +2405,6 @@ class Interface:
                     self._current_buf  = ""
                     self._after_tool   = False
                     self._task_running = False
-                    self._clear_agent_statuses("error")
                     _render_error(msg.message)
                     _p()
 
@@ -2522,16 +2417,6 @@ class Interface:
                 elif isinstance(msg, InfoEvent):
                     _p(f"  {_bd('·')} {_s(msg.message)}")
 
-                elif isinstance(msg, AgentStatusEvent):
-                    self._record_agent_status(
-                        msg.agent_id,
-                        color=msg.color,
-                        display_name=msg.display_name or msg.agent_id,
-                        activity=msg.activity,
-                        tokens=msg.tokens,
-                        status=msg.status,
-                    )
-
                 elif isinstance(msg, BackgroundTerminalOutputEvent):
                     _p(f"  {_bd('·')} {_d(f'[bg:{msg.terminal_id}] {msg.data.rstrip()}')}")
 
@@ -2541,7 +2426,6 @@ class Interface:
                     _p(f"  {_bd('╭─')} {_c('Question')}")
                     
                     # Word-wrap the prompt at terminal width
-                    import shutil
                     import textwrap
                     term_width = shutil.get_terminal_size().columns
                     wrapped_lines = textwrap.wrap(msg.prompt, width=term_width - 6)
@@ -2608,7 +2492,6 @@ class Interface:
                     _p(f"  {_bd('╭─')} {_c('Plan Summary')}")
                     
                     # Word-wrap and display plan
-                    import shutil
                     import textwrap
                     term_width = shutil.get_terminal_size().columns
                     wrapped_lines = textwrap.wrap(msg.plan_summary, width=term_width - 6)
@@ -2664,8 +2547,8 @@ class Interface:
                     self._done.set()
                     return
 
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log_event_handler_error(msg, exc)
 
     # ── Quick model turn (used by /commit, /summary, /review) ────────────────
 
@@ -2721,7 +2604,9 @@ class Interface:
         """Handle a slash command. Returns True to exit the chat loop."""
 
         if cmd in (SlashCommand.QUIT, SlashCommand.EXIT):
+            _p()
             _p(f"  {_d('goodbye')}")
+            _p()
             return True
 
         elif cmd == SlashCommand.CLEAR:
@@ -2805,16 +2690,14 @@ class Interface:
                     ["git", "diff", "HEAD", "--stat"], capture_output=True,
                     text=True, cwd=Path.cwd(), timeout=5,
                 ).stdout.strip() or "(no diff)"
-                _p(f"  {_d('spawning review agent…')}")
-                tm = self._session.ensure_thread_manager()
-                agent_id = await tm.spawn(
-                    task=(
-                        f"Review the following git diff and identify any bugs, "
-                        f"security issues, or improvements needed:\n\n{diff}"
-                    ),
-                    template="verify",
+                _p(f"  {_d('running review…')}")
+                review = await self._quick_model_turn(
+                    "Review the following git diff summary and identify bugs, "
+                    "behavioral regressions, security issues, and missing tests.\n\n"
+                    f"{diff}"
                 )
-                _p(f"  {_d(f'review agent started (id={agent_id})')}")
+                if not review.strip():
+                    _p(f"  {_d('no review output')}")
             except Exception as exc:
                 _p(f"  {_r('✗')} {exc}")
 
@@ -2932,8 +2815,7 @@ class Interface:
                                   SlashCommand.CONTEXT, SlashCommand.SUMMARY, SlashCommand.REVIEW]),
                 ("Config",      [SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.OUTPUT_STYLE,
                                   SlashCommand.THEME, SlashCommand.VI, SlashCommand.APPROVALS]),
-                ("Agent",       [SlashCommand.PLAN, SlashCommand.AGENT, SlashCommand.SUBAGENTS,
-                                  SlashCommand.MCP, SlashCommand.HOOKS]),
+                ("Workflow",    [SlashCommand.PLAN, SlashCommand.MCP, SlashCommand.HOOKS]),
                 ("System",      [SlashCommand.DOCTOR, SlashCommand.INIT, SlashCommand.FEEDBACK,
                                   SlashCommand.QUIT]),
             ]
@@ -3611,8 +3493,13 @@ class Interface:
         Called AFTER input_task is fully cancelled (prompt torn down), so it
         is safe to start the spinner here without overlapping with ❯.
         Handles approval prompts inline.  Ctrl+C sends an InterruptOp.
+        Arrow Up/Down opens the agent inspector (Windows only via msvcrt).
         """
         await self._start_spinner()
+        _inspector_open = False
+        _inspector_sel = 0
+        _inspector_lines = 0
+        _inspector_refresh = 0.0
         try:
             while self._task_running or self._pending_approval is not None:
                 if self._pending_approval is not None:
@@ -3645,12 +3532,71 @@ class Interface:
                     if self._task_running and not self._spinner_active:
                         await self._start_spinner()
                 else:
+                    # Arrow-key agent inspector (Windows only via msvcrt)
+                    try:
+                        import msvcrt
+                        while msvcrt.kbhit():
+                            ch = msvcrt.getch()
+                            if ch in (b'\xe0', b'\x00'):
+                                ch2 = msvcrt.getch()
+                                if ch2 in (b'H', b'P'):  # Up / Down arrow
+                                    if not _inspector_open:
+                                        await self._stop_spinner()
+                                        _inspector_sel = 0
+                                        _inspector_lines = self._draw_inspector_panel(_inspector_sel)
+                                        _inspector_open = True
+                                        _inspector_refresh = time.time()
+                                    else:
+                                        _agent_ctrl = getattr(self._session, "agent_control", None)
+                                        _recs = [r for r in _agent_ctrl.registry._agents.values() if not r.status.is_terminal] if _agent_ctrl else []
+                                        if ch2 == b'H':
+                                            _inspector_sel = max(0, _inspector_sel - 1)
+                                        else:
+                                            _inspector_sel = min(max(0, len(_recs) - 1), _inspector_sel + 1)
+                                        self._clear_inspector_panel(_inspector_lines)
+                                        _inspector_lines = self._draw_inspector_panel(_inspector_sel)
+                            elif ch == b'\r' and _inspector_open:
+                                self._clear_inspector_panel(_inspector_lines)
+                                _inspector_lines = 0
+                                self._print_agent_detail(_inspector_sel)
+                                _inspector_open = False
+                                if self._task_running and not self._spinner_active:
+                                    await self._start_spinner()
+                            elif ch in (b'\x1b', b'q', b'Q') and _inspector_open:
+                                self._clear_inspector_panel(_inspector_lines)
+                                _inspector_lines = 0
+                                _inspector_open = False
+                                if self._task_running and not self._spinner_active:
+                                    await self._start_spinner()
+                    except ImportError:
+                        pass
+
+                    # Refresh inspector panel once per second (live timer updates)
+                    if _inspector_open:
+                        _now_t = time.time()
+                        if _now_t - _inspector_refresh > 1.0:
+                            _agent_ctrl = getattr(self._session, "agent_control", None)
+                            _recs = [r for r in _agent_ctrl.registry._agents.values() if not r.status.is_terminal] if _agent_ctrl else []
+                            if _recs:
+                                _inspector_sel = min(_inspector_sel, len(_recs) - 1)
+                                self._clear_inspector_panel(_inspector_lines)
+                                _inspector_lines = self._draw_inspector_panel(_inspector_sel)
+                            else:
+                                self._clear_inspector_panel(_inspector_lines)
+                                _inspector_lines = 0
+                                _inspector_open = False
+                                if self._task_running and not self._spinner_active:
+                                    await self._start_spinner()
+                            _inspector_refresh = _now_t
+
                     try:
                         await asyncio.sleep(0.05)
                     except KeyboardInterrupt:
                         self._exit_requested.set()
                         return
         finally:
+            if _inspector_open:
+                self._clear_inspector_panel(_inspector_lines)
             await self._stop_spinner()
 
     async def _load_model_picker_models(self) -> list[dict]:
@@ -3923,7 +3869,10 @@ class Interface:
                     try:
                         text = await self._prompt_with_box(ps)
                     except (EOFError, KeyboardInterrupt):
+                        await self._stop_spinner()
+                        _p()
                         _p(f"  {_d('goodbye')}")
+                        _p()
                         self._exit_requested.set()
                         break
 

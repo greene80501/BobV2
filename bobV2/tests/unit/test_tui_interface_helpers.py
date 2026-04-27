@@ -1,6 +1,8 @@
+import inspect
 from pathlib import Path
 
 from bob.config.schema import BobConfig
+import bob.tui.interface as interface_module
 from bob.tui.interface import Interface, _strip_ansi
 
 
@@ -57,13 +59,22 @@ def test_strip_ansi_removes_color_codes() -> None:
     assert _strip_ansi("\x1b[31mred\x1b[0m plain") == "red plain"
 
 
+def test_stalled_status_has_distinct_icon_and_label(tmp_path: Path) -> None:
+    interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
+    try:
+        assert _strip_ansi(interface._status_icon("stalled")) == "⏳"
+        assert _strip_ansi(interface._status_label("stalled")) == "stalled"
+    finally:
+        interface._session_log_handle.close()
+
+
 def test_interface_logs_spinner_snapshot_once_per_change(tmp_path: Path) -> None:
     interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
     try:
         interface._log_spinner_snapshot("Thinking...", ["  one"])
         interface._log_spinner_snapshot("Thinking...", ["  one"])
         interface._log_spinner_snapshot("Thinking...", ["  two"])
-        text = interface._session_log_path.read_text(encoding="utf-8")
+        text = interface._session_log_path.read_text(encoding="utf-8-sig")
         assert text.count("SPINNER Thinking...") == 2
         assert "  one" in text
         assert "  two" in text
@@ -71,32 +82,13 @@ def test_interface_logs_spinner_snapshot_once_per_change(tmp_path: Path) -> None
         interface._session_log_handle.close()
 
 
-def test_interface_logs_agent_status_updates(tmp_path: Path) -> None:
-    interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
-    try:
-        interface._record_agent_status(
-            "a1",
-            color="",
-            display_name="researcher",
-            activity="Findings collected",
-            tokens=120,
-            status="done",
-        )
-        assert interface._agent_statuses["a1"]["status"] == "done"
-        assert interface._agent_statuses["a1"]["tokens"] == 120
-        assert interface._agent_statuses["a1"]["_done_at"] is not None
-        text = interface._session_log_path.read_text(encoding="utf-8")
-        assert "[agent-panel] update id=a1 status=done tokens=120 activity=Findings collected" in text
-    finally:
-        interface._session_log_handle.close()
-
 
 def test_interface_logs_terminal_mutations_and_blocks(tmp_path: Path) -> None:
     interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
     try:
         interface._log_terminal_mutation("cursor_up", lines=2)
         interface._log_terminal_block("header", ["row 1", "\x1b[31mrow 2\x1b[0m"])
-        text = interface._session_log_path.read_text(encoding="utf-8")
+        text = interface._session_log_path.read_text(encoding="utf-8-sig")
         assert "[terminal] cursor_up lines=2" in text
         assert "[terminal-block] header" in text
         assert "row 1" in text
@@ -105,18 +97,32 @@ def test_interface_logs_terminal_mutations_and_blocks(tmp_path: Path) -> None:
         interface._session_log_handle.close()
 
 
-def test_interface_writes_session_log_and_clear_events(tmp_path: Path) -> None:
+def test_interface_dedupes_identical_terminal_mutations_when_requested(tmp_path: Path) -> None:
     interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
     try:
-        interface._log_ui_line("hello")
-        interface._agent_statuses = {
-            "a1": {"status": "done"},
-            "a2": {"status": "error"},
-        }
-        interface._clear_agent_statuses("test_clear")
-        text = interface._session_log_path.read_text(encoding="utf-8")
-        assert "[session] log started for session=sess-1" in text
-        assert "hello" in text
-        assert "[agent-panel] cleared reason=test_clear removed=a1, a2" in text
+        interface._log_terminal_mutation("frame_drawn", dedupe=True, spinner="Thinking...", panel_lines=0)
+        interface._log_terminal_mutation("frame_drawn", dedupe=True, spinner="Thinking...", panel_lines=0)
+        interface._log_terminal_mutation("frame_drawn", dedupe=True, spinner="Thinking...", panel_lines=1)
+        text = interface._session_log_path.read_text(encoding="utf-8-sig")
+        assert text.count("[terminal] frame_drawn") == 2
+    finally:
+        interface._session_log_handle.close()
+
+
+def test_interface_logs_event_handler_errors(tmp_path: Path) -> None:
+    interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
+    try:
+        interface._log_event_handler_error(type("Msg", (), {"type": "agent_status"})(), ValueError("bad event"))
+        text = interface._session_log_path.read_text(encoding="utf-8-sig")
+        assert "[event-error] type=agent_status error=ValueError: bad event" in text
+    finally:
+        interface._session_log_handle.close()
+
+
+def test_consume_events_uses_module_level_shutil(tmp_path: Path) -> None:
+    interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
+    try:
+        source = inspect.getsource(interface._consume_events)
+        assert "import shutil" not in source
     finally:
         interface._session_log_handle.close()
