@@ -137,6 +137,83 @@ def _p(s: str = "", end: str = "\n") -> None:
             pass
 
 
+# ── Thinking-trail helpers ────────────────────────────────────────────────────
+
+_TOOL_VERBS: dict[str, str] = {
+    "read_file":      "read",
+    "write_file":     "wrote",
+    "edit_file":      "edited",
+    "shell":          "ran",
+    "web_search":     "searched",
+    "web_fetch":      "fetched",
+    "glob_files":     "globbed",
+    "apply_patch":    "patched",
+    "notebook_read":  "read nb",
+    "notebook_edit":  "edited nb",
+    "view_image":     "viewed",
+}
+
+
+def _format_tool_key_arg(tool_name: str, tool_input: dict) -> str:
+    """Return the most human-readable single argument for a tool call."""
+    from pathlib import Path as _P
+    if tool_name in ("read_file", "write_file", "edit_file", "view_image"):
+        p = tool_input.get("path", "")
+        return _P(p).name if p else ""
+    if tool_name == "shell":
+        cmd = tool_input.get("command", "")
+        if isinstance(cmd, list):
+            cmd = " ".join(cmd)
+        return _truncate_cmd(str(cmd), 60)
+    if tool_name == "web_search":
+        return str(tool_input.get("query", ""))[:60]
+    if tool_name == "web_fetch":
+        return str(tool_input.get("url", ""))[:60]
+    if tool_name == "glob_files":
+        return str(tool_input.get("pattern", ""))[:60]
+    if tool_name in ("apply_patch",):
+        patch = tool_input.get("patch", "") or tool_input.get("content", "")
+        for line in str(patch).splitlines():
+            for prefix in ("*** Add File: ", "*** Update File: ", "*** Delete File: "):
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip()
+    return ""
+
+
+def _print_activity_line(
+    tool_name: str,
+    tool_input: dict,
+    duration_ms: int,
+    *,
+    error: str | None = None,
+) -> None:
+    """Print a single-line activity record for a completed tool call."""
+    icon = _r("✗") if error else _g("✓")
+    verb = _TOOL_VERBS.get(tool_name, tool_name.replace("_", " "))
+    key_arg = _format_tool_key_arg(tool_name, tool_input or {})
+    dur_str = f"  {_d(f'{duration_ms}ms')}" if duration_ms else ""
+    arg_str = f"  {_s(key_arg)}" if key_arg else ""
+    _p(f"  {icon} {_d(verb)}{arg_str}{dur_str}")
+
+
+def _print_thinking_summary(token_count: int, tool_log: list) -> None:
+    """Print a compact one-line summary of tools used during the turn.
+
+    Only shown when at least one tool was called — skips pure-reasoning turns
+    with no observable activity so the user isn't shown noise.
+    """
+    if not tool_log:
+        return
+    from collections import Counter
+    counts: Counter = Counter(name for name, _, _ in tool_log)
+    summaries: list[str] = []
+    for name, count in counts.most_common(5):
+        verb = _TOOL_VERBS.get(name, name.replace("_", " "))
+        summaries.append(f"{verb} ×{count}" if count > 1 else verb)
+    if summaries:
+        _p(f"  {_d(' · '.join(summaries))}")
+
+
 def _render_error(message: str, tool_name: str | None = None, tool_input: dict | None = None) -> None:
     """Print an error with file:line highlighting and optional traceback rendering."""
     import re as _re
@@ -974,6 +1051,9 @@ class Interface:
         self._vi_mode_changed: bool = False
         # Extended thinking
         self._next_turn_thinking_budget: Optional[int] = None
+        # Per-turn activity tracking for thinking trail
+        self._turn_tool_log: list[tuple[str, dict, int]] = []  # (name, input, duration_ms)
+        self._reasoning_token_count: int = 0
         # Code block tracking for syntax highlighting
         self._in_code_block = False
         self._code_block_lang: Optional[str] = None
@@ -1955,6 +2035,9 @@ class Interface:
                     self._markdown_stream.pending = ""
                     self._wrap_buffer = ""
                     self._wrap_column = 0
+                    # Reset per-turn activity tracking
+                    self._turn_tool_log = []
+                    self._reasoning_token_count = 0
                     # Spinner is started by _busy_wait AFTER the ❯ prompt is
                     # fully torn down — do NOT start it here.
 
@@ -2037,7 +2120,6 @@ class Interface:
                             _p(tail, end="")
                     # Update spinner to show which tool is running
                     tool_name = msg.tool_name
-                    # Format tool name nicely (e.g., read_file -> "read file")
                     display_name = tool_name.replace("_", " ").title()
                     _NET_TOOLS = {"web_search", "web_fetch"}
                     if tool_name in _NET_TOOLS:
@@ -2046,20 +2128,27 @@ class Interface:
                     else:
                         self._spinner_label = f"Running {display_name}…"
                     self._tool_call_inputs[msg.tool_call_id] = msg.tool_input
+                    # Record in activity trail (duration filled when completed)
+                    self._turn_tool_log.append((msg.tool_name, msg.tool_input, 0))
                     if not self._spinner_active:
                         await self._start_spinner()
 
                 elif isinstance(msg, ToolCallCompletedEvent):
                     # Reset spinner label back to default
                     self._spinner_label = "Thinking…"
-                    # Surface tool errors with file:line highlighting
                     tool_input = self._tool_call_inputs.pop(msg.tool_call_id, None)
-                    if getattr(msg, 'error', None):
-                        _render_error(
-                            msg.error,
-                            tool_name=getattr(msg, 'tool_name', None),
-                            tool_input=tool_input,
-                        )
+                    duration_ms = getattr(msg, 'duration_ms', 0)
+                    error = getattr(msg, 'error', None)
+                    # Update duration in activity trail for this tool call
+                    for i in range(len(self._turn_tool_log) - 1, -1, -1):
+                        if self._turn_tool_log[i][0] == msg.tool_name and self._turn_tool_log[i][2] == 0:
+                            self._turn_tool_log[i] = (msg.tool_name, self._turn_tool_log[i][1], duration_ms)
+                            break
+                    # Print a compact activity line for this completed tool call
+                    _print_activity_line(msg.tool_name, tool_input or {}, duration_ms, error=error)
+                    # Surface tool errors with file:line highlighting
+                    if error:
+                        _render_error(error, tool_name=msg.tool_name, tool_input=tool_input)
                     elif isinstance(getattr(msg, "output", None), str) and msg.output.startswith("Error:"):
                         _render_error(
                             msg.output,
@@ -2078,14 +2167,17 @@ class Interface:
                         if tail:
                             _p(tail, end="")
                     if not hasattr(self, '_reasoning_started') or not self._reasoning_started:
-                        await self._stop_spinner()
                         self._reasoning_started = True
                         if self._after_tool:
                             _p()
                         self._after_tool = False
                         self._reasoning_buf = ""
-                    # Accumulate reasoning silently - will be displayed at end
+                        self._spinner_label = "Thinking…"
+                        if not self._spinner_active:
+                            await self._start_spinner()
+                    # Accumulate for optional verbose display; count tokens for summary
                     self._reasoning_buf += msg.delta
+                    self._reasoning_token_count += max(1, len(msg.delta) // 4)
 
                 # ── Command execution ─────────────────────────────────────────
 
@@ -2306,7 +2398,7 @@ class Interface:
                     if self._text_started and self._current_buf and not self._current_buf.endswith("\n"):
                         _p()
                     
-                    # Display reasoning block if we have thinking content
+                    # Verbose mode: show the full raw reasoning block (show_reasoning=True only)
                     if (
                         getattr(self._config, "show_reasoning", False)
                         and hasattr(self, '_reasoning_buf')
@@ -2328,6 +2420,7 @@ class Interface:
                         _p(f"  {_bd('╰─')} {_d('reasoning captured')}")
                     self._reasoning_buf = ""
                     self._reasoning_started = False
+                    self._reasoning_token_count = 0
                     
                     # Only do a final full render if no live text was streamed.
                     if self._current_buf and not self._text_started:
