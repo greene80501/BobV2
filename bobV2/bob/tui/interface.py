@@ -1320,8 +1320,8 @@ class Interface:
                         ),
                         Window(
                             width=1,
-                            content=FormattedTextControl(lambda: ANSI(f"{_BRD}│{RST}")),
-                            dont_extend_height=True,
+                            char='│',
+                            style='fg:#58637a',
                         ),
                     ], width=Dimension.exact(row_w)),
                     Window(
@@ -1413,7 +1413,7 @@ class Interface:
                     remaining = remaining[inner_w:]
                     is_first = False
             _p(f"{_BRD}╰{'─' * box_w}╯{RST}")
-            _p()
+            _p(f"{_DIM}  …{_R}", end="")  # placeholder — spinner overwrites on first frame
 
         return None if cancelled else (submitted[0] if submitted else None)
 
@@ -2216,7 +2216,9 @@ class Interface:
                     self._is_apply_patch = False
                     self._print_tool_footer(exit_code=msg.exit_code, duration_ms=msg.duration_ms)
                     self._after_tool = True
-                    # No blank line here — let the NEXT event decide spacing
+                    # Restart spinner so there's no dead space while model processes output
+                    if self._task_running and not self._spinner_active:
+                        await self._start_spinner()
 
                 # ── Approval — exec ───────────────────────────────────────────
 
@@ -2294,6 +2296,8 @@ class Interface:
                         request_id=msg.request_id,
                         granted=approved,
                     ))
+                    if self._task_running and not self._spinner_active:
+                        await self._start_spinner()
 
                 # ── Approval — patch ──────────────────────────────────────────
 
@@ -2462,24 +2466,14 @@ class Interface:
                     # Run post_turn hooks and surface their stdout as a status line
                     if self._config.hooks:
                         try:
-                            from bob.hooks.runner import HookRunner, HookConfig as RunnerHookConfig
                             from bob.protocol.config_types import HookEventName
-                            runner_hooks = []
-                            for h in self._config.hooks:
-                                if getattr(h, 'event', '') == HookEventName.POST_TURN:
-                                    cmd = h.command.split() if isinstance(h.command, str) else [h.command]
-                                    runner_hooks.append(RunnerHookConfig(
-                                        event=HookEventName.POST_TURN,
-                                        command=cmd,
-                                        mode="sync",
-                                        timeout_seconds=getattr(h, 'timeout_seconds', 10),
-                                    ))
-                            if runner_hooks:
-                                hook_runner = HookRunner(runner_hooks)
-                                results = await hook_runner.run_hooks(HookEventName.POST_TURN)
-                                for r in results:
-                                    if r.stdout.strip():
-                                        _p(f"  {_d(r.stdout.strip())}")
+                            results = await self._session.hook_runner.run_hooks(
+                                HookEventName.POST_TURN,
+                                {"session_id": getattr(self._session, "session_id", "")},
+                            )
+                            for r in results:
+                                if r.stdout.strip():
+                                    _p(f"  {_d(r.stdout.strip())}")
                         except Exception:
                             pass
 
