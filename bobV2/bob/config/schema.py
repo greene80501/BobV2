@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from bob.protocol.config_types import (
     AskForApproval,
@@ -28,10 +28,37 @@ from bob.protocol.config_types import (
 # MCP server configuration
 # ---------------------------------------------------------------------------
 
-class McpServerConfig(BaseModel):
+class McpStdioServerConfig(BaseModel):
+    type: Literal["stdio"] = "stdio"
     command: list[str]
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    connect_timeout_seconds: float = 15.0
+    call_timeout_seconds: float = 30.0
+
+
+class McpSseServerConfig(BaseModel):
+    type: Literal["sse"] = "sse"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    connect_timeout_seconds: float = 15.0
+    call_timeout_seconds: float = 30.0
+
+
+class McpHttpServerConfig(BaseModel):
+    type: Literal["http"] = "http"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    connect_timeout_seconds: float = 15.0
+    call_timeout_seconds: float = 30.0
+
+
+McpServerConfig = Annotated[
+    Union[McpStdioServerConfig, McpSseServerConfig, McpHttpServerConfig],
+    Field(discriminator="type"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +126,25 @@ class ProviderConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 class BobConfig(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_mcp_server_configs(cls, data: Any) -> Any:
+        """Upgrade legacy stdio-only MCP server configs to the new discriminated union format."""
+        if not isinstance(data, dict):
+            return data
+        servers = data.get("mcp_servers")
+        if not isinstance(servers, dict):
+            return data
+        upgraded: dict[str, Any] = {}
+        for name, cfg in servers.items():
+            if isinstance(cfg, dict) and "type" not in cfg and "command" in cfg:
+                upgraded[name] = {"type": "stdio", **cfg}
+            else:
+                upgraded[name] = cfg
+        data = dict(data)
+        data["mcp_servers"] = upgraded
+        return data
+
     # ------------------------------------------------------------------
     # Identity / API
     # ------------------------------------------------------------------
@@ -167,6 +213,10 @@ class BobConfig(BaseModel):
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
     # Per-server authentication tokens for MCP
     mcp_auth_tokens: dict[str, str] = Field(default_factory=dict)
+    # Auto-import MCP servers from ~/.claude/claude_desktop_config.json / settings
+    import_claude_mcp: bool = False
+    # Override path for Claude Code plugins directory (default: ~/.claude/plugins)
+    claude_plugins_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Hooks

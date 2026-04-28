@@ -11,6 +11,7 @@ from bob.protocol.config_types import SandboxPolicy, SandboxMode, AskForApproval
 from bob.protocol.ops import (
     Op, Submission, UserTurnOp, InterruptOp, CompactOp, ShutdownOp,
     SetThreadNameOp, RunUserShellCommandOp,
+    ListMcpToolsOp, RefreshMcpServersOp, ListSkillsOp,
 )
 from bob.protocol.events import Event, EventMsg
 
@@ -119,6 +120,10 @@ class BobSession:
         # Task database
         from bob.core.task_db import TaskDB
         self._task_db = TaskDB(self.bob_home / "tasks.db")
+
+        # MCP and Skills managers — started in start()
+        self._mcp_manager = None
+        self._skills_manager = None
 
         # Agent control — multi-agent orchestration (parent sessions only)
         if not ephemeral:
@@ -672,6 +677,10 @@ class BobSession:
         # Fire-and-forget keepalive to warm the TCP/TLS connection before the
         # user submits their first message.
         asyncio.create_task(self._prewarm_connection())
+        # Start MCP servers and skills discovery in the background so they
+        # don't delay the session_started event.
+        asyncio.create_task(self._start_mcp())
+        asyncio.create_task(self._start_skills())
 
         from bob.protocol.events import SessionStartedEvent
         from bob.protocol.config_types import SessionSource
@@ -762,6 +771,201 @@ class BobSession:
             urllib.request.urlopen(req, timeout=3)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # MCP lifecycle
+    # ------------------------------------------------------------------
+
+    def _plugin_roots(self) -> list[Path]:
+        """Return Bob-owned local plugin roots in discovery order."""
+        roots = [self.bob_home / "plugins", self.cwd / ".bob" / "plugins"]
+        unique_roots: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_roots.append(root)
+        return unique_roots
+
+    @staticmethod
+    def _plugin_skill_metadata(skill_infos: list) -> list:
+        """Convert plugin skill descriptors into SkillMetadata records."""
+        from bob.protocol.items import SkillMetadata
+
+        metadata: list[SkillMetadata] = []
+        for info in skill_infos:
+            metadata.append(SkillMetadata(
+                name=info.name,
+                description=info.description,
+                short_description=info.short_description or None,
+                path=info.plugin_path,
+                scope="plugin",
+                enabled=True,
+                user_invocable=info.user_invocable,
+                allowed_tools=list(info.allowed_tools),
+                content_file=info.content_file,
+            ))
+        return metadata
+
+    async def _start_mcp(self) -> None:
+        """Connect to all configured MCP servers and register their tools."""
+        import re
+        from bob.mcp.manager import McpManager
+        from bob.protocol.events import McpStartupStatusEvent
+        from bob.plugins.manager import PluginsManager
+
+        servers = dict(self.config.mcp_servers)
+
+        local_mcp_cfgs, _ = PluginsManager.load_plugin_bundles_from_roots(self._plugin_roots())
+        for cfg in local_mcp_cfgs:
+            if cfg.server_name not in servers:
+                if cfg.transport == "stdio":
+                    servers[cfg.server_name] = {
+                        "type": "stdio",
+                        "command": cfg.command,
+                        "args": cfg.args,
+                        "env": cfg.env,
+                    }
+                else:
+                    servers[cfg.server_name] = {
+                        "type": cfg.transport,
+                        "url": cfg.url,
+                        "headers": cfg.headers,
+                        "env": cfg.env,
+                    }
+
+        # Import from Claude Code plugins if requested
+        if self.config.import_claude_mcp or getattr(self.config, "claude_plugins_path", None):
+            pm = PluginsManager(self.bob_home / "plugins")
+            mcp_cfgs, _ = pm.load_claude_code_plugins(
+                claude_plugins_dir=self.config.claude_plugins_path
+            )
+            for cfg in mcp_cfgs:
+                if cfg.server_name not in servers:
+                    if cfg.transport == "stdio":
+                        servers[cfg.server_name] = {
+                            "type": "stdio",
+                            "command": cfg.command,
+                            "args": cfg.args,
+                            "env": cfg.env,
+                        }
+                    else:
+                        servers[cfg.server_name] = {
+                            "type": cfg.transport,
+                            "url": cfg.url,
+                            "headers": cfg.headers,
+                            "env": cfg.env,
+                        }
+
+        if not servers:
+            return
+
+        self._mcp_manager = McpManager(servers)
+        results = await self._mcp_manager.start()
+        self._register_mcp_tools()
+
+        connected = [n for n, ok in results.items() if ok]
+        failed = [n for n, ok in results.items() if not ok]
+        total_tools = len(self._mcp_manager.get_all_tools())
+
+        await self._emit(Event(
+            id="mcp",
+            msg=McpStartupStatusEvent(
+                type="mcp_startup_status",
+                connected=connected,
+                failed=failed,
+                total_tools=total_tools,
+            )
+        ))
+
+    def _register_mcp_tools(self) -> None:
+        """Register all MCP tools into the ToolRegistry."""
+        import re
+
+        if not self._mcp_manager:
+            return
+
+        for tool in self._mcp_manager.get_all_tools():
+            raw_name = f"{tool.server_name}__{tool.name}"
+            safe_name = re.sub(r"[^A-Za-z0-9_.:\-]", "_", raw_name)
+            if not safe_name or not safe_name[0].isalpha():
+                safe_name = f"mcp_{safe_name}"
+            description = f"[{tool.server_name}] {tool.description}"
+            captured_name = raw_name
+            mcp_mgr = self._mcp_manager
+
+            async def _handler(tc, args, _name=captured_name, _mgr=mcp_mgr):
+                return await _mgr.call_tool(_name, args)
+
+            self.tool_registry.register(
+                safe_name,
+                description,
+                tool.input_schema,
+                _handler,
+                is_mutating=True,
+                source="mcp",
+            )
+
+    # ------------------------------------------------------------------
+    # Skills lifecycle
+    # ------------------------------------------------------------------
+
+    async def _start_skills(self) -> None:
+        """Initialize the skills manager."""
+        if not self.config.enable_skills:
+            return
+        from bob.skills.manager import SkillsManager
+        from bob.plugins.manager import PluginsManager
+        self._skills_manager = SkillsManager(self.bob_home)
+        plugin_skills = []
+        _, local_skill_infos = PluginsManager.load_plugin_bundles_from_roots(self._plugin_roots())
+        plugin_skills.extend(self._plugin_skill_metadata(local_skill_infos))
+
+        if self.config.import_claude_mcp or getattr(self.config, "claude_plugins_path", None):
+            pm = PluginsManager(self.bob_home / "plugins")
+            _, claude_skill_infos = pm.load_claude_code_plugins(
+                claude_plugins_dir=self.config.claude_plugins_path
+            )
+            plugin_skills.extend(self._plugin_skill_metadata(claude_skill_infos))
+
+        self._skills_manager.set_extra_skills(plugin_skills)
+        # Eagerly discover skills so they're ready for the first turn
+        try:
+            self._skills_manager.discover(cwd=self.cwd)
+        except Exception:
+            pass
+
+    def list_skills(self, cwd: Optional[Path] = None) -> list:
+        """Return all discovered skills."""
+        if not self._skills_manager:
+            return []
+        return self._skills_manager.list_all(cwd=cwd or self.cwd)
+
+    async def invoke_skill(self, skill_name: str, arguments: str = "") -> None:
+        """Invoke a skill by injecting it as a developer_message_override turn."""
+        if not self._skills_manager:
+            return
+        skill = self._skills_manager.find(skill_name, cwd=self.cwd)
+        if skill is None:
+            return
+        skill_dir = skill.path
+        content_path = skill_dir / skill.content_file
+        if not content_path.exists():
+            return
+        template = content_path.read_text(encoding="utf-8")
+        # Strip YAML frontmatter from SKILL.md files
+        if template.startswith("---"):
+            end = template.find("\n---", 3)
+            if end != -1:
+                template = template[end + 4:].lstrip("\n")
+        prompt = template.replace("$ARGUMENTS", arguments)
+        await self.submit(UserTurnOp(
+            type="user_turn",
+            items=[],
+            developer_message_override=prompt,
+        ))
 
     async def _setup_persistence(self) -> None:
         if self.ephemeral:
@@ -1186,6 +1390,11 @@ class BobSession:
                 await asyncio.wait_for(self._agent_task, timeout=3.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+        if self._mcp_manager:
+            try:
+                await self._mcp_manager.stop()
+            except Exception:
+                pass
         if self._recorder:
             await self._recorder.stop()
         if self._state_db:
@@ -1336,6 +1545,7 @@ class BobSession:
             CompactOp, ShutdownOp, SetThreadNameOp, RunUserShellCommandOp,
             OverrideTurnContextOp, ThreadRollbackOp, UndoOp,
             DropMemoriesOp, UpdateMemoriesOp,
+            ListMcpToolsOp, RefreshMcpServersOp, ListSkillsOp,
         )
         from bob.protocol.events import (
             SessionEndedEvent, ThreadNameSetEvent,
@@ -1556,6 +1766,73 @@ class BobSession:
                     msg=MemoriesUpdatedEvent(
                         type="memories_updated",
                         memories=[u.model_dump() for u in op.updates],
+                    )
+                ))
+                continue
+
+            # ----------------------------------------------------------------
+            # List MCP tools
+            # ----------------------------------------------------------------
+            if isinstance(op, ListMcpToolsOp):
+                from bob.protocol.events import McpToolsListedEvent
+                tools = []
+                if self._mcp_manager:
+                    for t in self._mcp_manager.get_all_tools():
+                        if op.server_name and t.server_name != op.server_name:
+                            continue
+                        tools.append({
+                            "server_name": t.server_name,
+                            "name": t.name,
+                            "description": t.description,
+                        })
+                await self._emit(Event(
+                    id=sub_id,
+                    msg=McpToolsListedEvent(
+                        type="mcp_tools_listed",
+                        tools=tools,
+                    )
+                ))
+                continue
+
+            # ----------------------------------------------------------------
+            # Refresh MCP servers
+            # ----------------------------------------------------------------
+            if isinstance(op, RefreshMcpServersOp):
+                from bob.protocol.events import McpServersRefreshedEvent
+                if self._mcp_manager:
+                    await self._mcp_manager.stop()
+                    self._mcp_manager = None
+                # Unregister old MCP tools from registry
+                self.tool_registry.unregister_by_source("mcp")
+                await self._start_mcp()
+                connected = self._mcp_manager.connected_servers() if self._mcp_manager else []
+                failed = self._mcp_manager.failed_servers() if self._mcp_manager else []
+                await self._emit(Event(
+                    id=sub_id,
+                    msg=McpServersRefreshedEvent(
+                        type="mcp_servers_refreshed",
+                        connected=connected,
+                        failed=failed,
+                    )
+                ))
+                continue
+
+            # ----------------------------------------------------------------
+            # List skills
+            # ----------------------------------------------------------------
+            if isinstance(op, ListSkillsOp):
+                from bob.protocol.events import SkillsListedEvent
+                from bob.protocol.items import SkillsListEntry
+                entries = []
+                if self._skills_manager:
+                    cwd = Path(op.cwd) if op.cwd else self.cwd
+                    discovered = self._skills_manager.discover(cwd=cwd, force_reload=True)
+                    entries = [e.model_dump(mode="json") for e in discovered]
+                await self._emit(Event(
+                    id=sub_id,
+                    msg=SkillsListedEvent(
+                        type="skills_listed",
+                        entries=entries,
                     )
                 ))
                 continue

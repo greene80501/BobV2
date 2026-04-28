@@ -120,6 +120,14 @@ class ToolRegistry:
         self._tools.pop(name, None)
         self._load_locks.pop(name, None)
 
+    def unregister_by_source(self, source: str) -> int:
+        """Remove all tools with the given source tag. Returns count removed."""
+        to_remove = [name for name, t in self._tools.items() if t.source == source]
+        for name in to_remove:
+            self._tools.pop(name, None)
+            self._load_locks.pop(name, None)
+        return len(to_remove)
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------

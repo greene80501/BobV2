@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "repo_inspector": {
+      "type": "stdio",
+      "command": "${BOB_PYTHON}",
+      "args": [
+        "${BOB_PLUGIN_ROOT}/../../demo_mcp/repo_inspector_server.py"
+      ]
+    }
+  }
+}

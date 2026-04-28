@@ -1,0 +1,10 @@
+{
+  "name": "dev-workflow",
+  "version": "0.1.0",
+  "description": "Development workflow plugin with a task-focused MCP server and test guidance skill.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Dev Workflow",
+    "shortDescription": "Track test and task execution steps"
+  }
+}

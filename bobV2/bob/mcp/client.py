@@ -1,6 +1,8 @@
 from __future__ import annotations
 import asyncio
-from typing import Optional, Any
+import os
+import re
+from typing import Any, Optional
 from dataclasses import dataclass, field
 
 
@@ -21,101 +23,179 @@ class McpResource:
     server_name: str
 
 
+def _substitute_vars(text: str, extra_env: dict[str, str] | None = None) -> str:
+    """Replace ${VAR} placeholders using environment variables and extra_env."""
+    env = {**os.environ}
+    if extra_env:
+        env.update(extra_env)
+
+    def _replace(m: re.Match) -> str:
+        return env.get(m.group(1), m.group(0))
+
+    return re.sub(r"\$\{([^}]+)\}", _replace, text)
+
+
+def _substitute_vars_in_dict(d: dict, extra_env: dict[str, str] | None = None) -> dict:
+    """Recursively substitute ${VAR} in all string values of a dict."""
+    result: dict = {}
+    for k, v in d.items():
+        if isinstance(v, str):
+            result[k] = _substitute_vars(v, extra_env)
+        elif isinstance(v, dict):
+            result[k] = _substitute_vars_in_dict(v, extra_env)
+        elif isinstance(v, list):
+            result[k] = [
+                _substitute_vars(item, extra_env) if isinstance(item, str) else item
+                for item in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
 class McpServerConnection:
-    """Manages connection to a single MCP server subprocess."""
+    """Manages a connection to a single MCP server (stdio, SSE, or HTTP)."""
 
     def __init__(
         self,
         name: str,
-        command: list[str],
-        env: dict[str, str] = None,
+        command: list[str] | None = None,
+        env: dict[str, str] | None = None,
         *,
+        transport: str = "stdio",
+        url: str = "",
+        headers: dict[str, str] | None = None,
         connect_timeout_seconds: float = 15.0,
         call_timeout_seconds: float = 30.0,
         retry_count: int = 1,
         max_output_chars: int = 32000,
     ):
         self.name = name
-        self.command = command
+        self.transport = transport
+        self.command = command or []
         self.env = env or {}
+        self.url = url
+        self.headers = headers or {}
         self.connect_timeout_seconds = max(1.0, min(float(connect_timeout_seconds), 120.0))
         self.call_timeout_seconds = max(1.0, min(float(call_timeout_seconds), 300.0))
         self.retry_count = max(0, min(int(retry_count), 5))
         self.max_output_chars = max(512, min(int(max_output_chars), 100_000))
         self._session = None
-        self._stdio_ctx = None
+        self._transport_ctx = None
         self._tools: list[McpTool] = []
         self._resources: list[McpResource] = []
         self._connected = False
 
     async def connect(self) -> bool:
-        """Spawn the server process and connect via stdio. Returns True on success."""
         try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-            import os
-
-            env = os.environ.copy()
-            env.update(self.env)
-
-            server_params = StdioServerParameters(
-                command=self.command[0],
-                args=self.command[1:],
-                env=env,
-            )
-
-            self._stdio_ctx = stdio_client(server_params)
-            read_stream, write_stream = await asyncio.wait_for(
-                self._stdio_ctx.__aenter__(),
-                timeout=self.connect_timeout_seconds,
-            )
-            self._session = ClientSession(read_stream, write_stream)
-            await asyncio.wait_for(self._session.__aenter__(), timeout=self.connect_timeout_seconds)
-            await asyncio.wait_for(self._session.initialize(), timeout=self.connect_timeout_seconds)
-
-            tools_result = await asyncio.wait_for(
-                self._session.list_tools(),
-                timeout=self.connect_timeout_seconds,
-            )
-            self._tools = [
-                McpTool(
-                    name=tool.name,
-                    description=tool.description or "",
-                    input_schema=tool.inputSchema or {"type": "object", "properties": {}},
-                    server_name=self.name,
-                )
-                for tool in tools_result.tools
-            ]
-
-            # Fetch resources (optional — servers may not support this)
-            try:
-                resources_result = await asyncio.wait_for(
-                    self._session.list_resources(),
-                    timeout=self.connect_timeout_seconds,
-                )
-                self._resources = [
-                    McpResource(
-                        uri=str(r.uri),
-                        name=r.name or str(r.uri),
-                        description=r.description or "",
-                        mime_type=r.mimeType or "text/plain",
-                        server_name=self.name,
-                    )
-                    for r in (resources_result.resources or [])
-                ]
-            except Exception:
-                self._resources = []
-
-            self._connected = True
-            return True
-
+            if self.transport == "stdio":
+                return await self._connect_stdio()
+            elif self.transport == "sse":
+                return await self._connect_sse()
+            elif self.transport == "http":
+                return await self._connect_http()
+            else:
+                return False
         except ImportError:
-            # MCP SDK not installed — silently skip
             self._connected = False
             return False
         except Exception:
             self._connected = False
             return False
+
+    async def _connect_stdio(self) -> bool:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+
+        merged_env = os.environ.copy()
+        merged_env.update(self.env)
+
+        command = [_substitute_vars(c, self.env) for c in self.command]
+        server_params = StdioServerParameters(
+            command=command[0] if command else "",
+            args=command[1:],
+            env=merged_env,
+        )
+        self._transport_ctx = stdio_client(server_params)
+        read, write = await asyncio.wait_for(
+            self._transport_ctx.__aenter__(),
+            timeout=self.connect_timeout_seconds,
+        )
+        return await self._init_session(read, write)
+
+    async def _connect_sse(self) -> bool:
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+
+        url = _substitute_vars(self.url, self.env)
+        headers = _substitute_vars_in_dict(self.headers, self.env)
+        self._transport_ctx = sse_client(url=url, headers=headers)
+        read, write = await asyncio.wait_for(
+            self._transport_ctx.__aenter__(),
+            timeout=self.connect_timeout_seconds,
+        )
+        return await self._init_session(read, write)
+
+    async def _connect_http(self) -> bool:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        url = _substitute_vars(self.url, self.env)
+        headers = _substitute_vars_in_dict(self.headers, self.env)
+        self._transport_ctx = streamablehttp_client(url=url, headers=headers)
+        # streamablehttp_client returns (read, write, get_session_fn) — 3-tuple
+        result = await asyncio.wait_for(
+            self._transport_ctx.__aenter__(),
+            timeout=self.connect_timeout_seconds,
+        )
+        read, write = result[0], result[1]
+        return await self._init_session(read, write)
+
+    async def _init_session(self, read, write) -> bool:
+        from mcp import ClientSession
+
+        self._session = ClientSession(read, write)
+        await asyncio.wait_for(
+            self._session.__aenter__(), timeout=self.connect_timeout_seconds
+        )
+        await asyncio.wait_for(
+            self._session.initialize(), timeout=self.connect_timeout_seconds
+        )
+        await self._load_tools_and_resources()
+        self._connected = True
+        return True
+
+    async def _load_tools_and_resources(self) -> None:
+        tools_result = await asyncio.wait_for(
+            self._session.list_tools(),
+            timeout=self.connect_timeout_seconds,
+        )
+        self._tools = [
+            McpTool(
+                name=t.name,
+                description=t.description or "",
+                input_schema=t.inputSchema or {"type": "object", "properties": {}},
+                server_name=self.name,
+            )
+            for t in tools_result.tools
+        ]
+        try:
+            resources_result = await asyncio.wait_for(
+                self._session.list_resources(),
+                timeout=self.connect_timeout_seconds,
+            )
+            self._resources = [
+                McpResource(
+                    uri=str(r.uri),
+                    name=r.name or str(r.uri),
+                    description=r.description or "",
+                    mime_type=r.mimeType or "text/plain",
+                    server_name=self.name,
+                )
+                for r in (resources_result.resources or [])
+            ]
+        except Exception:
+            self._resources = []
 
     async def disconnect(self) -> None:
         if self._session:
@@ -124,12 +204,12 @@ class McpServerConnection:
             except Exception:
                 pass
             self._session = None
-        if self._stdio_ctx:
+        if self._transport_ctx:
             try:
-                await self._stdio_ctx.__aexit__(None, None, None)
+                await self._transport_ctx.__aexit__(None, None, None)
             except Exception:
                 pass
-            self._stdio_ctx = None
+            self._transport_ctx = None
         self._connected = False
 
     async def list_tools(self) -> list[McpTool]:
@@ -183,7 +263,6 @@ class McpServerConnection:
             if last_exc is not None:
                 raise last_exc
 
-            # Extract text content from result
             if hasattr(result, "content"):
                 texts = [
                     item.text
@@ -208,7 +287,6 @@ class McpServerConnection:
     def is_connected(self) -> bool:
         return self._connected
 
-    # Async context manager support
     async def __aenter__(self) -> "McpServerConnection":
         await self.connect()
         return self

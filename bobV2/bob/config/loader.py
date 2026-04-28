@@ -9,6 +9,7 @@ Merges four configuration layers in ascending priority order:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -93,6 +94,68 @@ def _user_config_path() -> Path:
     return Path.home() / ".bob" / "config.toml"
 
 
+def _load_claude_settings() -> dict[str, Any]:
+    """Import MCP servers from Claude Code's settings files.
+
+    Reads ~/.claude/settings.json and ~/.claude/claude_desktop_config.json,
+    extracting mcpServers entries and converting them to bob McpServerConfig
+    dict format.  Returns a partial BobConfig dict with only mcp_servers set.
+    """
+    mcp_servers: dict[str, Any] = {}
+    claude_home = Path.home() / ".claude"
+
+    settings_candidates = [
+        claude_home / "settings.json",
+        claude_home / "claude_desktop_config.json",
+    ]
+
+    for settings_path in settings_candidates:
+        if not settings_path.is_file():
+            continue
+        try:
+            raw = json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        servers_dict = raw.get("mcpServers", {})
+        if not isinstance(servers_dict, dict):
+            continue
+
+        for srv_name, srv_cfg in servers_dict.items():
+            if not isinstance(srv_cfg, dict) or srv_name in mcp_servers:
+                continue
+            transport = srv_cfg.get("type", "stdio")
+            if transport == "stdio" or ("command" in srv_cfg and "type" not in srv_cfg):
+                cmd = srv_cfg.get("command", "")
+                entry: dict[str, Any] = {
+                    "type": "stdio",
+                    "command": [cmd] if isinstance(cmd, str) else list(cmd),
+                    "args": list(srv_cfg.get("args", [])),
+                    "env": dict(srv_cfg.get("env", {})),
+                }
+            elif transport == "sse":
+                entry = {
+                    "type": "sse",
+                    "url": srv_cfg.get("url", ""),
+                    "headers": dict(srv_cfg.get("headers", {})),
+                    "env": dict(srv_cfg.get("env", {})),
+                }
+            elif transport in ("http", "streamable_http"):
+                entry = {
+                    "type": "http",
+                    "url": srv_cfg.get("url", ""),
+                    "headers": dict(srv_cfg.get("headers", {})),
+                    "env": dict(srv_cfg.get("env", {})),
+                }
+            else:
+                continue
+            mcp_servers[srv_name] = entry
+
+    if not mcp_servers:
+        return {}
+    return {"mcp_servers": mcp_servers}
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -125,6 +188,13 @@ def load_config(
     user_cfg = _load_toml(_user_config_path())
     if user_cfg:
         merged = _deep_merge(merged, user_cfg)
+
+    # Layer 2.5: import MCP servers from Claude Code settings (if enabled)
+    merged_config_so_far = BobConfig.model_validate(merged)
+    if merged_config_so_far.import_claude_mcp:
+        claude_cfg = _load_claude_settings()
+        if claude_cfg:
+            merged = _deep_merge(merged, claude_cfg)
 
     # Layer 3: project config (walk up from cwd)
     project_cfg = _find_project_config(cwd)

@@ -119,14 +119,7 @@ class NetworkApprovalOp(BaseModel):
     domain: str
     approved: bool
     approve_always: bool = False  # Approve this domain for the entire session
-
-
-
-
-    request_id: str
-    granted: bool
-    # Permissions that were actually granted (subset of requested)
-    granted_permissions: list[str] = Field(default_factory=list)
+    request_id: str = ""
 
 
 # ---------------------------------------------------------------------------

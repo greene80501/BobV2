@@ -143,6 +143,10 @@ class SkillMetadata(BaseModel):
     path: Path
     scope: str  # SkillScope value
     enabled: bool = True
+    # Claude Code / SKILL.md compatibility fields
+    user_invocable: bool = False
+    allowed_tools: list[str] = Field(default_factory=list)
+    content_file: str = "skill.md"  # "skill.md" (bob) or "SKILL.md" (Claude Code)
 
 
 class SkillErrorInfo(BaseModel):

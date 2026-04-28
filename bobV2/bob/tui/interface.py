@@ -1914,6 +1914,9 @@ class Interface:
             ExecOutputEvent,
             ExecStartedEvent,
             InfoEvent,
+            McpStartupStatusEvent,
+            McpServersRefreshedEvent,
+            McpToolsListedEvent,
             NetworkApprovalRequestedEvent,
             PatchApprovalRequestedEvent,
             PlanApprovalRequestedEvent,
@@ -1921,6 +1924,7 @@ class Interface:
             PlanRejectedEvent,
             ReasoningDeltaEvent,
             SessionEndedEvent,
+            SkillsListedEvent,
             TextDeltaEvent,
             ToolCallStartedEvent,
             ToolCallCompletedEvent,
@@ -2547,6 +2551,52 @@ class Interface:
                     self._done.set()
                     return
 
+                elif isinstance(msg, McpStartupStatusEvent):
+                    if msg.failed:
+                        failed_servers = ", ".join(msg.failed)
+                        _p(f"  {_bd('·')} {_y(f'MCP: {len(msg.failed)} server(s) failed: {failed_servers}')}")
+
+                elif isinstance(msg, McpServersRefreshedEvent):
+                    connected_servers = ", ".join(msg.connected) or "none"
+                    failed_servers = ", ".join(msg.failed) or "none"
+                    _p(
+                        f"  {_bd('·')} "
+                        f"{_d(f'MCP refreshed · connected: {connected_servers} · failed: {failed_servers}')}"
+                    )
+
+                elif isinstance(msg, McpToolsListedEvent):
+                    if not msg.tools:
+                        _p(f"  {_d('No MCP tools available')}")
+                    else:
+                        _p(f"  {_bd('MCP tools')} ({len(msg.tools)})")
+                        for t in msg.tools:
+                            _p(f"    {_c(t['server_name'])}{_d('/')}{t['name']}")
+                            if t.get('description'):
+                                _p(f"      {_d(t['description'][:80])}")
+
+                elif isinstance(msg, SkillsListedEvent):
+                    def _entry_skills(entry):
+                        if isinstance(entry, dict):
+                            return entry.get("skills", [])
+                        return getattr(entry, "skills", [])
+
+                    def _skill_value(skill, key, default=None):
+                        if isinstance(skill, dict):
+                            return skill.get(key, default)
+                        return getattr(skill, key, default)
+
+                    total = sum(len(_entry_skills(e)) for e in msg.entries)
+                    if total == 0:
+                        _p(f"  {_d('No skills found')}")
+                    else:
+                        _p(f"  {_bd('Skills')} ({total})")
+                        for entry in msg.entries:
+                            for skill in _entry_skills(entry):
+                                invocable = " [/]" if _skill_value(skill, "user_invocable", False) else ""
+                                name = _skill_value(skill, "name", "?")
+                                description = _skill_value(skill, "description", "")[:70]
+                                _p(f"    {_c(name)}{_d(invocable)} — {description}")
+
             except Exception as exc:
                 self._log_event_handler_error(msg, exc)
 
@@ -2675,9 +2725,54 @@ class Interface:
             _p(_d(json.dumps(self._config.model_dump(), indent=2, default=str)))
 
         elif cmd == SlashCommand.MCP:
-            from bob.protocol.ops import ListMcpToolsOp
-            await self._session.submit(ListMcpToolsOp())
-            _p(f"  {_d('listing MCP tools…')}")
+            sub = args.strip().lower() if args else ""
+            if sub == "refresh":
+                from bob.protocol.ops import RefreshMcpServersOp
+                _p(f"  {_d('refreshing MCP servers…')}")
+                await self._session.submit(RefreshMcpServersOp())
+            else:
+                from bob.protocol.ops import ListMcpToolsOp
+                server_filter = args.strip() if args and args.strip() != "list" else None
+                await self._session.submit(ListMcpToolsOp(server_name=server_filter))
+                _p(f"  {_d('listing MCP tools…')}")
+
+        elif cmd == SlashCommand.SKILLS:
+            sub = args.strip().lower() if args else ""
+            if sub == "list" or not sub:
+                from bob.protocol.ops import ListSkillsOp
+                await self._session.submit(ListSkillsOp(cwd=str(self._session.cwd)))
+                _p(f"  {_d('listing skills…')}")
+            else:
+                # Treat as skill name to invoke
+                skill_name, _, skill_args = args.strip().partition(" ")
+                await self._session.invoke_skill(skill_name.strip(), skill_args.strip())
+                _p(f"  {_d(f'invoking skill: {skill_name}…')}")
+
+        elif cmd == SlashCommand.PLUGINS:
+            from bob.plugins.manager import PluginsManager
+
+            plugins = []
+            seen: set[str] = set()
+            plugin_roots = [
+                ("user", self._session.bob_home / "plugins"),
+                ("repo", self._session.cwd / ".bob" / "plugins"),
+            ]
+            for scope, root in plugin_roots:
+                pm = PluginsManager(root)
+                for plugin in pm.list_plugins():
+                    key = plugin.name.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    plugins.append((scope, plugin))
+
+            if not plugins:
+                _p(f"  {_d('No plugins installed')}")
+            else:
+                _p(f"  {_bd('Plugins')} ({len(plugins)})")
+                for scope, plugin in plugins:
+                    status = "" if plugin.enabled else " [disabled]"
+                    _p(f"    {_c(plugin.name)}{_d(status)} {_d(f'[{scope}]')} — {plugin.description[:70]}")
 
         elif cmd == SlashCommand.STOP:
             from bob.protocol.ops import CleanBackgroundTerminalsOp
@@ -2815,7 +2910,7 @@ class Interface:
                                   SlashCommand.CONTEXT, SlashCommand.SUMMARY, SlashCommand.REVIEW]),
                 ("Config",      [SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.OUTPUT_STYLE,
                                   SlashCommand.THEME, SlashCommand.VI, SlashCommand.APPROVALS]),
-                ("Workflow",    [SlashCommand.PLAN, SlashCommand.MCP, SlashCommand.HOOKS]),
+                ("Workflow",    [SlashCommand.PLAN, SlashCommand.MCP, SlashCommand.SKILLS, SlashCommand.HOOKS]),
                 ("System",      [SlashCommand.DOCTOR, SlashCommand.INIT, SlashCommand.FEEDBACK,
                                   SlashCommand.QUIT]),
             ]

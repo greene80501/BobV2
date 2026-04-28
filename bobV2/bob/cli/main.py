@@ -229,13 +229,35 @@ def mcp_add(
 def mcp_list() -> None:
     """List configured MCP servers."""
     from bob.config.loader import load_config
+    from bob.plugins.manager import PluginsManager
 
     config = load_config()
-    if not config.mcp_servers:
+    rows: list[str] = []
+    for srv_name, srv in config.mcp_servers.items():
+        if getattr(srv, "type", "stdio") == "stdio":
+            rows.append(f"  [config] {srv_name}: {' '.join(srv.command)}")
+        else:
+            rows.append(f"  [config] {srv_name}: {srv.type} {srv.url}")
+
+    plugin_cfgs, _ = PluginsManager.load_plugin_bundles_from_roots(
+        [root for _, root in _get_plugin_roots()]
+    )
+    seen_plugin_servers: set[str] = set()
+    for cfg in plugin_cfgs:
+        if cfg.server_name in seen_plugin_servers or cfg.server_name in config.mcp_servers:
+            continue
+        seen_plugin_servers.add(cfg.server_name)
+        if cfg.transport == "stdio":
+            command = " ".join(cfg.command + cfg.args)
+            rows.append(f"  [plugin] {cfg.server_name}: {command}")
+        else:
+            rows.append(f"  [plugin] {cfg.server_name}: {cfg.transport} {cfg.url}")
+
+    if not rows:
         typer.echo("No MCP servers configured.")
         return
-    for srv_name, srv in config.mcp_servers.items():
-        typer.echo(f"  {srv_name}: {' '.join(srv.command)}")
+    for row in rows:
+        typer.echo(row)
 
 
 @app.command()
@@ -272,17 +294,44 @@ def _get_plugins_manager():
     return PluginsManager(plugins_dir)
 
 
+def _get_plugin_roots(cwd: Optional[Path] = None) -> list[tuple[str, Path]]:
+    import os
+    from pathlib import Path as _Path
+
+    active_cwd = (cwd or Path.cwd()).resolve()
+    roots = [("user", _Path(os.environ.get("BOB_HOME", _Path.home() / ".bob")) / "plugins")]
+    repo_root = active_cwd / ".bob" / "plugins"
+    if repo_root not in [root for _, root in roots]:
+        roots.append(("repo", repo_root))
+    return roots
+
+
+def _collect_plugins(cwd: Optional[Path] = None) -> list[tuple[str, object]]:
+    from bob.plugins.manager import PluginsManager
+
+    collected: list[tuple[str, object]] = []
+    seen: set[str] = set()
+    for scope, root in _get_plugin_roots(cwd):
+        pm = PluginsManager(root)
+        for plugin in pm.list_plugins():
+            key = plugin.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append((scope, plugin))
+    return collected
+
+
 @plugin_app.command("list")
 def plugin_list() -> None:
     """List installed plugins."""
-    pm = _get_plugins_manager()
-    plugins = pm.list_plugins()
+    plugins = _collect_plugins()
     if not plugins:
         typer.echo("  No plugins installed.")
         return
-    for p in plugins:
+    for scope, p in plugins:
         status = "" if p.enabled else " [disabled]"
-        typer.echo(f"  {p.name}@{p.version}{status} — {p.description}")
+        typer.echo(f"  [{scope}] {p.name}@{p.version}{status} — {p.description}")
 
 
 @plugin_app.command("install")

@@ -267,9 +267,6 @@ class PlanRejectedEvent(BaseModel):
     reason: str = ""
 
 
-    action: str  # ElicitationAction value
-
-
 class NetworkApprovalRequestedEvent(BaseModel):
     """Emitted when a tool attempts network access to an unapproved domain."""
     type: Literal["network_approval_requested"] = "network_approval_requested"
@@ -277,10 +274,6 @@ class NetworkApprovalRequestedEvent(BaseModel):
     domain: str
     tool_name: str
     request_id: str = ""
-
-
-
-    data: Optional[dict[str, Any]] = None
 
 
 # ===========================================================================
@@ -324,6 +317,13 @@ class McpServersRefreshedEvent(BaseModel):
     type: Literal["mcp_servers_refreshed"] = "mcp_servers_refreshed"
     connected: list[str]
     failed: list[str]
+
+
+class McpStartupStatusEvent(BaseModel):
+    type: Literal["mcp_startup_status"] = "mcp_startup_status"
+    connected: list[str]
+    failed: list[str]
+    total_tools: int
 
 
 # ===========================================================================
@@ -723,6 +723,7 @@ EventMsg = Annotated[
         McpServerDisconnectedEvent,
         McpToolsListedEvent,
         McpServersRefreshedEvent,
+        McpStartupStatusEvent,
         # Models
         ModelsListedEvent,
         # Config

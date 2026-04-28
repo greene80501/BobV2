@@ -36,40 +36,36 @@ class McpManager:
             return {}
 
         async def _connect_one(name: str, config) -> tuple[str, bool]:
-            command = (
-                config.get("command", [])
-                if isinstance(config, dict)
-                else list(config.command) + list(config.args)
-            )
-            env = (
-                config.get("env", {})
-                if isinstance(config, dict)
-                else dict(config.env)
-            )
-            connect_timeout_seconds = (
-                config.get("connect_timeout_seconds", 15.0)
-                if isinstance(config, dict)
-                else getattr(config, "connect_timeout_seconds", 15.0)
-            )
-            call_timeout_seconds = (
-                config.get("call_timeout_seconds", 30.0)
-                if isinstance(config, dict)
-                else getattr(config, "call_timeout_seconds", 30.0)
-            )
-            retry_count = (
-                config.get("retry_count", 1)
-                if isinstance(config, dict)
-                else getattr(config, "retry_count", 1)
-            )
-            max_output_chars = (
-                config.get("max_output_chars", 32000)
-                if isinstance(config, dict)
-                else getattr(config, "max_output_chars", 32000)
-            )
+            def _get(key: str, default):
+                if isinstance(config, dict):
+                    return config.get(key, default)
+                return getattr(config, key, default)
+
+            transport = _get("type", "stdio")
+            env = dict(_get("env", {}))
+            connect_timeout_seconds = float(_get("connect_timeout_seconds", 15.0))
+            call_timeout_seconds = float(_get("call_timeout_seconds", 30.0))
+            retry_count = int(_get("retry_count", 1))
+            max_output_chars = int(_get("max_output_chars", 32000))
+
+            if transport == "stdio":
+                raw_cmd = _get("command", [])
+                raw_args = _get("args", [])
+                command = list(raw_cmd) + list(raw_args)
+                url = ""
+                headers: dict = {}
+            else:
+                command = []
+                url = _get("url", "")
+                headers = dict(_get("headers", {}))
+
             conn = McpServerConnection(
                 name=name,
                 command=command,
                 env=env,
+                transport=transport,
+                url=url,
+                headers=headers,
                 connect_timeout_seconds=connect_timeout_seconds,
                 call_timeout_seconds=call_timeout_seconds,
                 retry_count=retry_count,
