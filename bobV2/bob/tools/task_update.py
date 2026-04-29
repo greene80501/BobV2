@@ -1,6 +1,7 @@
 """Task update tool for Bob V2."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 TASK_UPDATE_DESCRIPTION = (
@@ -68,9 +69,19 @@ async def task_update_handler(tool_input: dict, context: Any) -> str:
         task = task_db.update_task(task_id, **updates)
         if task is None:
             return f"Error: task {task_id} not found"
-        
+
         status = task.get("status", "unknown")
         title = task.get("title", "")
+
+        if status == "completed":
+            session = getattr(context, "_session", None)
+            if session is not None:
+                from bob.protocol.config_types import HookEventName
+                asyncio.create_task(session.hook_runner.run_hooks(
+                    HookEventName.TASK_COMPLETED,
+                    {"task_id": task_id, "title": title, "status": status},
+                ))
+
         return f"✓ Updated task {task_id}: {title} (status: {status})"
     except Exception as exc:
         return f"Error updating task: {exc}"

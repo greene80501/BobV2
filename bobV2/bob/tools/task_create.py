@@ -1,6 +1,7 @@
 """Task creation tool for Bob V2."""
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -57,7 +58,15 @@ async def task_create_handler(tool_input: dict, context: Any) -> str:
             status=TaskStatus.PENDING,
             priority=TaskPriority(priority),
         )
-        
+
+        session = getattr(context, "_session", None)
+        if session is not None:
+            from bob.protocol.config_types import HookEventName
+            asyncio.create_task(session.hook_runner.run_hooks(
+                HookEventName.TASK_CREATED,
+                {"task_id": task_id, "title": title, "priority": priority},
+            ))
+
         return f"✓ Created task {task_id}: {title} (priority: {priority})"
     except Exception as exc:
         return f"Error creating task: {exc}"

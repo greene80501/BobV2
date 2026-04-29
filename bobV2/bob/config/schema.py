@@ -82,14 +82,21 @@ class WebSearchToolConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 class HookConfig(BaseModel):
-    """A single hook entry — maps an event name to a shell command."""
+    """A single hook entry — maps an event name to a shell command or HTTP endpoint.
+
+    Exactly one of *command* or *url* must be non-empty.  When *url* is set the
+    runner POSTs the hook context as JSON instead of spawning a subprocess.
+    """
     event: str  # HookEventName value
-    command: str
+    # Shell command to execute (mutually exclusive with url)
+    command: str = ""
+    # HTTP endpoint to POST JSON context to (mutually exclusive with command)
+    url: Optional[str] = None
     # Optional glob/tool-name filter (e.g. only run on bash_exec)
     match_tool: Optional[str] = None
     # Timeout in seconds; 0 means no timeout
     timeout_seconds: int = 30
-    # Whether a non-zero exit code should block the triggering action
+    # Whether a non-zero exit code / non-2xx response should block the action
     blocking: bool = False
 
 

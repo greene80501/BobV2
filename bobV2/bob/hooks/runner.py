@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -12,12 +13,15 @@ class HookConfig:
     """Configuration for a single event hook."""
 
     event: HookEventName
-    command: list[str]
+    # Shell command tokens.  Empty when url is set instead.
+    command: list[str] = field(default_factory=list)
+    # HTTP endpoint — POST JSON context body.  Takes precedence over command.
+    url: Optional[str] = None
     # "sync" — await result and optionally block; "async" — fire and forget
     mode: str = "sync"
     # timeout in seconds; 0 = no limit
     timeout_seconds: int = 30
-    # Extra environment variables injected into the hook process
+    # Extra environment variables injected into subprocess hooks
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -29,7 +33,7 @@ class HookResult:
     stdout: str = ""
     stderr: str = ""
     exit_code: int = 0
-    # True when a sync hook returned non-zero and should block the action
+    # True when a sync hook returned non-zero / non-2xx and should block the action
     blocked: bool = False
 
 
@@ -55,14 +59,6 @@ class HookRunner:
 
         Async hooks are fired in background tasks and do not contribute to the
         returned list.
-
-        Parameters
-        ----------
-        event:
-            The lifecycle event that just occurred.
-        context:
-            Optional key-value context injected as ``BOB_<KEY>`` environment
-            variables into each hook subprocess.
         """
         matching = [h for h in self._hooks if h.event == event]
         if not matching:
@@ -76,7 +72,6 @@ class HookRunner:
                 result = await self._execute(hook, context)
                 results.append(result)
                 if result.blocked:
-                    # A blocking sync hook failed — stop processing further hooks
                     break
 
         return results
@@ -90,12 +85,25 @@ class HookRunner:
         hook: HookConfig,
         context: Optional[dict],
     ) -> HookResult:
+        if hook.url:
+            return await self._execute_http(hook, context)
+        return await self._execute_subprocess(hook, context)
+
+    async def _execute_subprocess(
+        self,
+        hook: HookConfig,
+        context: Optional[dict],
+    ) -> HookResult:
+        if not hook.command:
+            return HookResult(
+                status=HookRunStatus.FAILED,
+                stderr="Hook has neither command nor url",
+                exit_code=-1,
+                blocked=hook.mode == "sync",
+            )
+
         env = os.environ.copy()
-
-        # Inject hook extra env
         env.update(hook.extra_env)
-
-        # Inject context as BOB_* environment variables
         if context:
             for key, value in context.items():
                 env[f"BOB_{key.upper()}"] = str(value)
@@ -144,6 +152,55 @@ class HookRunner:
                 exit_code=-1,
                 blocked=hook.mode == "sync",
             )
+        except Exception as exc:
+            return HookResult(
+                status=HookRunStatus.FAILED,
+                stderr=str(exc),
+                exit_code=-1,
+                blocked=hook.mode == "sync",
+            )
+
+    async def _execute_http(
+        self,
+        hook: HookConfig,
+        context: Optional[dict],
+    ) -> HookResult:
+        """POST the context dict as JSON to hook.url.
+
+        A 2xx response is success; anything else is failure.
+        Response body is surfaced as stdout so callers can display it.
+        """
+        try:
+            import httpx
+        except ImportError:
+            return HookResult(
+                status=HookRunStatus.FAILED,
+                stderr="httpx is required for HTTP hooks (pip install httpx)",
+                exit_code=-1,
+                blocked=hook.mode == "sync",
+            )
+
+        payload = dict(context) if context else {}
+        timeout = float(hook.timeout_seconds) if hook.timeout_seconds > 0 else 30.0
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    hook.url,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "User-Agent": "bob-hook/1.0"},
+                )
+
+            success = 200 <= response.status_code < 300
+            body = response.text or ""
+            return HookResult(
+                status=HookRunStatus.COMPLETED if success else HookRunStatus.FAILED,
+                stdout=body,
+                stderr="" if success else f"HTTP {response.status_code}: {body[:200]}",
+                exit_code=0 if success else response.status_code,
+                blocked=(not success and hook.mode == "sync"),
+            )
+
         except Exception as exc:
             return HookResult(
                 status=HookRunStatus.FAILED,

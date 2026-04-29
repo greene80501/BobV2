@@ -101,6 +101,14 @@ class ToolOrchestrator:
             if result is not None:
                 tool_results.append(result)
 
+        # Notify after the full batch completes
+        from bob.protocol.config_types import HookEventName
+        import asyncio as _asyncio
+        _asyncio.create_task(self.session.hook_runner.run_hooks(
+            HookEventName.POST_TOOL_BATCH,
+            {"count": len(tool_results), "turn_id": self.turn_id},
+        ))
+
         return tool_results
 
     async def _filter_plan_mode(self, tool_calls: list[Any], tool_results: list[dict]) -> list[Any]:
@@ -366,6 +374,14 @@ class ToolOrchestrator:
             error=tool_error,
         ))
 
+        if tool_error is not None:
+            from bob.protocol.config_types import HookEventName
+            import asyncio as _asyncio
+            _asyncio.create_task(self.session.hook_runner.run_hooks(
+                HookEventName.POST_TOOL_USE_FAILURE,
+                {"tool": tool_name, "error": tool_error, "duration_ms": duration_ms},
+            ))
+
         return {
             "type": "function_call_output",
             "call_id": call_id,
@@ -426,6 +442,11 @@ class ToolOrchestrator:
         approval_reason = escalation_reason or "Command requires approval per policy"
 
         if approval_needed:
+            # Fire permission_request hook before prompting the user
+            from bob.protocol.config_types import HookEventName
+            perm_ctx = {"command": " ".join(command), "cwd": str(exec_cwd), "reason": approval_reason}
+            await self.session.hook_runner.run_hooks(HookEventName.PERMISSION_REQUEST, perm_ctx)
+
             await self.emit(ExecApprovalRequestedEvent(
                 type="exec_approval_requested",
                 tool_call_id=call_id,
@@ -446,6 +467,12 @@ class ToolOrchestrator:
                 ))
                 raise TurnAbortRequested()
             if decision == ReviewDecision.DENIED:
+                from bob.protocol.config_types import HookEventName
+                denied_ctx = {"command": " ".join(command), "cwd": str(exec_cwd)}
+                import asyncio as _asyncio
+                _asyncio.create_task(self.session.hook_runner.run_hooks(
+                    HookEventName.PERMISSION_DENIED, denied_ctx
+                ))
                 return "Command denied by user."
             if decision == ReviewDecision.APPROVED_FOR_SESSION:
                 key = " ".join(command[:2])

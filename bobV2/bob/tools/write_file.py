@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 from bob.tools.path_utils import resolve_tool_path
@@ -43,6 +44,13 @@ async def write_file_handler(tool_input: dict, context: Any) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding=encoding)
         byte_count = len(content.encode(encoding))
+        session = getattr(context, "_session", None)
+        if session is not None:
+            from bob.protocol.config_types import HookEventName
+            asyncio.create_task(session.hook_runner.run_hooks(
+                HookEventName.FILE_CHANGED,
+                {"path": str(p), "operation": "write", "bytes": byte_count},
+            ))
         return f"Wrote {byte_count:,} bytes to {p}"
     except Exception as exc:
         return f"Error writing {p}: {exc}"

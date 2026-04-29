@@ -147,6 +147,31 @@ class HookEventName(str, Enum):
     USER_PROMPT_SUBMIT = "user_prompt_submit"
     POST_TURN = "post_turn"
     STOP = "stop"
+    # Compaction lifecycle
+    PRE_COMPACT = "pre_compact"
+    POST_COMPACT = "post_compact"
+    # Filesystem / working-directory changes
+    CWD_CHANGED = "cwd_changed"
+    FILE_CHANGED = "file_changed"
+    # Git worktree lifecycle
+    WORKTREE_CREATE = "worktree_create"
+    WORKTREE_REMOVE = "worktree_remove"
+    # Prompt processing
+    USER_PROMPT_EXPANSION = "user_prompt_expansion"
+    # Approval / permission gates
+    PERMISSION_REQUEST = "permission_request"
+    PERMISSION_DENIED = "permission_denied"
+    # Tool-batch lifecycle
+    POST_TOOL_USE_FAILURE = "post_tool_use_failure"
+    POST_TOOL_BATCH = "post_tool_batch"
+    # Sub-agent lifecycle
+    SUBAGENT_START = "subagent_start"
+    SUBAGENT_STOP = "subagent_stop"
+    # Task lifecycle
+    TASK_CREATED = "task_created"
+    TASK_COMPLETED = "task_completed"
+    # Error termination
+    STOP_FAILURE = "stop_failure"
 
 
 class HookRunStatus(str, Enum):

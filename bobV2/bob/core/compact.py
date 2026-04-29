@@ -108,6 +108,15 @@ async def run_compact(
     max_retries: Optional[int] = None,
 ) -> Optional[CompactionResult]:
     from bob.llm.client import TextDeltaEvent, StreamErrorEvent  # type: ignore
+    from bob.protocol.config_types import HookEventName
+
+    # Fire pre-compact hooks (blocking hooks can veto compaction)
+    _hook_runner = getattr(session, "hook_runner", None)
+    if _hook_runner is not None:
+        hook_ctx = {"reason": reason, "hint": hint or ""}
+        pre_results = await _hook_runner.run_hooks(HookEventName.PRE_COMPACT, hook_ctx)
+        if any(r.blocked for r in pre_results):
+            return None
 
     old_history = session.context_manager.raw_items()
     token_before = session.context_manager.approx_token_count()
@@ -146,7 +155,7 @@ async def run_compact(
             user_messages = collect_user_messages(old_history)
             new_history = build_compacted_history(user_messages, summary_text)
             token_after = len(json.dumps(new_history)) // 4
-            return CompactionResult(
+            result = CompactionResult(
                 summary_text=summary_text,
                 old_history=old_history,
                 new_history=new_history,
@@ -154,6 +163,15 @@ async def run_compact(
                 token_before=token_before,
                 token_after=token_after,
             )
+            # Fire post-compact hooks asynchronously — no return value used
+            if _hook_runner is not None:
+                await _hook_runner.run_hooks(HookEventName.POST_COMPACT, {
+                    "reason": reason,
+                    "token_before": token_before,
+                    "token_after": token_after,
+                    "tokens_saved": token_before - token_after,
+                })
+            return result
 
         if not _is_prompt_too_long(stream_error or ""):
             return None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 from bob.tools.path_utils import resolve_tool_path
@@ -45,6 +46,13 @@ async def edit_file_handler(tool_input: dict, context: Any) -> str:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(new_string, encoding="utf-8")
+            session = getattr(context, "_session", None)
+            if session is not None:
+                from bob.protocol.config_types import HookEventName
+                asyncio.create_task(session.hook_runner.run_hooks(
+                    HookEventName.FILE_CHANGED,
+                    {"path": str(p), "operation": "create"},
+                ))
             return f"Created {p} ({len(new_string.encode()):,} bytes)"
         except Exception as exc:
             return f"Error creating {p}: {exc}"
@@ -78,6 +86,14 @@ async def edit_file_handler(tool_input: dict, context: Any) -> str:
         p.write_text(new_text, encoding="utf-8")
     except Exception as exc:
         return f"Error writing {p}: {exc}"
+
+    session = getattr(context, "_session", None)
+    if session is not None:
+        from bob.protocol.config_types import HookEventName
+        asyncio.create_task(session.hook_runner.run_hooks(
+            HookEventName.FILE_CHANGED,
+            {"path": str(p), "operation": "edit"},
+        ))
 
     # Count lines changed
     old_lines = old_string.count("\n") + 1

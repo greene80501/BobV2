@@ -125,6 +125,9 @@ class BobSession:
         self._mcp_manager = None
         self._skills_manager = None
 
+        # Hook runner — lazily built in the hook_runner property
+        self._hook_runner = None
+
         # Agent control — multi-agent orchestration (parent sessions only)
         if not ephemeral:
             from bob.core.agents.control import AgentControl
@@ -137,6 +140,37 @@ class BobSession:
         self._log_action_line(
             f"[session] action log started session={self.session_id} cwd={self.cwd} model={self.config.model}"
         )
+
+    # ------------------------------------------------------------------
+    # Hook runner
+    # ------------------------------------------------------------------
+
+    @property
+    def hook_runner(self) -> "HookRunner":
+        """Lazily-built HookRunner for this session's configured hooks."""
+        if not hasattr(self, "_hook_runner") or self._hook_runner is None:
+            from bob.hooks.runner import HookRunner, HookConfig as RunnerHookConfig
+            from bob.protocol.config_types import HookEventName
+            runner_hooks: list[RunnerHookConfig] = []
+            for h in self.config.hooks:
+                raw_event = getattr(h, "event", "")
+                try:
+                    event = HookEventName(raw_event)
+                except ValueError:
+                    continue
+                raw_cmd = getattr(h, "command", "") or ""
+                cmd = raw_cmd.split() if isinstance(raw_cmd, str) and raw_cmd else []
+                url = getattr(h, "url", None)
+                blocking = getattr(h, "blocking", False)
+                runner_hooks.append(RunnerHookConfig(
+                    event=event,
+                    command=cmd,
+                    url=url,
+                    mode="sync" if blocking else "async",
+                    timeout_seconds=getattr(h, "timeout_seconds", 30),
+                ))
+            self._hook_runner = HookRunner(runner_hooks)
+        return self._hook_runner
 
     # ------------------------------------------------------------------
     # Bob home helper
@@ -193,6 +227,9 @@ class BobSession:
         )
         from bob.tools.read_file import (
             read_file_handler, READ_FILE_DESCRIPTION, READ_FILE_SCHEMA,
+        )
+        from bob.tools.read_pdf import (
+            read_pdf_handler, READ_PDF_DESCRIPTION, READ_PDF_SCHEMA,
         )
         from bob.tools.write_file import (
             write_file_handler, WRITE_FILE_DESCRIPTION, WRITE_FILE_SCHEMA,
@@ -298,6 +335,11 @@ class BobSession:
         # Phase 1 â€” file tools
         self.tool_registry.register(
             "read_file", READ_FILE_DESCRIPTION, READ_FILE_SCHEMA, read_file_handler,
+            is_mutating=False,
+            supports_parallel=True,
+        )
+        self.tool_registry.register(
+            "read_pdf", READ_PDF_DESCRIPTION, READ_PDF_SCHEMA, read_pdf_handler,
             is_mutating=False,
             supports_parallel=True,
         )
@@ -1893,6 +1935,13 @@ class BobSession:
                 user_preview = self._preview_from_user_turn(op)
                 current_turn_preview = user_preview
 
+                # Fire user_prompt_expansion before the turn reaches the model
+                from bob.protocol.config_types import HookEventName
+                asyncio.create_task(self.hook_runner.run_hooks(
+                    HookEventName.USER_PROMPT_EXPANSION,
+                    {"preview": user_preview[:500], "session_id": self.session_id},
+                ))
+
                 cancel_ev = asyncio.Event()
                 self._current_turn_cancel = cancel_ev
                 current_turn_task = asyncio.create_task(
@@ -1955,6 +2004,11 @@ class BobSession:
                     await self._emit(Event(
                         id=sub_id,
                         msg=ErrorEvent(type="error", message=str(exc))
+                    ))
+                    from bob.protocol.config_types import HookEventName
+                    asyncio.create_task(self.hook_runner.run_hooks(
+                        HookEventName.STOP_FAILURE,
+                        {"error": str(exc), "session_id": self.session_id},
                     ))
 
             except asyncio.CancelledError:

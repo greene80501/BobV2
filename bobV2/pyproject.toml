@@ -20,6 +20,7 @@ dependencies = [
     "watchfiles>=0.21.0",
     "requests>=2.32.0",
     "beautifulsoup4>=4.12.2",
+    "pypdf>=4.0.0",
     "ddgs>=8.1.0",
     "tomli_w>=1.0.0",
 ]

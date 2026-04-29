@@ -57,6 +57,13 @@ class BobSubAgent:
             await self._set_status(AgentStatus.RUNNING)
             await self._emit_spawned()
 
+            # Notify parent hook runner of subagent start
+            from bob.protocol.config_types import HookEventName
+            asyncio.create_task(self._parent.hook_runner.run_hooks(
+                HookEventName.SUBAGENT_START,
+                {"agent_id": self.agent_id, "task": self.task[:200]},
+            ))
+
             initial_text = self.task
             if self._session.context_manager.size > 0:
                 initial_text = (
@@ -146,16 +153,28 @@ class BobSubAgent:
             result = final_text or "Task completed."
             await self._set_status(AgentStatus.COMPLETED, result=result)
             await self._emit_completed("completed", result=result)
+            asyncio.create_task(self._parent.hook_runner.run_hooks(
+                HookEventName.SUBAGENT_STOP,
+                {"agent_id": self.agent_id, "status": "completed"},
+            ))
 
         except asyncio.CancelledError:
             await self._set_status(AgentStatus.INTERRUPTED)
             await self._emit_completed("interrupted")
+            asyncio.create_task(self._parent.hook_runner.run_hooks(
+                HookEventName.SUBAGENT_STOP,
+                {"agent_id": self.agent_id, "status": "interrupted"},
+            ))
             raise
 
         except Exception as exc:
             err = str(exc)
             await self._set_status(AgentStatus.ERRORED, error=err)
             await self._emit_completed("errored", error=err)
+            asyncio.create_task(self._parent.hook_runner.run_hooks(
+                HookEventName.SUBAGENT_STOP,
+                {"agent_id": self.agent_id, "status": "errored", "error": err},
+            ))
 
         finally:
             try:

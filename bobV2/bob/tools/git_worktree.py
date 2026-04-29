@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -95,10 +96,25 @@ async def enter_worktree_handler(tool_input: dict, context: Any) -> str:
         if not hasattr(context, '_worktree_stack'):
             context._worktree_stack = []
         context._worktree_stack.append(str(cwd))
-        
+
+        resolved = worktree_path.resolve()
+
+        # Fire lifecycle hooks (fire-and-forget; errors are swallowed)
+        session = getattr(context, "_session", None)
+        if session is not None:
+            from bob.protocol.config_types import HookEventName
+            wt_ctx = {"branch": branch_name, "path": str(resolved), "prev_cwd": str(cwd)}
+            asyncio.create_task(session.hook_runner.run_hooks(HookEventName.WORKTREE_CREATE, wt_ctx))
+
         # Update session cwd
-        context.cwd = worktree_path.resolve()
-        
+        context.cwd = resolved
+        if session is not None:
+            from bob.protocol.config_types import HookEventName
+            asyncio.create_task(session.hook_runner.run_hooks(
+                HookEventName.CWD_CHANGED,
+                {"prev_cwd": str(cwd), "cwd": str(resolved), "source": "worktree_create"},
+            ))
+
         return (
             f"✓ Created worktree at: {worktree_path}\n"
             f"✓ Checked out branch: {branch_name}\n"
@@ -168,8 +184,21 @@ async def exit_worktree_handler(tool_input: dict, context: Any) -> str:
         )
         
         # Restore original cwd regardless of removal success
+        old_worktree = current_worktree
         context.cwd = original_cwd
-        
+
+        session = getattr(context, "_session", None)
+        if session is not None and result.returncode == 0:
+            from bob.protocol.config_types import HookEventName
+            asyncio.create_task(session.hook_runner.run_hooks(
+                HookEventName.WORKTREE_REMOVE,
+                {"path": str(old_worktree), "cwd": str(original_cwd)},
+            ))
+            asyncio.create_task(session.hook_runner.run_hooks(
+                HookEventName.CWD_CHANGED,
+                {"prev_cwd": str(old_worktree), "cwd": str(original_cwd), "source": "worktree_remove"},
+            ))
+
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if "uncommitted changes" in stderr.lower() and not force:
