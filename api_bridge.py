@@ -45,23 +45,19 @@ def chat(req: ChatRequest):
 
     provider = req.provider.lower()
 
-    # IBM Bob CLI
     if provider == "ibm":
-        return handle_bob(req)
+        result = handle_bob(req)
+    elif provider == "anthropic":
+        result = handle_anthropic(req)
+    elif provider == "openai":
+        result = handle_openai(req)
+    elif provider == "google":
+        result = handle_google(req)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
 
-    # Anthropic
-    if provider == "anthropic":
-        return handle_anthropic(req)
-
-    # OpenAI
-    if provider == "openai":
-        return handle_openai(req)
-
-    # Google
-    if provider == "google":
-        return handle_google(req)
-
-    raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+    print(f"[api_bridge] provider={provider} response_dict={result.dict()}", flush=True)
+    return result
 
 
 def handle_bob(req: ChatRequest):

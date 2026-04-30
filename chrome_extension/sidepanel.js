@@ -207,8 +207,10 @@ async function sendMessage() {
       return;
     }
     const data = await res.json();
+    console.log("[sidepanel] /chat response:", data);
     appendMessage(data.response || "(empty response)", "bot");
     sessionTokens += (data.input_tokens || 0) + (data.output_tokens || 0);
+    console.log("[sidepanel] sessionTokens now:", sessionTokens, "tokenCounter el:", tokenCounter);
     updateTokenCounter();
   } catch (err) {
     removeThinking();
