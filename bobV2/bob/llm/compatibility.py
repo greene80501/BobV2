@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import PureWindowsPath
 from typing import Any, Iterable, Optional
 
 
@@ -492,6 +493,17 @@ def _first_present(names: Iterable[str], env: dict[str, str]) -> str:
     return ""
 
 
+def _normalize_env_override(field_name: str, value: Any) -> str:
+    text = str(value)
+    # For cross-platform consistency, normalize Windows credential paths
+    # to backslash style when provided as C:/path in config.
+    if field_name == "credentials_path" and ":/" in text and len(text) >= 3:
+        drive = text[0]
+        if text[1:3] == ":/" and drive.isalpha():
+            return str(PureWindowsPath(text))
+    return text
+
+
 def _provider_config_as_dict(config: Any, provider: str) -> dict[str, Any]:
     try:
         provider_cfg = getattr(config, "providers", {}).get(provider)
@@ -546,7 +558,7 @@ def resolve_provider_auth(
     for field_name, env_name in profile.env_field_map.items():
         value = provider_cfg.get(field_name) or active_env.get(env_name, "")
         if value:
-            env_overrides[env_name] = str(value)
+            env_overrides[env_name] = _normalize_env_override(field_name, value)
     env_overrides.update({k: str(v) for k, v in (provider_cfg.get("env") or {}).items() if v})
 
     provider_kwargs: dict[str, Any] = {}

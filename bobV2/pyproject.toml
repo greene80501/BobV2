@@ -23,6 +23,7 @@ dependencies = [
     "pypdf>=4.0.0",
     "ddgs>=8.1.0",
     "tomli_w>=1.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]

@@ -1860,6 +1860,24 @@ class Interface:
         # Everything else
         return "Shell", _truncate_cmd(" ".join(command))
 
+    def _status_icon(self, status: str) -> str:
+        status_norm = (status or "").strip().lower()
+        if status_norm == "completed":
+            return _g("✓")
+        if status_norm == "in_progress":
+            return _cy("▶")
+        if status_norm == "cancelled":
+            return _r("✗")
+        if status_norm == "stalled":
+            return _y("⏳")
+        return _d("○")
+
+    def _status_label(self, status: str) -> str:
+        status_norm = (status or "").strip().lower()
+        if status_norm in {"pending", "in_progress", "completed", "cancelled", "stalled"}:
+            return status_norm
+        return "pending"
+
     def _print_tool_header(self, tool: str, arg: str, suffix: str = "") -> None:
         """Print a compact framed header for a tool block."""
         _p()
@@ -3279,15 +3297,8 @@ class Interface:
                             status = task.get('status', '?')
                             priority = task.get('priority', '?')
                             
-                            # Color-code by status
-                            if status == 'completed':
-                                status_icon = _g('✓')
-                            elif status == 'in_progress':
-                                status_icon = _cy('▶')
-                            elif status == 'cancelled':
-                                status_icon = _r('✗')
-                            else:
-                                status_icon = _d('○')
+                            status_label = self._status_label(status)
+                            status_icon = self._status_icon(status_label)
                             
                             # Color-code by priority
                             if priority == 'high':
@@ -3298,7 +3309,7 @@ class Interface:
                                 priority_text = _d(priority)
                             
                             _p(f"  {status_icon} [{_cy(task_id)}] {title}")
-                            _p(f"    {_d('Status:')} {status} {_d('|')} {_d('Priority:')} {priority_text}")
+                            _p(f"    {_d('Status:')} {status_label} {_d('|')} {_d('Priority:')} {priority_text}")
                         
                         _p()
                         _p(f"  {_d(f'Total: {len(tasks)} task(s)')}")

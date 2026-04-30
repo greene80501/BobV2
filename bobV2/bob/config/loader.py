@@ -29,6 +29,7 @@ else:
                 "Python < 3.11 requires the 'tomli' package: pip install tomli"
             ) from exc
 
+from bob.config.dotenv import load_dotenv_files
 from bob.config.schema import BobConfig
 
 
@@ -180,6 +181,9 @@ def load_config(
         cwd = Path(os.getcwd())
     if cli_overrides is None:
         cli_overrides = {}
+
+    # Bootstrap environment variables from .env files before resolving config.
+    load_dotenv_files(cwd)
 
     # Layer 1: built-in defaults
     merged: dict[str, Any] = BobConfig().model_dump()

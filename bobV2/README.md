@@ -36,9 +36,16 @@ python3.11 -m pip install -e .
 
 ---
 
-## Set Your API Key
+## Set Your API Key (.env recommended)
 
-Pick one provider to start. Set the key in your terminal before running bob.
+Best practice: create a `.env` file (project root or `~/.bob/.env`). Bob auto-loads both.
+
+```bash
+cp .env.example .env
+# then edit .env with your keys
+```
+
+Pick one provider to start. You can also set keys directly in your shell:
 
 ### Windows (PowerShell)
 
@@ -228,7 +235,9 @@ When bob wants to run a shell command:
 
 ## Config File
 
-Create `~/.bob/config.toml` to set persistent defaults:
+Create `~/.bob/config.toml` to set persistent defaults.
+
+Tip: keep secrets in `.env` instead of putting API keys directly in `config.toml`.
 
 ```toml
 model = "gpt-5.1-codex-mini"
