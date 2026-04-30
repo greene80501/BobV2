@@ -68,6 +68,8 @@ class SlashCommand(str, Enum):
     THINK = "think"
     BRIEF = "brief"
     TASKS = "tasks"
+    # Chrome extension bridge
+    BOB_IN_CHROME = "bob-in-chrome"
 
 
 COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
@@ -132,6 +134,8 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.THINK: "set thinking budget for next turn: /think [tokens]",
     SlashCommand.BRIEF: "alias for /output-style brief",
     SlashCommand.TASKS: "list all tasks or filter by status: /tasks [status]",
+    # Chrome bridge
+    SlashCommand.BOB_IN_CHROME: "toggle Chrome extension browser bridge on/off",
 }
 
 AVAILABLE_DURING_TASK: set[SlashCommand] = {

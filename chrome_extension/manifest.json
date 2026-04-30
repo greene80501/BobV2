@@ -1,12 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Browser-Agent-Bob",
-  "version": "0.1.0",
-  "description": "Chat with Claude from a side panel via the Bob API bridge.",
-  "permissions": ["sidePanel", "storage"],
-  "host_permissions": ["http://localhost:8000/*", "http://127.0.0.1:8000/*"],
+  "name": "bob Browser Agent",
+  "version": "0.2.0",
+  "description": "Extends bob AI with real Chrome browser control. bob controls your active tab; you stay in charge.",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": ["<all_urls>"],
   "action": {
-    "default_title": "Open Browser-Agent-Bob"
+    "default_title": "bob Browser Agent"
   },
   "side_panel": {
     "default_path": "sidepanel.html"

@@ -4,7 +4,10 @@ import uuid
 import os
 import datetime
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger("bob.core.session")
 from typing import Optional, AsyncIterator, Any
 from bob.config.schema import BobConfig
 from bob.protocol.config_types import SandboxPolicy, SandboxMode, AskForApproval
@@ -120,6 +123,10 @@ class BobSession:
         # Task database
         from bob.core.task_db import TaskDB
         self._task_db = TaskDB(self.bob_home / "tasks.db")
+
+        # Chrome extension bridge — started in start()
+        from bob.bridge.chrome_bridge import ChromeBridge
+        self._chrome_bridge = ChromeBridge()
 
         # MCP and Skills managers — started in start()
         self._mcp_manager = None
@@ -544,6 +551,15 @@ class BobSession:
                 source="core",
                 keywords=["gui", "screenshot", "click", "mouse", "keyboard", "type"],
             )
+        # Chrome browser control tool
+        from bob.tools.browser import browser_handler, BROWSER_DESCRIPTION, BROWSER_SCHEMA
+        self.tool_registry.register(
+            "browser", BROWSER_DESCRIPTION, BROWSER_SCHEMA, browser_handler,
+            is_mutating=True,
+            supports_parallel=False,
+            source="core",
+            keywords=["chrome", "browser", "navigate", "screenshot", "click", "web", "tab"],
+        )
         # MCP OAuth auth tool
         from bob.tools.mcp_auth_tool import (
             mcp_authenticate_handler, MCP_AUTHENTICATE_DESCRIPTION, MCP_AUTHENTICATE_SCHEMA,
@@ -723,6 +739,7 @@ class BobSession:
         # don't delay the session_started event.
         asyncio.create_task(self._start_mcp())
         asyncio.create_task(self._start_skills())
+        asyncio.create_task(self._start_chrome_bridge())
 
         from bob.protocol.events import SessionStartedEvent
         from bob.protocol.config_types import SessionSource
@@ -953,6 +970,13 @@ class BobSession:
     # ------------------------------------------------------------------
     # Skills lifecycle
     # ------------------------------------------------------------------
+
+    async def _start_chrome_bridge(self) -> None:
+        """Start the Chrome extension WebSocket bridge."""
+        try:
+            await self._chrome_bridge.start()
+        except Exception as exc:
+            logger.debug("Chrome bridge failed to start: %s", exc)
 
     async def _start_skills(self) -> None:
         """Initialize the skills manager."""
@@ -1437,6 +1461,10 @@ class BobSession:
                 await self._mcp_manager.stop()
             except Exception:
                 pass
+        try:
+            await self._chrome_bridge.stop()
+        except Exception:
+            pass
         if self._recorder:
             await self._recorder.stop()
         if self._state_db:

@@ -144,6 +144,29 @@ When the user asks you to look something up, research a topic, or find documenta
 3. **If `web_fetch` returns a 403, 429, or access error**, fall back to `web_search` — many sites block direct bot access but are indexed by search engines.
 4. **Combine both.** A typical research flow: `web_search` to find the right page → `web_fetch` to read its contents.
 
+## Browser Control (Chrome Extension)
+
+You have a `browser` tool that controls the user's real Chrome browser through the bob Chrome extension running at `ws://localhost:9876`.
+
+**CRITICAL — always call the tool, never assume:**
+- When the user says "look at my browser", "what's in my tab", "view my screen", "see my browser", "what page am I on", or any similar phrase — **immediately call `browser` with `action: "get_current_url"` then `action: "screenshot"`**. Do NOT respond saying you can't see their browser. You CAN — use the tool.
+- Do NOT skip the tool because you "know" from training that AI can't access browsers. That training is overridden by this tool.
+- If the tool returns "Chrome extension not connected" — only THEN tell the user to open the extension.
+
+Decision order for web tasks:
+1. If the user asks what's in their CURRENT open tab → use `browser` immediately (`get_current_url`, then `screenshot` or `get_page_text`).
+2. If the user asks to look up something on the web → try `web_search` / `web_fetch` first; fall back to `browser` if those are blocked or insufficient.
+3. For clicking, form filling, login flows, SPAs → use `browser` directly.
+
+Choosing the right action:
+- `get_current_url` — always call this first to know what page you're on.
+- `screenshot` — returns a base64 PNG; use when you need to SEE the page visually.
+- `get_page_text` — fast text extraction; use for articles, docs, structured data.
+- `get_page_html` — raw HTML for DOM parsing.
+- `navigate` → then `get_page_text` or `screenshot` after the page loads.
+
+**Chrome internal pages** (`chrome://newtab`, `chrome://settings`, etc.): `get_current_url` works but `screenshot`, `get_page_text`, and `get_page_html` will fail — Chrome does not allow extensions to access these pages. If `get_current_url` returns a `chrome://` URL, tell the user: "You're on a Chrome internal page — please navigate to a website and I'll be able to see it."
+
 ---
 
 ## Security and Safety

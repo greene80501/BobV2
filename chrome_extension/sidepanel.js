@@ -1,227 +1,392 @@
-const API_URL = "http://localhost:8000/chat";
+"use strict";
 
-const modelSelect = document.getElementById("model-select");
-const apiSetup = document.getElementById("api-setup");
-const chatView = document.getElementById("chat-view");
-const apiKeyInput = document.getElementById("api-key-input");
-const apiSaveBtn = document.getElementById("api-save-btn");
-const changeKeyBtn = document.getElementById("change-key-btn");
-const messageInput = document.getElementById("message");
-const sendButton = document.getElementById("send");
-const messagesEl = document.getElementById("messages");
-const emptyState = document.getElementById("empty-state");
-const emptyLogo = document.getElementById("empty-logo");
-const fileInput = document.getElementById("file-input");
-const filePreview = document.getElementById("file-preview");
-const tokenCounter = document.getElementById("token-counter");
+const BOB_WS_URL     = "ws://localhost:9876";
+const RECONNECT_MS   = 1500;
+const NAV_SETTLE_MS  = 1800;
 
-let attachedFile = null;
-let sessionTokens = 0;
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const statusPill   = document.getElementById("status-pill");
+const statusText   = document.getElementById("status-text");
+const topbarSub    = document.getElementById("topbar-sub");
+const messagesEl   = document.getElementById("messages");
+const emptyState   = document.getElementById("empty-state");
+const emptyLogo    = document.getElementById("empty-logo");
+const emptySubtitle = document.getElementById("empty-subtitle");
+const actionRow    = document.getElementById("action-row");
+const actionText   = document.getElementById("action-text");
+const actionCount  = document.getElementById("action-count");
+const thinkingDots = document.getElementById("thinking-dots");
 
-function updateTokenCounter() {
-  if (tokenCounter) tokenCounter.textContent = `🪙 ${sessionTokens} tokens used this session`;
+let ws = null;
+let reconnectTimer = null;
+let count = 0;
+
+// ── Status helpers ────────────────────────────────────────────────────────────
+
+function setStatus(state) {
+  statusPill.className = `status-pill ${state}`;
+  if (state === "connected") {
+    statusText.textContent = "Connected";
+    topbarSub.textContent  = "bob is ready to browse";
+    emptySubtitle.textContent = "Ask bob to navigate to a page, click something, or take a screenshot.";
+  } else if (state === "connecting") {
+    statusText.textContent = "Connecting";
+    topbarSub.textContent  = "Looking for bob on ws://localhost:9876…";
+    emptySubtitle.innerHTML = "Start bob in your terminal,<br>then ask it to browse the web.";
+  } else {
+    statusText.textContent = "Disconnected";
+    topbarSub.textContent  = "Start bob in your terminal to connect";
+    emptySubtitle.innerHTML = "Start bob in your terminal,<br>then ask it to browse the web.";
+  }
 }
 
-function resetSessionTokens() {
-  sessionTokens = 0;
-  updateTokenCounter();
-}
-
-const hasChromeStorage =
-  typeof chrome !== "undefined" && chrome.storage && chrome.storage.local;
-
-function storageGet(key) {
-  return new Promise((resolve) => {
-    if (hasChromeStorage) {
-      try {
-        chrome.storage.local.get([key], (result) => {
-          if (chrome.runtime && chrome.runtime.lastError) {
-            resolve(localStorage.getItem(key));
-            return;
-          }
-          const val =
-            result && Object.prototype.hasOwnProperty.call(result, key)
-              ? result[key]
-              : null;
-          resolve(val == null ? null : val);
-        });
-      } catch (e) {
-        resolve(localStorage.getItem(key));
-      }
-    } else {
-      resolve(localStorage.getItem(key));
-    }
-  });
-}
-
-function storageSet(key, val) {
-  return new Promise((resolve) => {
-    if (hasChromeStorage) {
-      try {
-        chrome.storage.local.set({ [key]: val }, () => {
-          if (chrome.runtime && chrome.runtime.lastError) {
-            try { localStorage.setItem(key, val); } catch (_) {}
-          }
-          resolve();
-        });
-      } catch (e) {
-        try { localStorage.setItem(key, val); } catch (_) {}
-        resolve();
-      }
-    } else {
-      try { localStorage.setItem(key, val); } catch (_) {}
-      resolve();
-    }
-  });
-}
-
-function getProvider() { return modelSelect.value.split("|")[0]; }
-function getModelId() { return modelSelect.value.split("|")[1]; }
-
-function showChat() {
-  apiSetup.style.display = "none";
-  chatView.classList.add("active");
-  changeKeyBtn.style.display = "block";
-  setTimeout(() => { if (messageInput) messageInput.focus(); }, 50);
-}
-
-function showSetup() {
-  chatView.classList.remove("active");
-  apiSetup.style.display = "flex";
-  changeKeyBtn.style.display = "none";
-  apiKeyInput.value = "";
-  setTimeout(() => apiKeyInput.focus(), 100);
-}
-
-function refreshViewForProvider() {
-  storageGet(`apiKey_${getProvider()}`).then((val) => {
-    if (val) showChat(); else showSetup();
-  });
-}
-
-storageGet("modelValue").then((val) => {
-  if (val) modelSelect.value = val;
-  refreshViewForProvider();
-});
-
-modelSelect.addEventListener("change", () => {
-  storageSet("modelValue", modelSelect.value);
-  resetSessionTokens();
-  refreshViewForProvider();
-});
-
-apiSaveBtn.addEventListener("click", () => {
-  const key = apiKeyInput.value.trim();
-  if (!key) { apiKeyInput.style.borderColor = "#da1e28"; return; }
-  apiSaveBtn.disabled = true;
-  storageSet(`apiKey_${getProvider()}`, key).then(() => {
-    apiSaveBtn.disabled = false;
-    showChat();
-  });
-});
-
-apiKeyInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); apiSaveBtn.click(); }
-});
-
-apiKeyInput.addEventListener("input", () => {
-  apiKeyInput.style.borderColor = "";
-});
-
-changeKeyBtn.addEventListener("click", () => {
-  resetSessionTokens();
-  showSetup();
-});
-
-fileInput.addEventListener("change", () => {
-  const file = fileInput.files[0];
-  if (file) { attachedFile = file; filePreview.textContent = `Attached: ${file.name}`; }
-});
+// ── Activity log ──────────────────────────────────────────────────────────────
 
 function hideEmptyState() {
   if (emptyState) emptyState.style.display = "none";
 }
 
-function appendMessage(text, role) {
+function ts() {
+  return new Date().toLocaleTimeString("en-US", { hour12: false });
+}
+
+function appendEntry(label, body, kind = "info") {
   hideEmptyState();
+  count++;
+  actionCount.textContent = `${count} action${count === 1 ? "" : "s"}`;
+
   const wrapper = document.createElement("div");
-  wrapper.className = `message message-${role === "error" ? "bot" : role}`;
-  if (role === "error") wrapper.classList.add("error");
+  wrapper.className = `message message-bot ${kind}`;
+
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  bubble.textContent = text;
+
+  const meta = document.createElement("div");
+  meta.className = "bubble-meta";
+  meta.textContent = `${ts()}  ${label}`;
+
+  bubble.appendChild(meta);
+
+  if (body) {
+    const bodyEl = document.createElement("div");
+    bodyEl.textContent = body;
+    bubble.appendChild(bodyEl);
+  }
+
   wrapper.appendChild(bubble);
   messagesEl.appendChild(wrapper);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function appendThinking() {
-  hideEmptyState();
+// ── Action bar ────────────────────────────────────────────────────────────────
+
+function showAction(text) {
+  actionRow.classList.add("active");
+  thinkingDots.style.display = "flex";
+  actionText.textContent = text;
   if (emptyLogo) emptyLogo.classList.add("bob-thinking");
-  const wrapper = document.createElement("div");
-  wrapper.className = "message message-bot";
-  wrapper.id = "thinking-msg";
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-  const dots = document.createElement("div");
-  dots.className = "thinking-dots";
-  dots.innerHTML = "<span></span><span></span><span></span>";
-  bubble.appendChild(dots);
-  wrapper.appendChild(bubble);
-  messagesEl.appendChild(wrapper);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function removeThinking() {
-  const el = document.getElementById("thinking-msg");
-  if (el) el.remove();
+function clearAction() {
+  actionRow.classList.remove("active");
+  thinkingDots.style.display = "none";
+  actionText.textContent = "Waiting for bob…";
   if (emptyLogo) emptyLogo.classList.remove("bob-thinking");
 }
 
-async function sendMessage() {
-  const message = messageInput.value.trim();
-  if (!message && !attachedFile) return;
-  const provider = getProvider();
-  const model = getModelId();
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 
-  const apiKey = await storageGet(`apiKey_${provider}`);
-  if (!apiKey) { showSetup(); return; }
-
-  appendMessage(message + (attachedFile ? ` [${attachedFile.name}]` : ""), "user");
-  messageInput.value = "";
-  attachedFile = null;
-  fileInput.value = "";
-  filePreview.textContent = "";
-  sendButton.disabled = true;
-  appendThinking();
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  clearTimeout(reconnectTimer);
+  setStatus("connecting");
 
   try {
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, api_key: apiKey, model, provider }),
-    });
-    removeThinking();
-    if (!res.ok) {
-      appendMessage(`Error ${res.status}: ${await res.text()}`, "error");
+    ws = new WebSocket(BOB_WS_URL);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    setStatus("connected");
+    appendEntry("Connected", "bob session is active", "ok");
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    clearAction();
+    setStatus("disconnected");
+    appendEntry("Disconnected", "Reconnecting in 3s…", "error");
+    scheduleReconnect();
+  };
+
+  ws.onerror = () => { /* onclose fires immediately after */ };
+
+  ws.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    if (msg.type === "connected") {
+      appendEntry("Session ready", "", "info");
       return;
     }
-    const data = await res.json();
-    console.log("[sidepanel] /chat response:", data);
-    appendMessage(data.response || "(empty response)", "bot");
-    sessionTokens += (data.input_tokens || 0) + (data.output_tokens || 0);
-    console.log("[sidepanel] sessionTokens now:", sessionTokens, "tokenCounter el:", tokenCounter);
-    updateTokenCounter();
-  } catch (err) {
-    removeThinking();
-    appendMessage("Request failed. Make sure api_bridge.py is running on localhost:8000", "error");
-  } finally {
-    sendButton.disabled = false;
-    messageInput.focus();
+
+    const { id, action, params } = msg;
+    if (!id || !action) return;
+
+    const label = actionLabel(action, params || {});
+    showAction(label);
+    appendEntry(label, paramSummary(action, params || {}), "info");
+
+    let result, error;
+    try {
+      result = await dispatch(action, params || {});
+    } catch (err) {
+      error = err.message || String(err);
+    }
+
+    clearAction();
+
+    if (error) {
+      appendEntry(label + " — failed", error, "error");
+      safeSend({ id, error });
+    } else {
+      const preview = previewResult(action, result);
+      appendEntry(label + " — done", preview, "ok");
+      safeSend({ id, result: result ?? "" });
+    }
+  };
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connect, RECONNECT_MS);
+}
+
+function safeSend(data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
   }
 }
 
-sendButton.addEventListener("click", sendMessage);
-messageInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-});
+function actionLabel(action, params) {
+  switch (action) {
+    case "navigate":        return `Navigate → ${(params.url || "").replace(/^https?:\/\//, "")}`;
+    case "get_page_text":   return "Read page text";
+    case "get_page_html":   return "Read page HTML";
+    case "screenshot":      return "Take screenshot";
+    case "click":           return `Click "${params.selector || ""}"`;
+    case "form_input":      return `Fill in "${params.selector || ""}"`;
+    case "execute_js":      return `Run JS`;
+    case "find_elements":   return `Find "${params.selector || ""}"`;
+    case "scroll":          return `Scroll (${params.x || 0}, ${params.y || 0})`;
+    case "get_current_url": return "Get current URL";
+    case "ping":            return "Ping";
+    default:                return action;
+  }
+}
+
+function paramSummary(action, params) {
+  if (action === "navigate")    return params.url || "";
+  if (action === "execute_js")  return (params.code || "").slice(0, 120);
+  if (action === "form_input")  return `${params.selector} = "${params.value}"`;
+  return "";
+}
+
+function previewResult(action, result) {
+  if (!result || typeof result !== "string") return "";
+  if (action === "screenshot") return "(image captured)";
+  if (action === "navigate")   return result;
+  return result.slice(0, 200).replace(/\n/g, " ");
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+async function dispatch(action, params) {
+  switch (action) {
+    case "navigate":        return await cmdNavigate(params);
+    case "get_page_text":   return await cmdGetPageText();
+    case "get_page_html":   return await cmdGetPageHtml();
+    case "screenshot":      return await cmdScreenshot();
+    case "click":           return await cmdClick(params);
+    case "form_input":      return await cmdFormInput(params);
+    case "execute_js":      return await cmdExecuteJs(params);
+    case "find_elements":   return await cmdFindElements(params);
+    case "scroll":          return await cmdScroll(params);
+    case "get_current_url": return await cmdGetCurrentUrl();
+    case "ping":            return "pong";
+    default: throw new Error(`Unknown action: ${action}`);
+  }
+}
+
+// ── Active tab helper ─────────────────────────────────────────────────────────
+
+async function activeTab({ allowInternal = false } = {}) {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs.length) throw new Error("No active tab found");
+  const tab = tabs[0];
+  if (!allowInternal && tab.url && (tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://") || tab.url.startsWith("about:"))) {
+    throw new Error(`Cannot access Chrome internal page (${tab.url}). Navigate to a regular website first.`);
+  }
+  return tab;
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+async function cmdNavigate({ url }) {
+  if (!url) throw new Error("url is required");
+  const tab = await activeTab({ allowInternal: true });
+  await chrome.tabs.update(tab.id, { url });
+  await waitForTabLoad(tab.id);
+  return `Navigated to ${url}`;
+}
+
+function waitForTabLoad(tabId) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (!done) {
+        done = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+    const listener = (id, info) => {
+      if (id === tabId && info.status === "complete") finish();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    setTimeout(finish, NAV_SETTLE_MS);
+  });
+}
+
+async function cmdGetPageText() {
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => document.body ? document.body.innerText : "",
+  });
+  const text = results[0]?.result || "";
+  return text.length > 80000 ? text.slice(0, 80000) + "\n[truncated]" : text;
+}
+
+async function cmdGetPageHtml() {
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => document.documentElement.outerHTML,
+  });
+  const html = results[0]?.result || "";
+  return html.length > 100000 ? html.slice(0, 100000) + "\n[truncated]" : html;
+}
+
+async function cmdScreenshot() {
+  const tab = await activeTab({ allowInternal: true });
+  if (!tab.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://") || tab.url.startsWith("about:")) {
+    throw new Error(`Cannot screenshot ${tab.url || "this page"} — navigate to a regular website first.`);
+  }
+  return await chrome.tabs.captureVisibleTab(null, { format: "png" });
+}
+
+async function cmdClick({ selector }) {
+  if (!selector) throw new Error("selector is required");
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      el.focus();
+      el.click();
+      return true;
+    },
+    args: [selector],
+  });
+  if (!results[0]?.result) throw new Error(`Element not found: ${selector}`);
+  return `Clicked ${selector}`;
+}
+
+async function cmdFormInput({ selector, value }) {
+  if (!selector) throw new Error("selector is required");
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (sel, val) => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      el.focus();
+      if (el.tagName === "SELECT") {
+        el.value = val;
+      } else {
+        const nativeSetter = Object.getOwnPropertyDescriptor(el.constructor.prototype, "value")?.set;
+        if (nativeSetter) nativeSetter.call(el, val);
+        else el.value = val;
+      }
+      el.dispatchEvent(new Event("input",  { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    },
+    args: [selector, value ?? ""],
+  });
+  if (!results[0]?.result) throw new Error(`Element not found: ${selector}`);
+  return `Set "${selector}"`;
+}
+
+async function cmdExecuteJs({ code }) {
+  if (!code) throw new Error("code is required");
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (c) => {
+      try {
+        const result = (0, eval)(c); // eslint-disable-line no-eval
+        return result !== undefined ? String(result) : "(undefined)";
+      } catch (e) {
+        return `Error: ${e.message}`;
+      }
+    },
+    args: [code],
+  });
+  return results[0]?.result ?? "";
+}
+
+async function cmdFindElements({ selector, limit = 20 }) {
+  if (!selector) throw new Error("selector is required");
+  const tab = await activeTab();
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (sel, lim) => {
+      return Array.from(document.querySelectorAll(sel))
+        .slice(0, lim)
+        .map((el) => ({
+          tag:   el.tagName.toLowerCase(),
+          text:  (el.innerText || el.value || el.getAttribute("alt") || "").slice(0, 200),
+          href:  el.href   || null,
+          id:    el.id     || null,
+          cls:   el.className || null,
+          type:  el.type   || null,
+          value: (el.tagName === "INPUT" || el.tagName === "SELECT") ? el.value : null,
+        }));
+    },
+    args: [selector, limit],
+  });
+  return JSON.stringify(results[0]?.result ?? [], null, 2);
+}
+
+async function cmdScroll({ x = 0, y = 0 }) {
+  const tab = await activeTab();
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (dx, dy) => window.scrollBy(dx, dy),
+    args: [x, y],
+  });
+  return `Scrolled by (${x}, ${y})`;
+}
+
+async function cmdGetCurrentUrl() {
+  const tab = await activeTab({ allowInternal: true });
+  return tab.url || "";
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+connect();

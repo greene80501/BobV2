@@ -3423,6 +3423,35 @@ class Interface:
             except ValueError:
                 _p(f"  {_y('⚠')} usage: /think [budget_tokens]  (default: 5000)")
 
+        elif cmd == SlashCommand.BOB_IN_CHROME:
+            bridge = getattr(self._session, "_chrome_bridge", None)
+            _p()
+            if bridge is None:
+                _p(f"  {_r('✗')} Chrome bridge not available in this session")
+            else:
+                action = (args.strip().lower() or "status")
+                if action in ("off", "disable"):
+                    bridge.disable()
+                    _p(f"  {_d('Chrome bridge disabled — bob will not control the browser')}")
+                elif action in ("on", "enable"):
+                    bridge.enable()
+                    if bridge.is_connected:
+                        _p(f"  {_g('✓')} Chrome bridge enabled — extension is connected")
+                    else:
+                        _p(f"  {_y('○')} Chrome bridge enabled — waiting for Chrome extension on ws://localhost:{bridge.port}")
+                else:
+                    if bridge.is_connected:
+                        _p(f"  {_g('✓')} Chrome extension connected  (ws://localhost:{bridge.port})")
+                        _p(f"  {_d('bob can now control your browser')}")
+                    elif bridge._enabled:
+                        _p(f"  {_y('○')} Chrome bridge listening on ws://localhost:{bridge.port}")
+                        _p(f"  {_d('Open the bob Chrome extension in Chrome to connect')}")
+                    else:
+                        _p(f"  {_r('○')} Chrome bridge is disabled — run /bob-in-chrome on to enable")
+                    _p()
+                    _p(f"  {_d('Usage:  /bob-in-chrome [on|off]')}")
+            _p()
+
         elif cmd == SlashCommand.CONFIG:
             _p()
             _p(f"  {_b('Configuration:')}")
