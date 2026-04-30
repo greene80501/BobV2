@@ -13,8 +13,19 @@ const emptyState = document.getElementById("empty-state");
 const emptyLogo = document.getElementById("empty-logo");
 const fileInput = document.getElementById("file-input");
 const filePreview = document.getElementById("file-preview");
+const tokenCounter = document.getElementById("token-counter");
 
 let attachedFile = null;
+let sessionTokens = 0;
+
+function updateTokenCounter() {
+  if (tokenCounter) tokenCounter.textContent = `🪙 ${sessionTokens} tokens used this session`;
+}
+
+function resetSessionTokens() {
+  sessionTokens = 0;
+  updateTokenCounter();
+}
 
 const hasChromeStorage =
   typeof chrome !== "undefined" && chrome.storage && chrome.storage.local;
@@ -95,6 +106,7 @@ storageGet("modelValue").then((val) => {
 
 modelSelect.addEventListener("change", () => {
   storageSet("modelValue", modelSelect.value);
+  resetSessionTokens();
   refreshViewForProvider();
 });
 
@@ -116,7 +128,10 @@ apiKeyInput.addEventListener("input", () => {
   apiKeyInput.style.borderColor = "";
 });
 
-changeKeyBtn.addEventListener("click", () => showSetup());
+changeKeyBtn.addEventListener("click", () => {
+  resetSessionTokens();
+  showSetup();
+});
 
 fileInput.addEventListener("change", () => {
   const file = fileInput.files[0];
@@ -193,6 +208,8 @@ async function sendMessage() {
     }
     const data = await res.json();
     appendMessage(data.response || "(empty response)", "bot");
+    sessionTokens += (data.input_tokens || 0) + (data.output_tokens || 0);
+    updateTokenCounter();
   } catch (err) {
     removeThinking();
     appendMessage("Request failed. Make sure api_bridge.py is running on localhost:8000", "error");

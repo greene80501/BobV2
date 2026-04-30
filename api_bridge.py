@@ -27,6 +27,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @app.get("/health")
@@ -97,7 +99,9 @@ def handle_bob(req: ChatRequest):
     if not output:
         detail = (result.stderr or "").strip() or "Bob Shell returned no response."
         raise HTTPException(status_code=502, detail=f"Bob Shell error: {detail}")
-    return ChatResponse(response=output)
+    input_tokens = int(len(req.message.split()) * 1.3)
+    output_tokens = int(len(output.split()) * 1.3)
+    return ChatResponse(response=output, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 def handle_anthropic(req: ChatRequest):
@@ -109,7 +113,11 @@ def handle_anthropic(req: ChatRequest):
             messages=[{"role": "user", "content": req.message}],
         )
         text = "".join(b.text for b in result.content if getattr(b, "type", None) == "text")
-        return ChatResponse(response=text.strip())
+        return ChatResponse(
+            response=text.strip(),
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+        )
     except APIError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic error: {e}")
     except Exception as e:
@@ -125,7 +133,11 @@ def handle_openai(req: ChatRequest):
             messages=[{"role": "user", "content": req.message}],
             max_tokens=1024,
         )
-        return ChatResponse(response=result.choices[0].message.content.strip())
+        return ChatResponse(
+            response=result.choices[0].message.content.strip(),
+            input_tokens=result.usage.prompt_tokens,
+            output_tokens=result.usage.completion_tokens,
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI error: {str(e)}")
 
@@ -136,7 +148,11 @@ def handle_google(req: ChatRequest):
         genai.configure(api_key=req.api_key)
         model = genai.GenerativeModel(req.model)
         result = model.generate_content(req.message)
-        return ChatResponse(response=result.text.strip())
+        return ChatResponse(
+            response=result.text.strip(),
+            input_tokens=result.usage_metadata.prompt_token_count,
+            output_tokens=result.usage_metadata.candidates_token_count,
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Google error: {str(e)}")
 
