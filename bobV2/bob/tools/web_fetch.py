@@ -3,9 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 WEB_FETCH_DESCRIPTION = (
-    "Fetch the full content of a specific URL. Use this only when you already have "
-    "a URL to read — not for discovery or search. If you get a 403 or access error, "
-    "use web_search instead. HTML is converted to Markdown; output is truncated at max_length characters."
+    "Fetch the full content of a specific URL. "
+    "This is the DEFAULT tool for reading any public page — GitHub repos, personal sites, "
+    "docs, news articles, PDFs, APIs. Always try web_fetch first before reaching for the browser tool. "
+    "Use web_search when you need to discover URLs. "
+    "Fall back to browser only if web_fetch returns a 403, an empty page, or clearly broken content. "
+    "HTML is converted to Markdown; output is truncated at max_length characters."
 )
 
 WEB_FETCH_SCHEMA = {

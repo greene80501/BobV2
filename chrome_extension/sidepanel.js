@@ -182,6 +182,7 @@ function actionLabel(action, params) {
     case "find_elements":   return `Find "${params.selector || ""}"`;
     case "scroll":          return `Scroll (${params.x || 0}, ${params.y || 0})`;
     case "get_current_url": return "Get current URL";
+    case "type_text":       return `Type "${(params.text || "").slice(0, 40)}"`;
     case "ping":            return "Ping";
     default:                return action;
   }
@@ -215,6 +216,7 @@ async function dispatch(action, params) {
     case "find_elements":   return await cmdFindElements(params);
     case "scroll":          return await cmdScroll(params);
     case "get_current_url": return await cmdGetCurrentUrl();
+    case "type_text":       return await cmdTypeText(params);
     case "ping":            return "pong";
     default: throw new Error(`Unknown action: ${action}`);
   }
@@ -335,19 +337,113 @@ async function cmdFormInput({ selector, value }) {
 async function cmdExecuteJs({ code }) {
   if (!code) throw new Error("code is required");
   const tab = await activeTab();
-  const results = await chrome.scripting.executeScript({
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (c) => {
+        try {
+          const result = (0, eval)(c); // eslint-disable-line no-eval
+          return result !== undefined ? String(result) : "(undefined)";
+        } catch (e) {
+          return `Error: ${e.message}`;
+        }
+      },
+      args: [code],
+    });
+    return results[0]?.result ?? "";
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (msg.includes("Content Security Policy") || msg.includes("unsafe-eval")) {
+      return (
+        "Error: This page blocks eval() via Content Security Policy. " +
+        "Use 'type_text' to type into editors, 'click' to click elements, " +
+        "or 'form_input' for standard HTML input fields."
+      );
+    }
+    throw err;
+  }
+}
+
+async function cmdTypeText({ text, selector }) {
+  if (text == null) throw new Error("text is required");
+  const tab = await activeTab();
+
+  // Phase 1: <input>/<textarea> — instant value setter (no CDP overhead)
+  if (selector) {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (sel) => { const el = document.querySelector(sel); if (el) { el.focus(); el.click(); } },
+      args: [selector],
+    });
+  }
+  const nativeResult = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    func: (c) => {
-      try {
-        const result = (0, eval)(c); // eslint-disable-line no-eval
-        return result !== undefined ? String(result) : "(undefined)";
-      } catch (e) {
-        return `Error: ${e.message}`;
-      }
+    func: (txt) => {
+      const t = document.activeElement;
+      if (!t || (t.tagName !== "INPUT" && t.tagName !== "TEXTAREA")) return false;
+      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(t), "value")?.set;
+      if (setter) setter.call(t, (t.value || "") + txt);
+      else t.value = (t.value || "") + txt;
+      t.dispatchEvent(new Event("input",  { bubbles: true }));
+      t.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
     },
-    args: [code],
+    args: [text],
   });
-  return results[0]?.result ?? "";
+  if (nativeResult[0]?.result) return `Typed ${text.length} chars via native-input`;
+
+  // Phase 2: CDP clipboard paste.
+  // JavaScript-dispatched events (KeyboardEvent, InputEvent) are isTrusted:false — Google
+  // Docs and most canvas editors silently drop them. CDP key events go to the main frame,
+  // not the hidden input iframe Google Docs uses. The only reliable path is:
+  //   1. Write text to clipboard via CDP Runtime.evaluate (bypasses page CSP)
+  //   2. Send Ctrl+V via CDP — Google Docs' paste handler runs in the main frame
+  //      and inserts at cursor, no iframe routing required.
+  // Side effect: overwrites the user's clipboard.
+  const dbg = { tabId: tab.id };
+  try {
+    await chrome.debugger.attach(dbg, "1.3");
+  } catch (err) {
+    if ((err.message || "").includes("Another debugger")) {
+      try { await chrome.debugger.detach(dbg); } catch (_) {}
+      await chrome.debugger.attach(dbg, "1.3");
+    } else throw err;
+  }
+
+  try {
+    // Get click coordinates: use selector's center, or center of viewport
+    const coordsExpr = selector
+      ? `(function(){const el=document.querySelector(${JSON.stringify(selector)});if(!el)return null;const r=el.getBoundingClientRect();return{x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)};})()`
+      : `({x:Math.round(window.innerWidth/2),y:Math.round(window.innerHeight*0.55)})`;
+    const coordsVal = (await chrome.debugger.sendCommand(dbg, "Runtime.evaluate", { expression: `JSON.stringify(${coordsExpr})` })).result?.value;
+    const { x, y } = JSON.parse(coordsVal || '{"x":640,"y":400}');
+
+    // Click to ensure the editor has focus (cursor placement)
+    await chrome.debugger.sendCommand(dbg, "Input.dispatchMouseEvent", { type: "mousePressed", button: "left", x, y, clickCount: 1 });
+    await chrome.debugger.sendCommand(dbg, "Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", x, y, clickCount: 1 });
+    await new Promise(r => setTimeout(r, 80));
+
+    // Write to clipboard via CDP Runtime.evaluate (not blocked by CSP — bypasses eval())
+    const clipResult = (await chrome.debugger.sendCommand(dbg, "Runtime.evaluate", {
+      expression: `(async()=>{try{await navigator.clipboard.writeText(${JSON.stringify(text)});return "ok";}catch(e){return "err:"+e.message;}})()`,
+      awaitPromise: true,
+      userGesture: true,
+    })).result?.value;
+    if (typeof clipResult === "string" && clipResult.startsWith("err:")) {
+      throw new Error(`Clipboard write failed: ${clipResult.slice(4)}`);
+    }
+
+    await new Promise(r => setTimeout(r, 50));
+
+    // Ctrl+V — processed by the app's main-frame paste handler
+    await chrome.debugger.sendCommand(dbg, "Input.dispatchKeyEvent", { type: "rawKeyDown", modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, nativeVirtualKeyCode: 86 });
+    await chrome.debugger.sendCommand(dbg, "Input.dispatchKeyEvent", { type: "keyUp",    modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, nativeVirtualKeyCode: 86 });
+    await new Promise(r => setTimeout(r, 120));
+
+    return `Typed ${text.length} chars via clipboard paste (clipboard overwritten)`;
+  } finally {
+    try { await chrome.debugger.detach(dbg); } catch (_) {}
+  }
 }
 
 async function cmdFindElements({ selector, limit = 20 }) {
@@ -375,12 +471,60 @@ async function cmdFindElements({ selector, limit = 20 }) {
 
 async function cmdScroll({ x = 0, y = 0 }) {
   const tab = await activeTab();
-  await chrome.scripting.executeScript({
+  const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    func: (dx, dy) => window.scrollBy(dx, dy),
+    func: (dx, dy) => {
+      const isScrollable = (el) => {
+        if (!el) return false;
+        const oy = window.getComputedStyle(el).overflowY;
+        return (oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 10;
+      };
+
+      // 1. Try document.scrollingElement first (works for traditional pages)
+      const docEl = document.scrollingElement || document.documentElement;
+      const beforeDoc = docEl.scrollTop;
+      docEl.scrollBy(dx, dy);
+      if (docEl.scrollTop !== beforeDoc) return "document";
+
+      // 2. Try common SPA main containers (LinkedIn, Twitter, etc.)
+      const spaCandidates = [
+        document.querySelector("main"),
+        document.querySelector('[role="main"]'),
+        document.querySelector(".scaffold-layout__main"),
+        document.querySelector(".scaffold-layout__detail"),
+        document.querySelector(".application-outlet"),
+        document.querySelector("#main-content"),
+        document.querySelector(".feed-container"),
+        document.querySelector("[data-view-name]"),
+      ];
+      for (const el of spaCandidates) {
+        if (isScrollable(el)) {
+          el.scrollBy(dx, dy);
+          return el.tagName + (el.className ? "." + el.className.split(" ")[0] : "");
+        }
+      }
+
+      // 3. Find the largest scrollable element on the page
+      let best = null, bestScrollable = 0;
+      document.querySelectorAll("div, main, section, article, aside").forEach((el) => {
+        if (isScrollable(el)) {
+          const h = el.scrollHeight - el.clientHeight;
+          if (h > bestScrollable) { bestScrollable = h; best = el; }
+        }
+      });
+      if (best) {
+        best.scrollBy(dx, dy);
+        return best.tagName + (best.id ? "#" + best.id : "");
+      }
+
+      // 4. Last resort: window
+      window.scrollBy(dx, dy);
+      return "window";
+    },
     args: [x, y],
   });
-  return `Scrolled by (${x}, ${y})`;
+  const target = results[0]?.result ?? "unknown";
+  return `Scrolled by (${x}, ${y}) on ${target}`;
 }
 
 async function cmdGetCurrentUrl() {

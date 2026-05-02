@@ -151,6 +151,7 @@ _TOOL_VERBS: dict[str, str] = {
     "notebook_read":  "read nb",
     "notebook_edit":  "edited nb",
     "view_image":     "viewed",
+    "browser":        "browser",
 }
 
 
@@ -160,6 +161,9 @@ def _format_tool_key_arg(tool_name: str, tool_input: dict) -> str:
     if tool_name in ("read_file", "write_file", "edit_file", "view_image"):
         p = tool_input.get("path", "")
         return _P(p).name if p else ""
+    if tool_name == "list_dir":
+        p = tool_input.get("path", "")
+        return str(p)[:60] if p else "."
     if tool_name == "shell":
         cmd = tool_input.get("command", "")
         if isinstance(cmd, list):
@@ -177,6 +181,38 @@ def _format_tool_key_arg(tool_name: str, tool_input: dict) -> str:
             for prefix in ("*** Add File: ", "*** Update File: ", "*** Delete File: "):
                 if line.startswith(prefix):
                     return line[len(prefix):].strip()
+    if tool_name == "browser":
+        action = tool_input.get("action", "")
+        if action == "navigate":
+            url = tool_input.get("url", "")
+            try:
+                from urllib.parse import urlparse as _up
+                p = _up(url)
+                short = p.netloc + (p.path[:25] if len(p.path) > 1 else "")
+                return f"navigate → {short}"
+            except Exception:
+                return f"navigate → {url[:40]}"
+        if action == "scroll":
+            x, y = tool_input.get("x", 0), tool_input.get("y", 0)
+            parts = []
+            if x:
+                parts.append(f"x={x}")
+            if y:
+                parts.append(f"y={y}")
+            return ("scroll  " + ", ".join(parts)) if parts else "scroll"
+        if action == "click":
+            return f"click  {tool_input.get('selector', '')[:35]}"
+        if action == "form_input":
+            return f"type → {tool_input.get('selector', '')[:30]}"
+        if action == "find_elements":
+            return f"find  {tool_input.get('selector', '')[:35]}"
+        if action == "execute_js":
+            return "execute js"
+        if action == "type_text":
+            text = tool_input.get("text", "")
+            preview = text[:40].replace("\n", "↵")
+            return f"type  \"{preview}{'…' if len(text) > 40 else ''}\""
+        return action.replace("_", " ")
     return ""
 
 
@@ -197,21 +233,46 @@ def _print_activity_line(
 
 
 def _print_thinking_summary(token_count: int, tool_log: list) -> None:
-    """Print a compact one-line summary of tools used during the turn.
+    """Print a single collapsed activity line at end of turn.
 
-    Only shown when at least one tool was called — skips pure-reasoning turns
-    with no observable activity so the user isn't shown noise.
+    Groups repeated tool calls and sums their durations.
+    Only shown when at least one tool was called.
     """
     if not tool_log:
         return
-    from collections import Counter
-    counts: Counter = Counter(name for name, _, _ in tool_log)
-    summaries: list[str] = []
-    for name, count in counts.most_common(5):
+    groups: dict = {}
+    order: list[str] = []
+    for entry in tool_log:
+        name = entry[0]
+        duration_ms = entry[2] if len(entry) > 2 else 0
+        error = entry[3] if len(entry) > 3 else None
+        if name not in groups:
+            groups[name] = {"count": 0, "total_ms": 0, "errors": 0}
+            order.append(name)
+        groups[name]["count"] += 1
+        groups[name]["total_ms"] += duration_ms or 0
+        if error:
+            groups[name]["errors"] += 1
+    has_errors = any(g["errors"] for g in groups.values())
+    icon = _r("✗") if has_errors else _g("✓")
+    parts: list[str] = []
+    for name in order:
+        g = groups[name]
         verb = _TOOL_VERBS.get(name, name.replace("_", " "))
-        summaries.append(f"{verb} ×{count}" if count > 1 else verb)
-    if summaries:
-        _p(f"  {_d(' · '.join(summaries))}")
+        count_str = f" ×{g['count']}" if g["count"] > 1 else ""
+        total_ms = g["total_ms"]
+        if total_ms >= 1000:
+            dur_str = f"  {_d(f'{total_ms / 1000:.1f}s')}"
+        elif total_ms > 0:
+            dur_str = f"  {_d(f'{total_ms}ms')}"
+        else:
+            dur_str = ""
+        err_count = g["errors"]
+        err_str = f" {_r(f'({err_count} err)')}" if err_count else ""
+        parts.append(f"{_d(verb + count_str)}{dur_str}{err_str}")
+    if parts:
+        sep = f"  {_d('·')}  "
+        _p(f"  {icon}  {sep.join(parts)}")
 
 
 def _render_error(message: str, tool_name: str | None = None, tool_input: dict | None = None) -> None:
@@ -1037,6 +1098,7 @@ class Interface:
         self._spinner_stop:   Optional[asyncio.Event] = None
         self._spinner_active = False
         self._spinner_label: str = "Thinking…"
+        self._reasoning_peek: str = ""
         # Token / cost tracking
         self._total_input_tokens  = 0
         self._total_output_tokens = 0
@@ -1795,7 +1857,10 @@ class Interface:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
                 spinner_label = self._compute_spinner_label()
-                out.write(f"\r\033[2K  {frame} {_DIM}{spinner_label}{_R}")
+                line = f"\r\033[2K  {frame} {_DIM}{spinner_label}{_R}"
+                if self._reasoning_peek:
+                    line += f"  {_DIM}\"{self._reasoning_peek}\"{_R}"
+                out.write(line)
 
                 self._log_spinner_snapshot(spinner_label, [])
                 self._log_terminal_mutation(
@@ -2056,6 +2121,7 @@ class Interface:
                     # Reset per-turn activity tracking
                     self._turn_tool_log = []
                     self._reasoning_token_count = 0
+                    self._reasoning_peek = ""
                     # Spinner is started by _busy_wait AFTER the ❯ prompt is
                     # fully torn down — do NOT start it here.
 
@@ -2064,6 +2130,7 @@ class Interface:
                 elif isinstance(msg, TextDeltaEvent):
                     if not self._text_started:
                         await self._stop_spinner()
+                        self._reasoning_peek = ""
                         self._text_started = True
                         # blank line separating tool output from AI prose
                         if self._after_tool:
@@ -2139,15 +2206,26 @@ class Interface:
                     # Update spinner to show which tool is running
                     tool_name = msg.tool_name
                     display_name = tool_name.replace("_", " ").title()
+                    key_arg = _format_tool_key_arg(tool_name, msg.tool_input or {})
                     _NET_TOOLS = {"web_search", "web_fetch"}
                     if tool_name in _NET_TOOLS:
-                        verb = "Searching…" if tool_name == "web_search" else "Fetching…"
-                        self._spinner_label = f"🌐 {verb}"
+                        base = "Searching…" if tool_name == "web_search" else "Fetching…"
+                        self._spinner_label = f"🌐 {base}  {key_arg}" if key_arg else f"🌐 {base}"
                     else:
-                        self._spinner_label = f"Running {display_name}…"
+                        base = f"Running {display_name}…"
+                        self._spinner_label = f"{base}  {key_arg}" if key_arg else base
+                    # 2C: dim tool-start banner written directly to stdout for scrollback record
+                    _verb = _TOOL_VERBS.get(tool_name, tool_name.replace("_", " "))
+                    _banner = f"\r\033[2K  {_DIM}·{_R} {_SFT}{_verb}{_R}"
+                    if key_arg:
+                        _banner += f"  {_DIM}{key_arg}{_R}"
+                    sys.__stdout__.write(_banner + "\n")
+                    sys.__stdout__.flush()
+                    # Clear reasoning peek — tool action is starting, not free-thinking
+                    self._reasoning_peek = ""
                     self._tool_call_inputs[msg.tool_call_id] = msg.tool_input
-                    # Record in activity trail (duration filled when completed)
-                    self._turn_tool_log.append((msg.tool_name, msg.tool_input, 0))
+                    # Record in activity trail (duration and error filled when completed)
+                    self._turn_tool_log.append((msg.tool_name, msg.tool_input, 0, None))
                     if not self._spinner_active:
                         await self._start_spinner()
 
@@ -2157,14 +2235,12 @@ class Interface:
                     tool_input = self._tool_call_inputs.pop(msg.tool_call_id, None)
                     duration_ms = getattr(msg, 'duration_ms', 0)
                     error = getattr(msg, 'error', None)
-                    # Update duration in activity trail for this tool call
+                    # Update duration and error in activity trail — deferred to TurnEndedEvent
                     for i in range(len(self._turn_tool_log) - 1, -1, -1):
                         if self._turn_tool_log[i][0] == msg.tool_name and self._turn_tool_log[i][2] == 0:
-                            self._turn_tool_log[i] = (msg.tool_name, self._turn_tool_log[i][1], duration_ms)
+                            self._turn_tool_log[i] = (msg.tool_name, self._turn_tool_log[i][1], duration_ms, error)
                             break
-                    # Print a compact activity line for this completed tool call
-                    _print_activity_line(msg.tool_name, tool_input or {}, duration_ms, error=error)
-                    # Surface tool errors with file:line highlighting
+                    # Surface tool errors immediately — errors need to be seen right away
                     if error:
                         _render_error(error, tool_name=msg.tool_name, tool_input=tool_input)
                     elif isinstance(getattr(msg, "output", None), str) and msg.output.startswith("Error:"):
@@ -2196,6 +2272,17 @@ class Interface:
                     # Accumulate for optional verbose display; count tokens for summary
                     self._reasoning_buf += msg.delta
                     self._reasoning_token_count += max(1, len(msg.delta) // 4)
+                    # 2B: Extract live reasoning peek for spinner display
+                    _rbuf = self._reasoning_buf[-200:].lstrip()
+                    for _sep in (". ", "? ", "! ", "\n", ", "):
+                        _idx = _rbuf.rfind(_sep)
+                        if 0 <= _idx < len(_rbuf) - 12:
+                            _rbuf = _rbuf[_idx + len(_sep):]
+                            break
+                    _rbuf = _rbuf.strip().replace("\n", " ")
+                    if len(_rbuf) > 72:
+                        _rbuf = _rbuf[:72] + "…"
+                    self._reasoning_peek = _rbuf if len(_rbuf) > 8 else ""
 
                 # ── Command execution ─────────────────────────────────────────
 
@@ -2414,6 +2501,7 @@ class Interface:
                         if tail:
                             _p(tail, end="")
                     await self._stop_spinner()
+                    _print_thinking_summary(self._reasoning_token_count, self._turn_tool_log)
 
                     # Live-streamed replies may end without a final newline.
                     # Close the prose line before any reasoning/footer output.

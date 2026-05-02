@@ -26,10 +26,13 @@ def test_candidate_env_files_prefers_user_then_project(tmp_path: Path, monkeypat
 
 
 def test_load_config_uses_project_dotenv_for_provider_key(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "home"
     project = tmp_path / "repo"
+    (fake_home / ".bob").mkdir(parents=True)
     project.mkdir()
     (project / ".env").write_text("OPENAI_API_KEY=from-dotenv\n", encoding="utf-8")
 
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
     # Ensure no ambient key leaks into this test.
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -40,3 +43,23 @@ def test_load_config_uses_project_dotenv_for_provider_key(tmp_path: Path, monkey
 
     auth = resolve_provider_auth("gpt-5.1-codex-mini", cfg)
     assert auth.api_key == "from-dotenv"
+
+
+def test_project_dotenv_overrides_blank_user_value(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "home"
+    project = tmp_path / "repo"
+    (fake_home / ".bob").mkdir(parents=True)
+    project.mkdir()
+
+    (fake_home / ".bob" / ".env").write_text("KIMI_API_KEY=\n", encoding="utf-8")
+    (project / ".env").write_text("KIMI_API_KEY=from-project\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+
+    cfg = load_config(cwd=project)
+
+    from bob.llm.compatibility import resolve_provider_auth
+
+    auth = resolve_provider_auth("kimi/kimi-for-coding", cfg)
+    assert auth.api_key == "from-project"
