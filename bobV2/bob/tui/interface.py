@@ -522,12 +522,18 @@ def _unwrap_shell_printf_art(source: str) -> str:
 
 
 @lru_cache(maxsize=1)
+def _tui_art_dir() -> Path:
+    """Return the in-project directory that stores Bob TUI art assets."""
+    return Path(__file__).resolve().parents[2] / "chacter"
+
+
+@lru_cache(maxsize=1)
 def _load_tui_bob_art() -> tuple[
     tuple[tuple[str, tuple[int, int, int] | None, tuple[int, int, int] | None], ...],
     ...,
 ]:
     """Load Bob's embedded ANSI art from the repository asset file."""
-    art_dir = Path(__file__).resolve().parents[3] / "chacter"
+    art_dir = _tui_art_dir()
     for name in ("bob_tui_ansi.sh", "bob_tui_ansi.txt", "bob_tui_ansi.ans", "img.ANS"):
         art_path = art_dir / name
         if not art_path.exists():
@@ -546,7 +552,7 @@ def _load_uploaded_ascii_art() -> tuple[
     ...,
 ]:
     """Load the newest generated or uploaded colored ASCII art from the repo."""
-    art_dir = Path(__file__).resolve().parents[3] / "chacter"
+    art_dir = _tui_art_dir()
     candidates = sorted(art_dir.glob("bob-terminal-*.html"), key=lambda path: path.stat().st_mtime)
     if not candidates:
         candidates = sorted(art_dir.glob("ascii-art-*.html"), key=lambda path: path.stat().st_mtime)

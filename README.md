@@ -6,7 +6,7 @@ Current layout:
 
 - `bobV2/`: the Bob V2 CLI, TUI, tool system, app server, and built-in Chrome bridge
 - `chrome_extension/`: the Chrome side panel extension that connects to Bob over `ws://localhost:9876`
-- `chacter/`: character art and local helper assets
+- `bobV2/chacter/`: character art and local helper assets
 - `BOB_V2_PITCH.md`: product and positioning notes
 
 Important runtime detail:
