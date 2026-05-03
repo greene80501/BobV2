@@ -64,3 +64,25 @@ class TaskObject(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     result: Optional[dict[str, Any]] = None
 
+
+class AgentObject(BaseModel):
+    agent_id: str
+    path: str
+    name: str
+    agent_type: str
+    task: str = ""
+    status: str
+    cwd: Optional[str] = None
+    worktree_path: Optional[str] = None
+    isolation_mode: str
+    permission_mode: str
+    last_activity: str = ""
+    tool_uses: int = 0
+    tokens: int = 0
+    merge_status: Optional[str] = None
+    merge_success: Optional[bool] = None
+    result: Optional[str] = None
+    result_preview: Optional[str] = None
+    error: Optional[str] = None
+    created_at_ts: Optional[int] = None
+    updated_at_ts: Optional[int] = None

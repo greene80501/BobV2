@@ -7,8 +7,14 @@ from typing import Optional
 
 def _run(cmd: list[str], cwd: Path, timeout: int = 30) -> tuple[int, str, str]:
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
     except Exception as exc:
         return 1, "", str(exc)
 
@@ -24,18 +30,14 @@ def _is_git_repo(cwd: Path) -> bool:
 
 
 class WorktreeManager:
-    """Manages per-agent git worktrees. Falls back gracefully if not in a git repo."""
+    """Manage per-agent git worktrees and squash-merge their results locally."""
 
     def __init__(self, main_cwd: Path) -> None:
         self._main_cwd = main_cwd
-        self._worktrees: dict[str, Path] = {}   # agent_id → worktree path
-        self._branches: dict[str, str] = {}      # agent_id → branch name
+        self._worktrees: dict[str, Path] = {}
+        self._branches: dict[str, str] = {}
 
     def create(self, agent_id: str) -> Optional[Path]:
-        """
-        Create an isolated git worktree for agent_id.
-        Returns the worktree path, or None if not in a git repo.
-        """
         if not _is_git_repo(self._main_cwd):
             return None
 
@@ -47,7 +49,7 @@ class WorktreeManager:
         worktree_path = root / ".bob_worktrees" / agent_id
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-        rc, _, err = _run(
+        rc, _, _ = _run(
             ["git", "worktree", "add", "-b", branch, str(worktree_path), "HEAD"],
             cwd=root,
         )
@@ -59,10 +61,6 @@ class WorktreeManager:
         return worktree_path
 
     def merge_and_cleanup(self, agent_id: str) -> tuple[bool, str]:
-        """
-        Commit changes in worktree, squash-merge to main working tree, then remove worktree.
-        Returns (success, status_message).
-        """
         worktree_path = self._worktrees.get(agent_id)
         if worktree_path is None or not worktree_path.exists():
             return True, "no worktree"
@@ -70,33 +68,36 @@ class WorktreeManager:
         branch = self._branches.get(agent_id, f"bob-agent-{agent_id}")
         root = _repo_root(self._main_cwd)
 
-        # Check for changes in worktree
-        rc, status_out, _ = _run(["git", "status", "--porcelain"], worktree_path)
+        _, status_out, _ = _run(["git", "status", "--porcelain"], worktree_path)
         has_changes = bool(status_out.strip())
+        if not has_changes:
+            self._cleanup(agent_id, root, branch)
+            return True, "no changes"
 
-        merge_msg = "no changes"
-        if has_changes:
-            _run(["git", "add", "-A"], worktree_path)
-            _run(["git", "commit", "-m", f"agent({agent_id}): task result"], worktree_path)
+        _run(["git", "add", "-A"], worktree_path)
+        _run(["git", "commit", "-m", f"agent({agent_id}): task result"], worktree_path)
 
-            if root:
-                rc_m, _, err_m = _run(
-                    ["git", "merge", "--squash", branch], cwd=self._main_cwd
-                )
-                if rc_m == 0:
-                    _run(
-                        ["git", "commit", "-m", f"agent({agent_id}): merged result", "--allow-empty"],
-                        cwd=self._main_cwd,
-                    )
-                    merge_msg = "merged to main"
-                else:
-                    merge_msg = f"merge conflict (manual resolution needed): {err_m[:120]}"
+        if root is None:
+            self._cleanup(agent_id, root, branch)
+            return True, "worktree committed but repo root was not available"
+
+        rc_merge, _, err_merge = _run(
+            ["git", "merge", "--squash", "--no-commit", branch],
+            cwd=self._main_cwd,
+        )
+        if rc_merge != 0:
+            return (
+                False,
+                (
+                    "merge conflict (worktree preserved for manual resolution): "
+                    f"{err_merge[:120]} path={worktree_path} branch={branch}"
+                ),
+            )
 
         self._cleanup(agent_id, root, branch)
-        return True, merge_msg
+        return True, "squash-merged into main working tree"
 
     def cleanup_no_merge(self, agent_id: str) -> None:
-        """Remove the worktree without merging (agent failed or was cancelled)."""
         root = _repo_root(self._main_cwd)
         branch = self._branches.get(agent_id, f"bob-agent-{agent_id}")
         self._cleanup(agent_id, root, branch)

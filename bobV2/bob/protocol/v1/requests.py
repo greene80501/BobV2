@@ -174,6 +174,45 @@ class TasksCancelParams(BaseModel):
     task_id: str
 
 
+class AgentsSpawnParams(BaseModel):
+    thread_id: str
+    task: str
+    name: Optional[str] = None
+    agent_type: Optional[str] = None
+    model: Optional[str] = None
+    fork_mode: str = "none"
+    isolation_mode: Optional[str] = None
+    permission_mode: Optional[str] = None
+
+
+class AgentsGetParams(BaseModel):
+    thread_id: str
+    agent_id: str
+
+
+class AgentsListParams(BaseModel):
+    thread_id: str
+    include_completed: bool = True
+
+
+class AgentsMessageParams(BaseModel):
+    thread_id: str
+    target: str
+    message: str
+    trigger_turn: bool = True
+
+
+class AgentsWaitParams(BaseModel):
+    thread_id: str
+    agent_ids: list[str] = Field(default_factory=list)
+    timeout_ms: int = 300000
+
+
+class AgentsCloseParams(BaseModel):
+    thread_id: str
+    target: str
+
+
 class RealtimeSubscribeParams(BaseModel):
     channels: list[str] = Field(default_factory=list)
     after_cursor: Optional[int] = None

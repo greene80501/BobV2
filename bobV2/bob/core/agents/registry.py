@@ -40,16 +40,24 @@ class AgentRecord:
     agent_id: str
     path: "AgentPath"
     task: str
+    agent_type: str = "worker"
     status: AgentStatus = AgentStatus.PENDING
     progress: AgentProgress = field(default_factory=AgentProgress)
     result: Optional[str] = None
     error: Optional[str] = None
+    cwd: Optional[str] = None
+    worktree_path: Optional[str] = None
+    definition_source: Optional[str] = None
+    isolation_mode: str = "shared_workspace"
+    permission_mode: str = "full_auto"
+    merge_status: Optional[str] = None
+    merge_success: Optional[bool] = None
     started_at: float = 0.0
     _done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class AgentPath:
-    """Hierarchical agent path: /root, /root/researcher, /root/planner."""
+    """Hierarchical agent path: /root, /root/research_auth, /root/implement_api."""
 
     def __init__(self, segments: tuple[str, ...]) -> None:
         self._segments = segments

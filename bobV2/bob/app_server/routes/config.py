@@ -21,7 +21,7 @@ def register(router) -> None:
                 "turns": True,
                 "files": True,
                 "exec": True,
-                "agents": False,
+                "agents": True,
                 "tasks": True,
                 "realtime": True,
                 "dynamic_tools": True,

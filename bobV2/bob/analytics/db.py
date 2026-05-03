@@ -141,6 +141,7 @@ class AnalyticsDB:
                         SUM(input_tokens)   AS input_tokens,
                         SUM(output_tokens)  AS output_tokens,
                         SUM(total_tokens)   AS total_tokens,
+                        SUM(cached_input_tokens) AS cached_input_tokens,
                         SUM(total_cost_usd) AS total_cost_usd,
                         AVG(latency_ms)     AS avg_latency_ms
                     FROM turns
@@ -166,6 +167,7 @@ class AnalyticsDB:
                         SUM(input_tokens)   AS input_tokens,
                         SUM(output_tokens)  AS output_tokens,
                         SUM(total_tokens)   AS total_tokens,
+                        SUM(cached_input_tokens) AS cached_input_tokens,
                         SUM(total_cost_usd) AS total_cost_usd,
                         AVG(latency_ms)     AS avg_latency_ms
                     FROM turns
@@ -223,6 +225,32 @@ class AnalyticsDB:
         except Exception:
             return []
 
+    async def turn_history(
+        self,
+        session_id: str,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent-to-oldest turn records for a specific session."""
+        if not self._ready:
+            return []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                if limit is None:
+                    rows = await (await db.execute(
+                        "SELECT * FROM turns WHERE session_id = ? ORDER BY id DESC",
+                        (session_id,),
+                    )).fetchall()
+                else:
+                    rows = await (await db.execute(
+                        "SELECT * FROM turns WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                        (session_id, limit),
+                    )).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -234,6 +262,7 @@ def _empty_totals() -> dict[str, Any]:
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
         "avg_latency_ms": None,
     }
@@ -247,6 +276,7 @@ def _row_to_totals(row: Any) -> dict[str, Any]:
         "input_tokens":   int(row["input_tokens"] or 0),
         "output_tokens":  int(row["output_tokens"] or 0),
         "total_tokens":   int(row["total_tokens"] or 0),
+        "cached_input_tokens": int(row["cached_input_tokens"] or 0),
         "total_cost_usd": float(row["total_cost_usd"] or 0.0),
         "avg_latency_ms": float(row["avg_latency_ms"]) if row["avg_latency_ms"] else None,
     }

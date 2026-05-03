@@ -17,7 +17,7 @@ WAIT_AGENT_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "List of agent IDs (from spawn_agent) or agent names to wait for. "
+                "List of agent IDs (from spawn_agents/spawn_agent) or agent names to wait for. "
                 "At least one required."
             ),
             "minItems": 1,

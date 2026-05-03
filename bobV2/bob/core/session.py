@@ -192,6 +192,11 @@ class BobSession:
     def action_log_path(self) -> Path:
         return self._action_log_path
 
+    @property
+    def current_rollout_path(self) -> Path | None:
+        recorder = getattr(self, "_recorder", None)
+        return getattr(recorder, "_path", None)
+
     def _make_action_log_path(self) -> Path:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         return self.bob_home / "logs" / "actions" / f"{stamp}-{self.session_id}.log"
@@ -572,6 +577,7 @@ class BobSession:
         # Multi-agent tools (only for non-ephemeral sessions)
         if not self.ephemeral:
             from bob.tools.agents import (
+                spawn_agents_handler, SPAWN_AGENTS_DESCRIPTION, SPAWN_AGENTS_SCHEMA,
                 spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
                 wait_agent_handler, WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
                 send_message_handler, SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
@@ -580,12 +586,21 @@ class BobSession:
                 list_agents_handler, LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
             )
             self.tool_registry.register(
+                "spawn_agents", SPAWN_AGENTS_DESCRIPTION, SPAWN_AGENTS_SCHEMA,
+                spawn_agents_handler,
+                is_mutating=True,
+                supports_parallel=False,
+                source="agents",
+                keywords=["agents", "parallel", "spawn", "workers", "batch", "team"],
+            )
+            self.tool_registry.register(
                 "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
                 spawn_agent_handler,
                 is_mutating=True,
                 supports_parallel=False,
+                expose_to_model=False,
                 source="agents",
-                keywords=["agent", "parallel", "spawn", "worker", "background"],
+                keywords=["agent", "spawn", "legacy", "worker", "background"],
             )
             self.tool_registry.register(
                 "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
@@ -1156,7 +1171,8 @@ class BobSession:
         if collab_mode == CollaborationModeKind.PLAN:
             base += (
                 "\n\n# COLLABORATION MODE: PLAN\n"
-                "- You are in planning mode. Use read-only tools and spawn plan agents to explore.\n"
+                "- You are in planning mode. Use read-only tools and stay in the main thread unless there are at least two substantial independent research tracks.\n"
+                "- If you delegate, decompose first and spawn multiple workers in parallel; never spawn a single worker.\n"
                 "- Do NOT write or edit files until the user approves the plan.\n"
                 "- Produce a detailed, step-by-step plan with clear deliverables."
             )
@@ -1165,14 +1181,19 @@ class BobSession:
                 "\n\n# COLLABORATION MODE: PAIR PROGRAMMING\n"
                 "- Work closely with the user. Explain your reasoning as you go.\n"
                 "- Suggest alternatives and ask clarifying questions when appropriate.\n"
-                "- Spawn implementer agents only for well-defined, independent sub-tasks."
+                "- Use sub-agents only for real parallel work. If the task does not need multiple workers, stay in the main thread.\n"
+                "- Decompose first. Spawn multiple workers only when there are at least two substantial independent tracks.\n"
+                "- Use the worker task prompt to define whether each worker should plan, inspect, implement, or review."
             )
         elif collab_mode == CollaborationModeKind.EXECUTE:
             base += (
                 "\n\n# COLLABORATION MODE: EXECUTE\n"
                 "- Focus on getting things done with minimal back-and-forth.\n"
-                "- Aggressively parallelise: spawn multiple implementer agents for independent changes.\n"
-                "- After implementation, spawn a review agent to verify quality.\n"
+                "- Use sub-agents only for true parallelism. Never spawn a single worker.\n"
+                "- Decompose first. Spawn multiple workers only when there are at least two substantial independent tracks.\n"
+                "- Use the worker task prompt to specify whether each worker should research, plan, implement, or test/review.\n"
+                "- For coding work, parallel workers should have clearly separated scope ownership.\n"
+                "- Wait for all workers to finish before synthesizing the final response.\n"
                 "- Only ask the user for input when truly blocked."
             )
         # DEFAULT mode has no extra directive
@@ -1450,6 +1471,11 @@ class BobSession:
     async def shutdown(self) -> None:
         self._shutdown_event.set()
         self._log_action_line("[session] shutdown requested")
+        if getattr(self, "agent_control", None) is not None:
+            try:
+                await self.agent_control.shutdown()
+            except Exception:
+                pass
         if self._agent_task:
             self._agent_task.cancel()
             try:

@@ -51,6 +51,8 @@ class SlashCommand(str, Enum):
     # Phase 1 additions
     HELP = "help"
     EFFORT = "effort"
+    ANALYTICS = "analytics"
+    TOKENS = "tokens"
     COST = "cost"
     USAGE = "usage"
     # Phase 3 additions
@@ -116,6 +118,8 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.DEBUG_M_UPDATE: "update memories (debug)",
     # Phase 1
     SlashCommand.HELP: "show all available slash commands",
+    SlashCommand.ANALYTICS: "show session analytics and operational statistics",
+    SlashCommand.TOKENS: "show token-focused analytics for this session",
     SlashCommand.EFFORT: "set reasoning effort: low, medium, or high",
     SlashCommand.COST: "show estimated token cost for this session",
     SlashCommand.USAGE: "show token usage breakdown for the last turn",
@@ -151,7 +155,8 @@ AVAILABLE_DURING_TASK: set[SlashCommand] = {
 SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.REVIEW, SlashCommand.RENAME, SlashCommand.PLAN,
     SlashCommand.FAST, SlashCommand.SANDBOX_READ_ROOT,
-    SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.BRANCH,
+    SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.ANALYTICS,
+    SlashCommand.TOKENS, SlashCommand.BRANCH,
     SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
     SlashCommand.OUTPUT_STYLE, SlashCommand.THINK,
 }

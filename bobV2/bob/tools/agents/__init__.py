@@ -1,4 +1,5 @@
 from bob.tools.agents.spawn_agent import (
+    spawn_agents_handler, SPAWN_AGENTS_DESCRIPTION, SPAWN_AGENTS_SCHEMA,
     spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
 )
 from bob.tools.agents.send_message import (
@@ -16,6 +17,7 @@ from bob.tools.agents.list_agents import (
 )
 
 __all__ = [
+    "spawn_agents_handler", "SPAWN_AGENTS_DESCRIPTION", "SPAWN_AGENTS_SCHEMA",
     "spawn_agent_handler", "SPAWN_AGENT_DESCRIPTION", "SPAWN_AGENT_SCHEMA",
     "send_message_handler", "SEND_MESSAGE_DESCRIPTION", "SEND_MESSAGE_SCHEMA",
     "assign_task_handler", "ASSIGN_TASK_DESCRIPTION", "ASSIGN_TASK_SCHEMA",

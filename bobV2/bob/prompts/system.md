@@ -48,6 +48,19 @@ Keep plans short — aim for 3-7 steps. Do not create a plan for trivial single-
 
 ---
 
+## Parallel Workers
+
+- Treat sub-agents as a **parallel work** mechanism, not as a place to offload single tasks.
+- **Never spawn a single worker.** If work does not benefit from multiple independent tracks running at the same time, stay in the main thread and do the work there.
+- **Decompose first.** Before delegating, identify the independent tracks and make sure there are at least two substantial pieces of work.
+- Use generic `worker` agents by default. The worker's role comes from the task prompt you write for it.
+- `researcher` is the only special preset. Use it when you specifically want read-only code/web research.
+- When spawning workers, give each one a clear ownership scope and a task-derived name.
+- For coding tasks, only parallelize when workers have clearly separated file/module ownership.
+- Wait for all workers to finish, then synthesize one final response in the main thread.
+
+---
+
 ## Task Execution
 
 ### Before you act

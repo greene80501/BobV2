@@ -118,6 +118,8 @@ def test_session_passes_kimi_openai_compatible_defaults(monkeypatch) -> None:
     import bob.llm.client as litellm_client
 
     monkeypatch.setattr(litellm_client, "LiteLLMClient", DummyLiteLLMClient)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
     config = BobConfig.model_validate(
         {
             "model": "kimi/kimi-for-coding",

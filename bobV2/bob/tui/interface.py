@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
@@ -2223,6 +2224,8 @@ class Interface:
                     sys.__stdout__.flush()
                     # Clear reasoning peek — tool action is starting, not free-thinking
                     self._reasoning_peek = ""
+                    # Reset so the spinner is stopped when text resumes after this tool
+                    self._text_started = False
                     self._tool_call_inputs[msg.tool_call_id] = msg.tool_input
                     # Record in activity trail (duration and error filled when completed)
                     self._turn_tool_log.append((msg.tool_name, msg.tool_input, 0, None))
@@ -2841,6 +2844,138 @@ class Interface:
         self._task_running = False
         return "".join(result_parts)
 
+    async def _build_analytics_report(self):
+        from bob.analytics.report import build_session_report
+
+        return await build_session_report(
+            session_id=self._session.session_id,
+            analytics_db=self._session._analytics_db,
+            rollout_path=self._session.current_rollout_path,
+            model=self._config.model,
+            cwd=str(Path.cwd()),
+        )
+
+    async def _render_analytics(self, focus: str = "all") -> None:
+        report = await self._build_analytics_report()
+        focus_key = (focus or "all").strip().lower()
+
+        def _sec(title: str) -> None:
+            _p()
+            _p(f"  {_b(title)}")
+            _p()
+
+        def _row(label: str, value: str) -> None:
+            _p(f"  {_d(f'{label:<22}')} {value}")
+
+        if focus_key == "raw":
+            _p()
+            payload = json.dumps(asdict(report), indent=2, default=str)
+            for line in payload.splitlines():
+                _p(f"  {line}")
+            _p()
+            return
+
+        if focus_key in {"all", "overview"}:
+            _sec("Session Analytics")
+            _row("Session", report.session_id)
+            _row("Model", report.model or "unknown")
+            _row("Turns", f"{report.turns:,}")
+            _row("Tool calls", f"{report.tool_calls:,}")
+            _row("Current cwd", report.cwd or str(Path.cwd()))
+            if report.rollout_path:
+                _row("Rollout", report.rollout_path)
+
+        if focus_key in {"all", "tokens", "usage"}:
+            _sec("Tokens")
+            _row("Input tokens", f"{report.input_tokens:,}")
+            if report.cached_input_tokens > 0:
+                _row("Cached input", f"{report.cached_input_tokens:,}")
+            _row("Output tokens", f"{report.output_tokens:,}")
+            _row("Total tokens", f"{report.total_tokens:,}")
+            _row("Avg tokens / turn", f"{report.avg_tokens_per_turn:,.1f}")
+            _row("Largest turn", f"{report.max_turn_tokens:,}")
+            if report.recent_turns:
+                last_turn = report.recent_turns[0]
+                _row(
+                    "Last turn",
+                    f"{last_turn.input_tokens:,} in / {last_turn.output_tokens:,} out / {last_turn.total_tokens:,} total",
+                )
+            if report.budget.peak_fraction_used is not None and report.budget.peak_budget_tokens > 0:
+                _row(
+                    "Peak budget seen",
+                    f"{report.budget.peak_fraction_used * 100:.1f}% ({report.budget.peak_used_tokens:,} / {report.budget.peak_budget_tokens:,})",
+                )
+
+        if focus_key in {"all", "cost"}:
+            _sec("Cost")
+            _row("Estimated cost", f"${report.total_cost_usd:.4f}")
+            if report.avg_latency_ms is not None:
+                _row("Avg turn latency", f"{report.avg_latency_ms:,.0f}ms")
+            if report.max_turn_latency_ms > 0:
+                _row("Slowest turn", f"{report.max_turn_latency_ms:,}ms")
+            if report.model_breakdown:
+                _p()
+                _p(f"  {_d('Model breakdown')}")
+                for entry in report.model_breakdown[:5]:
+                    _p(
+                        f"    {entry.model}  {_d('·')} {entry.turns:,} turns  {_d('·')} "
+                        f"{entry.total_tokens:,} tok  {_d('·')} ${entry.total_cost_usd:.4f}"
+                    )
+
+        if focus_key in {"all", "tools"}:
+            _sec("Tools")
+            _row("Tool calls", f"{report.tool_calls:,}")
+            _row("Unique tools", f"{report.unique_tools:,}")
+            _row("Failures", f"{report.tool_failures:,}")
+            _row("Shell commands", f"{report.shell_commands:,}")
+            if report.avg_tool_duration_ms is not None:
+                _row("Avg tool duration", f"{report.avg_tool_duration_ms:,.0f}ms")
+            if report.agent_spawns or report.agent_completions:
+                _row("Agent runs", f"{report.agent_spawns:,} spawned / {report.agent_completions:,} completed")
+            if report.tool_breakdown:
+                _p()
+                _p(f"  {_d('Top tools')}")
+                for entry in report.tool_breakdown[:7]:
+                    _p(
+                        f"    {entry.name}  {_d('·')} {entry.count:,} calls  {_d('·')} "
+                        f"{entry.avg_duration_ms:,.0f}ms avg  {_d('·')} {entry.failures:,} fail"
+                    )
+
+        if focus_key in {"all", "context", "analytics"}:
+            _sec("Context")
+            _row("Compactions", f"{report.compaction.successful:,} / {report.compaction.total:,} successful")
+            _row("Tokens removed", f"{report.compaction.reduction_tokens:,}")
+            if report.compaction.average_reduction_pct is not None:
+                _row("Avg reduction", f"{report.compaction.average_reduction_pct:.1f}%")
+            if report.compaction.best_reduction_pct is not None:
+                _row("Best reduction", f"{report.compaction.best_reduction_pct:.1f}%")
+            if report.compaction.last_summary:
+                _row("Last compaction", report.compaction.last_summary)
+            if report.unique_changed_files > 0:
+                _row("Changed files", f"{report.unique_changed_files:,} unique this session")
+
+        if focus_key in {"all", "approvals"}:
+            _sec("Approvals")
+            _row("Exec requests", f"{report.approvals.exec_requested:,}")
+            _row("Exec approved", f"{report.approvals.exec_approved:,}")
+            _row("Exec denied", f"{report.approvals.exec_denied:,}")
+            _row("Exec aborted", f"{report.approvals.exec_aborted:,}")
+            _row("Network requests", f"{report.approvals.network_requested:,}")
+
+        if focus_key in {"all", "tokens", "usage", "recent"} and report.recent_turns:
+            _sec("Recent Turns")
+            for turn in report.recent_turns:
+                stamp = turn.timestamp[11:19] if turn.timestamp else "unknown"
+                changed = len(turn.changed_files)
+                _p(
+                    f"  {stamp}  {_d('·')} {turn.total_tokens:,} tok  {_d('·')} "
+                    f"{turn.input_tokens:,} in / {turn.output_tokens:,} out  {_d('·')} "
+                    f"${turn.total_cost_usd:.4f}"
+                    + (f"  {_d('·')} {changed} files" if changed else "")
+                )
+
+        _p()
+
     # ── Slash dispatch ────────────────────────────────────────────────────────
 
     async def _dispatch_slash(self, cmd: SlashCommand, args: str) -> bool:
@@ -3096,7 +3231,8 @@ class Interface:
             groups = [
                 ("Navigation",  [SlashCommand.NEW, SlashCommand.RESUME, SlashCommand.FORK,
                                   SlashCommand.REWIND, SlashCommand.CLEAR]),
-                ("Session",     [SlashCommand.STATUS, SlashCommand.COST, SlashCommand.USAGE,
+                ("Session",     [SlashCommand.STATUS, SlashCommand.ANALYTICS, SlashCommand.TOKENS,
+                                  SlashCommand.COST, SlashCommand.USAGE,
                                   SlashCommand.COMPACT, SlashCommand.EXPORT, SlashCommand.COPY,
                                   SlashCommand.RENAME]),
                 ("Tools",       [SlashCommand.DIFF, SlashCommand.COMMIT, SlashCommand.BRANCH,
@@ -3152,53 +3288,17 @@ class Interface:
                 except Exception:
                     _p(f"  {_d(f'reasoning effort set to: {level}')}")
 
+        elif cmd == SlashCommand.ANALYTICS:
+            await self._render_analytics(args.strip() or "all")
+
+        elif cmd == SlashCommand.TOKENS:
+            await self._render_analytics(args.strip() or "tokens")
+
         elif cmd == SlashCommand.COST:
-            # Rough cost estimate (OpenAI pricing as of 2024, per 1k tokens)
-            _RATES: dict[str, tuple[float, float]] = {
-                "gpt-4o":           (0.005,  0.015),
-                "gpt-4o-mini":      (0.00015, 0.0006),
-                "gpt-4-turbo":      (0.01,   0.03),
-                "gpt-4":            (0.03,   0.06),
-                "gpt-3.5-turbo":    (0.0005, 0.0015),
-                "o1":               (0.015,  0.06),
-                "o1-mini":          (0.003,  0.012),
-                "o3-mini":          (0.0011, 0.0044),
-            }
-            model_key = self._config.model.lower()
-            rate_in, rate_out = 0.0, 0.0
-            for k, rates in _RATES.items():
-                if k in model_key:
-                    rate_in, rate_out = rates
-                    break
-            cost_in  = self._total_input_tokens  / 1000 * rate_in
-            cost_out = self._total_output_tokens / 1000 * rate_out
-            # Cached tokens cost ~10% of normal input rate
-            cost_cached = self._total_cached_input_tokens / 1000 * rate_in * 0.1
-            total_cost = cost_in + cost_out + cost_cached
-            savings = self._total_cached_input_tokens / 1000 * rate_in * 0.9
-            _p()
-            _p(f"  {_d('input tokens')}   {self._total_input_tokens:>10,}   ${cost_in:.4f}")
-            _p(f"  {_d('cached tokens')}  {self._total_cached_input_tokens:>10,}   ${cost_cached:.4f}")
-            _p(f"  {_d('output tokens')}  {self._total_output_tokens:>10,}   ${cost_out:.4f}")
-            _p(f"  {_d('total estimate')} {'':>10}   ${total_cost:.4f}")
-            if savings > 0:
-                _p(f"  {_g('cache savings')}   {'':>10}   ${savings:.4f}")
-            if rate_in == 0:
-                _p(f"  {_d('(rates unknown for this model)')}")
-            _p()
+            await self._render_analytics("cost")
 
         elif cmd == SlashCommand.USAGE:
-            t = self._last_turn_tokens
-            if not t:
-                _p(f"  {_d('no turns yet')}")
-            else:
-                _p()
-                _p(f"  {_d('last turn input')}   {t.get('input', 0):>8,}")
-                cached = t.get('cached', 0)
-                if cached > 0:
-                    _p(f"  {_g('last turn cached')}  {cached:>8,}")
-                _p(f"  {_d('last turn output')}  {t.get('output', 0):>8,}")
-                _p()
+            await self._render_analytics("tokens")
 
         # ── Phase 3: git, export, rewind, summary, doctor, context, style ─────
 
@@ -4150,9 +4250,6 @@ class Interface:
             self._log_ui_line("[header] welcome header rendered")
             self._log_ui_line(f"[session] cwd={self._session.cwd}")
             self._log_ui_line(f"[session] model={self._config.model}")
-            _p(f"  {_d(f'log: {self._session_log_path}')}")
-            if hasattr(self._session, "action_log_path"):
-                _p(f"  {_d(f'actions: {self._session.action_log_path}')}")
             event_task = asyncio.create_task(self._consume_events())
 
             try:

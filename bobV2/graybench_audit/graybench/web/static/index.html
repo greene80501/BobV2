@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GrayBench</title>
+    <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <h1>GrayBench</h1>
+            <span class="version">v1.0.0</span>
+            <nav class="nav">
+                <button class="nav-btn active" data-page="dashboard">Dashboard</button>
+                <button class="nav-btn" data-page="launcher">Launch</button>
+                <button class="nav-btn" data-page="results">Results</button>
+                <button class="nav-btn" data-page="settings">Settings</button>
+            </nav>
+        </header>
+        <main class="main" id="main">
+            <div class="spinner" style="margin:60px auto;display:block;"></div>
+        </main>
+    </div>
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

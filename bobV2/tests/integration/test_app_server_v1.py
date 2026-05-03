@@ -81,3 +81,62 @@ def test_legacy_and_task_routes():
             await server.stop()
 
     asyncio.run(_run())
+
+
+def test_agent_routes():
+    async def _run() -> None:
+        server = AppServer()
+        await server.start()
+        try:
+            created = await server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "threads.create",
+                    "params": {"ephemeral": False},
+                }
+            )
+            assert created is not None
+            thread_id = created["result"]["thread"]["id"]
+
+            spawned = await server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "agents.spawn",
+                    "params": {
+                        "thread_id": thread_id,
+                        "task": "Inspect the repository and report likely risk areas.",
+                    },
+                }
+            )
+            assert spawned is not None
+            agent_id = spawned["result"]["agent"]["agent_id"]
+            assert spawned["result"]["agent"]["agent_type"] == "worker"
+            assert spawned["result"]["agent"]["name"] == "inspect_repository_report_likely"
+
+            listed = await server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "agents.list",
+                    "params": {"thread_id": thread_id},
+                }
+            )
+            assert listed is not None
+            assert any(agent["agent_id"] == agent_id for agent in listed["result"]["agents"])
+
+            waited = await server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 13,
+                    "method": "agents.wait",
+                    "params": {"thread_id": thread_id, "agent_ids": [agent_id], "timeout_ms": 1000},
+                }
+            )
+            assert waited is not None
+            assert agent_id in waited["result"]["results"]
+        finally:
+            await server.stop()
+
+    asyncio.run(_run())
