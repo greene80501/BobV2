@@ -225,7 +225,7 @@ def detect_escalation(command: list[str]) -> str | None:
 
 def _stream_idle_timeout_seconds(session: "BobSession") -> float:
     exec_timeout = float(getattr(session.config, "exec_timeout_seconds", 120) or 120)
-    return max(15.0, min(45.0, exec_timeout * 0.25))
+    return max(15.0, min(60.0, exec_timeout * 0.25))
 
 
 async def _next_stream_event(

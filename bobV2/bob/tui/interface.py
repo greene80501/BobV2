@@ -1865,8 +1865,9 @@ class Interface:
                 frame = frames[i % len(frames)]
                 spinner_label = self._compute_spinner_label()
                 line = f"\r\033[2K  {frame} {_DIM}{spinner_label}{_R}"
-                if self._reasoning_peek:
-                    line += f"  {_DIM}\"{self._reasoning_peek}\"{_R}"
+                # Reasoning peek disabled - uncomment to show model's thinking
+                # if self._reasoning_peek:
+                #     line += f"  {_DIM}\"{self._reasoning_peek}\"{_R}"
                 out.write(line)
 
                 self._log_spinner_snapshot(spinner_label, [])
