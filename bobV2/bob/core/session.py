@@ -33,6 +33,7 @@ class ToolContext:
         self.on_plan_update = None   # set per-turn
         self.on_request_user_input = None
         self.current_tool_call_id = None
+        self.attach_image = session.attach_image
         # Back-reference so plan_mode tools can toggle the flag
         self._session = session
         # Task database for task management tools
@@ -64,6 +65,7 @@ class BobSession:
         # Domains approved for web access this session (key = request_id â†’ Future)
         self._pending_network_approvals: dict[str, asyncio.Future] = {}
         self._pending_dynamic_tool_calls: dict[str, asyncio.Future] = {}
+        self._pending_attached_images: list[dict[str, Any]] = []
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
         self._current_on_plan_update = None
@@ -196,6 +198,48 @@ class BobSession:
     def current_rollout_path(self) -> Path | None:
         recorder = getattr(self, "_recorder", None)
         return getattr(recorder, "_path", None)
+
+    async def attach_image(
+        self,
+        path: str,
+        mime: str,
+        b64: str,
+        *,
+        detail_level: str = "medium",
+    ) -> None:
+        normalized_detail = detail_level if detail_level in {"low", "medium", "high"} else "medium"
+        self._pending_attached_images.append(
+            {
+                "path": path,
+                "mime": mime,
+                "b64": b64,
+                "detail": normalized_detail,
+            }
+        )
+        self._log_action_line(
+            f"[image] attached path={path} mime={mime} detail={normalized_detail} approx_tokens={len(b64) // 4}"
+        )
+
+    def consume_pending_image_message(self) -> dict[str, Any] | None:
+        if not self._pending_attached_images:
+            return None
+        attachments = list(self._pending_attached_images)
+        self._pending_attached_images.clear()
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": "Tool attachment(s) for inspection. Use the attached image(s) along with the related tool results.",
+            }
+        ]
+        for item in attachments:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{item['mime']};base64,{item['b64']}",
+                    "detail": item["detail"],
+                }
+            )
+        return {"role": "user", "content": content}
 
     def _make_action_log_path(self) -> Path:
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -821,6 +865,9 @@ class BobSession:
             base_url=provider_auth.base_url,
             provider_kwargs=provider_auth.provider_kwargs,
             env_overrides=env_overrides,
+            default_timeout_seconds=float(
+                getattr(self.config, "provider_stream_idle_timeout_seconds", 90) or 90
+            ),
         )
 
     async def _prewarm_connection(self) -> None:

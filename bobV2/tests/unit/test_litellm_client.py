@@ -79,6 +79,35 @@ def test_to_chat_messages_preserves_reasoning_content_for_plain_assistant_messag
     ]
 
 
+def test_to_chat_messages_maps_medium_image_detail_to_provider_auto() -> None:
+    items = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/jpeg;base64,abc",
+                    "detail": "medium",
+                }
+            ],
+        }
+    ]
+
+    messages = _to_chat_messages("", items, model="openai/gpt-4o")
+
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,abc", "detail": "auto"},
+                }
+            ],
+        }
+    ]
+
+
 def test_to_chat_messages_preserves_tool_call_provider_specific_fields() -> None:
     items = [
         {

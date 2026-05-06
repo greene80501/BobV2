@@ -188,7 +188,10 @@ def _temporary_env(overrides: dict[str, str]):
                     os.environ[key] = old_value
 
 
-def _provider_timeout_seconds(extra_params: dict[str, Any]) -> float:
+def _provider_timeout_seconds(
+    extra_params: dict[str, Any],
+    default_timeout_seconds: float = _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+) -> float:
     for key in ("timeout", "request_timeout"):
         raw = extra_params.get(key)
         if raw is None:
@@ -197,7 +200,7 @@ def _provider_timeout_seconds(extra_params: dict[str, Any]) -> float:
             return max(0.1, min(float(raw), 900.0))
         except (TypeError, ValueError):
             continue
-    return _DEFAULT_PROVIDER_TIMEOUT_SECONDS
+    return max(0.1, min(float(default_timeout_seconds), 900.0))
 
 
 def _emit_threadsafe(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, kind: str, payload: Any) -> None:
@@ -250,10 +253,19 @@ def _to_chat_messages(
                         if c.get("type") == "input_text":
                             parts.append({"type": "text", "text": c.get("text", "")})
                         elif c.get("type") == "input_image":
+                            detail = c.get("detail")
+                            provider_detail = {
+                                "low": "low",
+                                "medium": "auto",
+                                "high": "high",
+                            }.get(detail)
+                            image_url: dict[str, Any] = {"url": c.get("image_url", "")}
+                            if provider_detail:
+                                image_url["detail"] = provider_detail
                             parts.append(
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": c.get("image_url", "")},
+                                    "image_url": image_url,
                                 }
                             )
                     messages.append({"role": "user", "content": parts})
@@ -347,12 +359,14 @@ class LiteLLMClient:
         base_url: Optional[str] = None,
         provider_kwargs: Optional[dict[str, Any]] = None,
         env_overrides: Optional[dict[str, str]] = None,
+        default_timeout_seconds: float = _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     ) -> None:
         self.model = model
         self._api_key = api_key
         self._base_url = base_url
         self._provider_kwargs = dict(provider_kwargs or {})
         self._env_overrides = dict(env_overrides or {})
+        self._default_timeout_seconds = max(0.1, min(float(default_timeout_seconds), 900.0))
         self._configure_litellm()
 
     def _configure_litellm(self) -> None:
@@ -497,7 +511,10 @@ class LiteLLMClient:
             kwargs["api_key"] = self._api_key
         kwargs.update(self._provider_kwargs)
         kwargs["stream_options"] = {"include_usage": True}
-        provider_timeout_seconds = _provider_timeout_seconds(kwargs)
+        provider_timeout_seconds = _provider_timeout_seconds(
+            kwargs,
+            self._default_timeout_seconds,
+        )
         kwargs.setdefault("timeout", provider_timeout_seconds)
 
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()

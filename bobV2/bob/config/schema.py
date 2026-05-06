@@ -285,6 +285,9 @@ class BobConfig(BaseModel):
     show_cost: bool = False
     # Stream responses in real-time (False = buffer full response)
     stream_responses: bool = True
+    # Maximum idle time, in seconds, to wait for the model stream before
+    # treating the provider as stalled.
+    provider_stream_idle_timeout_seconds: int = 90
     # Markdown renderer backend used by the chat TUI.
     # "markdown_it" is the CommonMark parser-backed renderer.
     # "legacy" keeps the old regex-based fallback renderer.

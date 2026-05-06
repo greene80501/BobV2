@@ -11,6 +11,8 @@ class _FakeSession:
         self.bob_home = bob_home
         self.session_id = "sess-1"
         self.cwd = bob_home
+        self.action_log_path = bob_home / "logs" / "actions" / "actions.log"
+        self.current_rollout_path = bob_home / "sessions" / "rollout.jsonl"
 
 
 def test_format_command_labels_cmd_wrapper() -> None:
@@ -57,6 +59,16 @@ def test_input_box_dash_width_matches_shared_prompt_geometry() -> None:
 
 def test_strip_ansi_removes_color_codes() -> None:
     assert _strip_ansi("\x1b[31mred\x1b[0m plain") == "red plain"
+
+
+def test_parse_at_images_supports_detail_suffix(tmp_path: Path) -> None:
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"png")
+
+    cleaned, image_paths = interface_module._parse_at_images(f"look at @{img}#high please")
+
+    assert cleaned == "look at  please"
+    assert image_paths == [(img.resolve(), "high")]
 
 
 def test_stalled_status_has_distinct_icon_and_label(tmp_path: Path) -> None:
@@ -115,6 +127,19 @@ def test_interface_logs_event_handler_errors(tmp_path: Path) -> None:
         interface._log_event_handler_error(type("Msg", (), {"type": "agent_status"})(), ValueError("bad event"))
         text = interface._session_log_path.read_text(encoding="utf-8-sig")
         assert "[event-error] type=agent_status error=ValueError: bad event" in text
+    finally:
+        interface._session_log_handle.close()
+
+
+def test_startup_log_rows_include_current_log_paths(tmp_path: Path) -> None:
+    interface = Interface(session=_FakeSession(tmp_path / ".bob"), config=BobConfig())
+    try:
+        rows = interface._startup_log_rows()
+        assert any("Session Files" in row for row in rows)
+        assert any("bob_home" in row and ".bob" in row for row in rows)
+        assert any("logs" in row and "actions.log" in row for row in rows)
+        assert any("logs" in row and "sess-1.log" in row for row in rows)
+        assert any("sessions" in row and "rollout.jsonl" in row for row in rows)
     finally:
         interface._session_log_handle.close()
 

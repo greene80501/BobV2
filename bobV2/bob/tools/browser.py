@@ -1,15 +1,18 @@
-"""Browser control tool — controls the user's Chrome via the Chrome extension bridge."""
+"""Browser control tool that uses the Chrome extension bridge."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from bob.core.image_payloads import prepare_base64_image_for_model
+
 if TYPE_CHECKING:
     from bob.core.session import ToolContext
+
 
 BROWSER_DESCRIPTION = """\
 Control the user's Chrome browser via the bob Chrome extension (ws://localhost:9876).
 
-IMPORTANT — use web_fetch instead of this tool for any public page you can read directly.
+IMPORTANT - use web_fetch instead of this tool for any public page you can read directly.
 Only use browser when one of these is true:
   1. The page requires the user's active login session (LinkedIn feed, Gmail, Twitter timeline,
      private dashboards). The user's Chrome already has the session; web_fetch does not.
@@ -18,27 +21,26 @@ Only use browser when one of these is true:
      filling forms, or navigating through authenticated flows.
 
 Do NOT use browser for (use web_fetch instead):
-  - GitHub repos, files, READMEs, commit history — web_fetch reads these perfectly.
+  - GitHub repos, files, READMEs, commit history - web_fetch reads these perfectly.
   - Personal/portfolio websites, landing pages, marketing sites.
   - Documentation sites, blog posts, news articles, PDFs.
   - Any public static page where you just need to read content.
 
 Actions available (once you've determined browser is needed):
-  - get_page_text — fast, low-cost; use for articles, docs, structured text.
-  - get_page_html — raw HTML; use when you need to parse structure.
-  - navigate → then get_page_text or get_page_html in separate calls.
-  - scroll — scroll the page; y=500 scrolls down ~one screen, y=-500 scrolls up.
-    Use scroll (not execute_js) for scrolling — it works on SPAs like LinkedIn and Twitter.
-  - click, form_input, find_elements — for interaction with page elements.
-  - type_text — type text into the currently focused element (or a given selector).
+  - get_page_text - fast, low-cost; use for articles, docs, structured text.
+  - get_page_html - raw HTML; use when you need to parse structure.
+  - navigate -> then get_page_text or get_page_html in separate calls.
+  - scroll - scroll the page; y=500 scrolls down about one screen, y=-500 scrolls up.
+    Use scroll (not execute_js) for scrolling - it works on SPAs like LinkedIn and Twitter.
+  - click, form_input, find_elements - for interaction with page elements.
+  - type_text - type text into the currently focused element (or a given selector).
     Works for standard inputs AND rich text editors (Google Docs, Notion, CodeMirror).
-    Use instead of execute_js for typing — not blocked by CSP.
-  - screenshot — EXPENSIVE: costs ~100k–500k tokens on text-only models and may exceed
-    the context window entirely. Only use when visual layout genuinely cannot be inferred
-    from text (e.g. diagrams, captchas, canvas). For profiles, articles, tables, or any
-    readable content, always use get_page_text or get_page_html instead.
+    Use instead of execute_js for typing - not blocked by CSP.
+  - screenshot - expensive. On vision-capable models Bob attaches the screenshot as an image
+    using low/medium/high detail. On non-vision models Bob refuses to dump raw base64 into
+    context because that bloats tokens without giving the model usable visual understanding.
 
-If the extension is not connected this tool returns a message. Do not retry —
+If the extension is not connected this tool returns a message. Do not retry -
 report it to the user and ask them to open the bob Chrome extension in Chrome.
 """
 
@@ -97,6 +99,11 @@ BROWSER_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Text to type. Required for 'type_text'.",
         },
+        "quality": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Optional screenshot detail level. When omitted, Bob auto-picks based on context pressure.",
+        },
     },
     "required": ["action"],
 }
@@ -105,46 +112,6 @@ _NOT_CONNECTED = (
     "Chrome extension not connected. Ask the user to open the bob Chrome extension "
     "in their browser. Once connected, you can control their active Chrome tab."
 )
-
-# ~50k tokens — safe ceiling for base64 image data in context
-_SCREENSHOT_MAX_CHARS = 200_000
-
-
-def _compress_or_reject_screenshot(raw: str) -> str:
-    """Try to resize the screenshot to fit within _SCREENSHOT_MAX_CHARS.
-
-    Attempts progressively lower resolutions/quality using Pillow.
-    Returns a guidance message if Pillow is unavailable or the image
-    cannot be compressed small enough.
-    """
-    try:
-        import base64 as _b64
-        import io as _io
-        from PIL import Image as _Image  # type: ignore[import]
-
-        # Strip data URL prefix if present (data:image/png;base64,...)
-        b64 = raw.split(",", 1)[1] if "," in raw else raw
-        img = _Image.open(_io.BytesIO(_b64.b64decode(b64))).convert("RGB")
-
-        for max_w, quality in [(960, 75), (640, 60), (480, 50)]:
-            if img.width > max_w:
-                ratio = max_w / img.width
-                img = img.resize((max_w, int(img.height * ratio)), _Image.LANCZOS)
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality)
-            compressed = _b64.b64encode(buf.getvalue()).decode()
-            if len(compressed) <= _SCREENSHOT_MAX_CHARS:
-                return compressed
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    return (
-        f"Screenshot captured but too large to include in context "
-        f"({len(raw):,} chars ≈ {len(raw) // 4:,} tokens — model limit would be exceeded). "
-        "Use get_page_text to read this page as text instead."
-    )
 
 
 async def browser_handler(tool_input: dict, context: "ToolContext") -> str:
@@ -180,8 +147,37 @@ async def browser_handler(tool_input: dict, context: "ToolContext") -> str:
 
     try:
         result = await bridge.send_command(action, params)
-        if action == "screenshot" and len(result) > _SCREENSHOT_MAX_CHARS:
-            result = _compress_or_reject_screenshot(result)
+        if action == "screenshot":
+            compatibility, _ = session.get_model_runtime(session.config.model)
+            if not getattr(compatibility, "supports_vision", False):
+                return (
+                    f"Screenshot captured, but current model '{session.config.model}' is not configured for vision. "
+                    "Bob skipped attaching the raw image to avoid bloating context. "
+                    "Use get_page_text/get_page_html or switch to a vision-capable model."
+                )
+
+            prepared = prepare_base64_image_for_model(
+                result,
+                session=session,
+                prompt_text="screenshot visual inspection",
+                requested=tool_input.get("quality"),
+            )
+            attach = getattr(context, "attach_image", None)
+            if attach is None:
+                return (
+                    f"Screenshot prepared (detail={prepared.detail_level}, "
+                    f"approx_tokens={prepared.approx_tokens:,}) but attachment is not supported in this mode."
+                )
+            await attach(
+                "browser-screenshot",
+                prepared.mime,
+                prepared.data_url.split(",", 1)[1],
+                detail_level=prepared.detail_level,
+            )
+            return (
+                f"Screenshot attached: detail={prepared.detail_level}, "
+                f"approx_tokens={prepared.approx_tokens:,}, mime={prepared.mime}"
+            )
         return result
     except RuntimeError as exc:
         return f"Browser error: {exc}"

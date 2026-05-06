@@ -16,6 +16,7 @@ class InputTextContent(BaseModel):
 class InputImageContent(BaseModel):
     type: Literal["input_image"] = "input_image"
     image_url: str  # file:// or https:// or base64 data URL
+    detail: Optional[Literal["low", "medium", "high"]] = None
 
 
 class OutputTextContent(BaseModel):
@@ -41,6 +42,7 @@ class TextUserInput(BaseModel):
 class ImageUserInput(BaseModel):
     type: Literal["image"] = "image"
     path: Path  # local image path
+    detail: Optional[Literal["low", "medium", "high"]] = None
 
 
 UserInput = Annotated[

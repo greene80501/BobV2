@@ -364,10 +364,17 @@ def _parse_at_images(text: str) -> tuple[str, list]:
 
     def _replace(m):
         raw = m.group(1).rstrip(".,;:!?")  # strip trailing punctuation
-        p = _P(raw)
+        detail = None
+        base = raw
+        if "#" in raw:
+            base_candidate, detail_candidate = raw.rsplit("#", 1)
+            if detail_candidate in {"low", "medium", "high"}:
+                base = base_candidate
+                detail = detail_candidate
+        p = _P(base)
         if p.suffix.lower() in _IMAGE_EXTS:
             if p.exists():
-                image_paths.append(p.resolve())
+                image_paths.append((p.resolve(), detail))
                 return ""  # remove from text
         return m.group(0)  # leave non-image @mentions unchanged
 
@@ -1170,6 +1177,54 @@ class Interface:
         session_id = getattr(self._session, "session_id", "session")
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         return logs_dir / f"{stamp}-{session_id}.log"
+
+    def _format_startup_path(self, path: Path | str | None) -> str:
+        if not path:
+            return "not available"
+        try:
+            resolved = Path(path)
+        except TypeError:
+            return str(path)
+        try:
+            return str(resolved.relative_to(self._session.bob_home))
+        except Exception:
+            return str(resolved)
+
+    def _format_bob_home_path(self) -> str:
+        bob_home = getattr(self._session, "bob_home", None)
+        if not bob_home:
+            return "not available"
+        try:
+            resolved = Path(bob_home)
+            home = Path.home()
+            text = str(resolved)
+            home_text = str(home)
+            if text.startswith(home_text):
+                return "~" + text[len(home_text):]
+            return text
+        except Exception:
+            return str(bob_home)
+
+    def _startup_log_rows(self) -> list[str]:
+        bob_home = self._format_bob_home_path()
+        action_log = self._format_startup_path(getattr(self._session, "action_log_path", None))
+        tui_log = self._format_startup_path(self._session_log_path)
+        rollout = self._format_startup_path(getattr(self._session, "current_rollout_path", None))
+        return [
+            f"  {_bd('Session Files')}",
+            f"  {_d('bob_home')} {bob_home}",
+            f"  {_d('action')}   {action_log}",
+            f"  {_d('tui')}      {tui_log}",
+            f"  {_d('rollout')}  {rollout}",
+        ]
+
+    def _print_startup_log_info(self) -> None:
+        lines = self._startup_log_rows()
+        out = sys.__stdout__
+        for line in lines:
+            out.write(line + "\n")
+        out.flush()
+        self._log_terminal_block("startup_paths", lines)
 
     def _log_ui_line(self, text: str) -> None:
         cleaned = str(text).replace("\r", "")
@@ -4250,6 +4305,7 @@ class Interface:
         ps: PromptSession = _make_session()
 
         self._print_header()   # rich Panel — before patch_stdout
+        self._print_startup_log_info()
 
         with patch_stdout():
             global _UI_LOG_SINK
@@ -4351,9 +4407,10 @@ class Interface:
                         from bob.protocol.items import ImageUserInput as _ImgInput
                         cleaned_text, image_paths = _parse_at_images(full_text)
                         items: list = [TextUserInput(type="text", text=cleaned_text or full_text)]
-                        for img_path in image_paths:
-                            items.append(_ImgInput(type="image", path=img_path))
-                            _p(f"  {_d(f'📎 attached: {img_path.name}')}")
+                        for img_path, detail in image_paths:
+                            items.append(_ImgInput(type="image", path=img_path, detail=detail))
+                            suffix = f" ({detail})" if detail else ""
+                            _p(f"  {_d(f'📎 attached: {img_path.name}{suffix}')}")
                         await self._session.submit(UserTurnOp(items=items))
                         
                         # Reset thinking budget after turn

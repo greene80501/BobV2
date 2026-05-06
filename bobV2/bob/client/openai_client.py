@@ -33,6 +33,24 @@ from bob.llm.client import (  # noqa: E402
 )
 
 
+def _normalize_responses_input_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        copied = dict(item)
+        if copied.get("role") == "user" and isinstance(copied.get("content"), list):
+            content_items: list[dict[str, Any]] = []
+            for part in copied["content"]:
+                if not isinstance(part, dict):
+                    continue
+                entry = dict(part)
+                if entry.get("type") == "input_image":
+                    entry.pop("detail", None)
+                content_items.append(entry)
+            copied["content"] = content_items
+        normalized.append(copied)
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Internal state used while buffering a single tool call
 # ---------------------------------------------------------------------------
@@ -223,7 +241,7 @@ class BobClient:
 
         build_kwargs: dict[str, Any] = {
             "model": self.model,
-            "input": input,
+            "input": _normalize_responses_input_items(input),
             "instructions": instructions,
             "stream": True,
             "temperature": temperature,

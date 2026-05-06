@@ -224,8 +224,10 @@ def detect_escalation(command: list[str]) -> str | None:
 
 
 def _stream_idle_timeout_seconds(session: "BobSession") -> float:
-    exec_timeout = float(getattr(session.config, "exec_timeout_seconds", 120) or 120)
-    return max(15.0, min(60.0, exec_timeout * 0.25))
+    configured = float(
+        getattr(session.config, "provider_stream_idle_timeout_seconds", 90) or 90
+    )
+    return max(15.0, min(900.0, configured))
 
 
 async def _next_stream_event(
@@ -332,19 +334,26 @@ async def run_turn(
     # Build user message content and add to history                      #
     # ------------------------------------------------------------------ #
     user_content: list[dict] = []
+    prompt_text = "\n".join(item.text for item in op.items if item.type == "text")
     for item in op.items:
         if item.type == "text":
             user_content.append({"type": "input_text", "text": item.text})
         elif item.type == "image":
-            import base64
+            from bob.core.image_payloads import prepare_local_image_for_model
             try:
-                data = item.path.read_bytes()
-                b64 = base64.b64encode(data).decode()
                 suffix = item.path.suffix.lower().lstrip(".")
                 mime = f"image/{suffix if suffix in ('png', 'jpg', 'jpeg', 'gif', 'webp') else 'png'}"
+                prepared = prepare_local_image_for_model(
+                    item.path,
+                    mime_hint=mime,
+                    session=session,
+                    prompt_text=prompt_text,
+                    requested=getattr(item, "detail", None),
+                )
                 user_content.append({
                     "type": "input_image",
-                    "image_url": f"data:{mime};base64,{b64}",
+                    "image_url": prepared.data_url,
+                    "detail": prepared.detail_level,
                 })
             except OSError:
                 pass
@@ -729,6 +738,16 @@ async def run_turn(
                         "turn_id": turn_id,
                         "results": tool_results,
                     })
+
+                attachment_message = session.consume_pending_image_message()
+                if attachment_message:
+                    session.context_manager.record_items([attachment_message])
+                    if session._recorder:
+                        await session._recorder.write({
+                            "type": "response_item",
+                            "turn_id": turn_id,
+                            "item": attachment_message,
+                        })
 
                 if getattr(session.config, "enable_mid_turn_compaction", True):
                     from bob.core.context_budget import compute_context_budget

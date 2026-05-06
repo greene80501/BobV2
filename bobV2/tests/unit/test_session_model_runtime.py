@@ -71,6 +71,7 @@ def test_session_uses_litellm_for_anthropic(monkeypatch) -> None:
     assert client.kwargs["api_key"] == "anthropic-key"
     assert client.kwargs["model"] == "anthropic/claude-3.5-sonnet"
     assert client.kwargs["env_overrides"] == {}
+    assert client.kwargs["default_timeout_seconds"] == 90.0
     assert session._model_compatibility.provider == "anthropic"
 
 
@@ -135,4 +136,5 @@ def test_session_passes_kimi_openai_compatible_defaults(monkeypatch) -> None:
     assert client.kwargs["model"] == "openai/kimi-for-coding"
     assert client.kwargs["base_url"] == "https://api.kimi.com/coding/v1"
     assert client.kwargs["provider_kwargs"]["extra_headers"]["X-Client-Name"] == "claude-code"
+    assert client.kwargs["default_timeout_seconds"] == 90.0
     assert session._model_compatibility.provider == "kimi"
