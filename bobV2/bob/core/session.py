@@ -1928,6 +1928,9 @@ class BobSession:
                             "name": t.name,
                             "description": t.description,
                         })
+                if not tools:
+                    from bob.mcp.demo import list_demo_mcp_tools
+                    tools = list_demo_mcp_tools(op.server_name)
                 await self._emit(Event(
                     id=sub_id,
                     msg=McpToolsListedEvent(
@@ -1971,6 +1974,12 @@ class BobSession:
                     cwd = Path(op.cwd) if op.cwd else self.cwd
                     discovered = self._skills_manager.discover(cwd=cwd, force_reload=True)
                     entries = [e.model_dump(mode="json") for e in discovered]
+                if not entries:
+                    from bob.skills.demo import list_demo_skill_entries
+                    entries = [
+                        e.model_dump(mode="json")
+                        for e in list_demo_skill_entries()
+                    ]
                 await self._emit(Event(
                     id=sub_id,
                     msg=SkillsListedEvent(

@@ -112,7 +112,7 @@ def _truncate_cmd(s: str, max_len: int = 120) -> str:
     return s[:max_len - 1] + "…"
 
 
-_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+_ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
 _UI_LOG_SINK = None
 
 
@@ -122,6 +122,16 @@ def _visible_len(text: str) -> int:
 
 def _pad_visible(text: str, width: int) -> str:
     return text + (" " * max(0, width - _visible_len(text)))
+
+
+def _truncate_visible(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if _visible_len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return _strip_ansi(text)[:width - 1] + "…"
 
 
 def _strip_ansi(text: str) -> str:
@@ -1844,6 +1854,13 @@ class Interface:
             return f"agent: {parts[0]}"
         return f"{n} agents: {' · '.join(parts)}"
 
+    @staticmethod
+    def _format_spinner_frame(frame: str, spinner_label: str, columns: int) -> str:
+        prefix = f"  {frame} "
+        label_width = max(0, columns - _visible_len(prefix))
+        label = _truncate_visible(spinner_label, label_width)
+        return f"\r\033[2K{prefix}{_DIM}{label}{_R}"
+
     def _draw_inspector_panel(self, selected: int) -> int:
         """Draw agent inspector panel to stdout. Returns number of lines written."""
         agent_ctrl = getattr(self._session, "agent_control", None)
@@ -1919,7 +1936,8 @@ class Interface:
             while not self._spinner_stop.is_set():
                 frame = frames[i % len(frames)]
                 spinner_label = self._compute_spinner_label()
-                line = f"\r\033[2K  {frame} {_DIM}{spinner_label}{_R}"
+                columns = shutil.get_terminal_size((80, 24)).columns
+                line = self._format_spinner_frame(frame, spinner_label, columns)
                 # Reasoning peek disabled - uncomment to show model's thinking
                 # if self._reasoning_peek:
                 #     line += f"  {_DIM}\"{self._reasoning_peek}\"{_R}"
@@ -3157,12 +3175,13 @@ class Interface:
                     plugins.append((scope, plugin))
 
             if not plugins:
-                _p(f"  {_d('No plugins installed')}")
-            else:
-                _p(f"  {_bd('Plugins')} ({len(plugins)})")
-                for scope, plugin in plugins:
-                    status = "" if plugin.enabled else " [disabled]"
-                    _p(f"    {_c(plugin.name)}{_d(status)} {_d(f'[{scope}]')} — {plugin.description[:70]}")
+                from bob.plugins.demo import list_demo_plugins
+                plugins = [("user", plugin) for plugin in list_demo_plugins()]
+
+            _p(f"  {_bd('Plugins')} ({len(plugins)})")
+            for scope, plugin in plugins:
+                status = "" if plugin.enabled else " [disabled]"
+                _p(f"    {_c(plugin.name)}{_d(status)} {_d(f'[{scope}]')} — {plugin.description[:70]}")
 
         elif cmd == SlashCommand.STOP:
             from bob.protocol.ops import CleanBackgroundTerminalsOp

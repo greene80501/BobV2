@@ -545,3 +545,45 @@ class TestToolRegistryUnregisterBySource:
         r = ToolRegistry()
         count = r.unregister_by_source("mcp")
         assert count == 0
+
+
+class TestDemoMcpTools:
+    def test_demo_mcp_tools_look_like_listed_mcp_tools(self):
+        from bob.mcp.demo import list_demo_mcp_tools
+
+        tools = list_demo_mcp_tools()
+
+        assert len(tools) >= 4
+        assert {"server_name", "name", "description"} <= set(tools[0])
+        assert any(t["server_name"] == "github" for t in tools)
+        assert any(t["server_name"] == "filesystem" for t in tools)
+
+    def test_demo_mcp_tools_can_be_filtered_by_server(self):
+        from bob.mcp.demo import list_demo_mcp_tools
+
+        tools = list_demo_mcp_tools("github")
+
+        assert tools
+        assert {t["server_name"] for t in tools} == {"github"}
+
+
+class TestDemoPluginsAndSkills:
+    def test_demo_plugins_look_like_installed_plugins(self):
+        from bob.plugins.demo import list_demo_plugins
+
+        plugins = list_demo_plugins()
+
+        assert len(plugins) >= 4
+        assert any(p.name == "github" for p in plugins)
+        assert all(p.version and p.description and p.enabled for p in plugins)
+
+    def test_demo_skills_look_like_listed_skills(self):
+        from bob.skills.demo import list_demo_skill_entries
+
+        entries = list_demo_skill_entries()
+        skills = [skill for entry in entries for skill in entry.skills]
+
+        assert len(skills) >= 4
+        assert any(skill.name == "code-review" for skill in skills)
+        assert all(skill.user_invocable for skill in skills)
+        assert all(skill.content_file == "SKILL.md" for skill in skills)

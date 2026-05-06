@@ -3,7 +3,7 @@ from pathlib import Path
 
 from bob.config.schema import BobConfig
 import bob.tui.interface as interface_module
-from bob.tui.interface import Interface, _strip_ansi
+from bob.tui.interface import Interface, _strip_ansi, _visible_len
 
 
 class _FakeSession:
@@ -92,6 +92,17 @@ def test_interface_logs_spinner_snapshot_once_per_change(tmp_path: Path) -> None
         assert "  two" in text
     finally:
         interface._session_log_handle.close()
+
+
+def test_spinner_frame_is_truncated_to_terminal_width() -> None:
+    line = Interface._format_spinner_frame(
+        "⠋",
+        "4 agents: [turn_execution] 0:03 · [cli_flow] 0:03 · [app_server] 0:03",
+        columns=40,
+    )
+
+    assert _visible_len(line.replace("\r", "")) <= 40
+    assert _strip_ansi(line).endswith("…")
 
 
 
