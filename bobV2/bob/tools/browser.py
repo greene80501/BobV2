@@ -1,6 +1,9 @@
 """Browser control tool that uses the Chrome extension bridge."""
 from __future__ import annotations
 
+import base64
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from bob.core.image_payloads import prepare_base64_image_for_model
@@ -36,6 +39,9 @@ Actions available (once you've determined browser is needed):
   - type_text - type text into the currently focused element (or a given selector).
     Works for standard inputs AND rich text editors (Google Docs, Notion, CodeMirror).
     Use instead of execute_js for typing - not blocked by CSP.
+  - execute_js - last-resort diagnostic only. Many production sites block string
+    JavaScript evaluation via Content Security Policy. Do not use execute_js for
+    simple page inspection; use get_page_text, get_page_html, find_elements, or scroll.
   - screenshot - expensive. On vision-capable models Bob attaches the screenshot as an image
     using low/medium/high detail. On non-vision models Bob refuses to dump raw base64 into
     context because that bloats tokens without giving the model usable visual understanding.
@@ -114,6 +120,43 @@ _NOT_CONNECTED = (
 )
 
 
+_CSP_EXECUTE_JS_MESSAGE = (
+    "JavaScript execution was blocked by this page's Content Security Policy. "
+    "Use get_page_text, get_page_html, find_elements, scroll, click, form_input, "
+    "or type_text instead."
+)
+
+
+def _is_csp_execute_js_error(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "content security policy" in lowered
+        or "unsafe-eval" in lowered
+        or "evaluating a string as javascript violates" in lowered
+    )
+
+
+def _save_screenshot_artifact(result: str, session: Any) -> tuple[Path | None, str]:
+    mime = "image/png"
+    payload = result
+    if result.startswith("data:"):
+        header, _, payload = result.partition(",")
+        if header.startswith("data:") and ";base64" in header:
+            mime = header[5:].split(";", 1)[0] or mime
+
+    suffix = ".jpg" if mime in {"image/jpeg", "image/jpg"} else ".png"
+    bob_home = getattr(session, "bob_home", None)
+    if bob_home is None:
+        return None, mime
+
+    artifacts_dir = Path(bob_home) / "artifacts" / "browser"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    session_id = str(getattr(session, "session_id", "session"))[:8]
+    path = artifacts_dir / f"screenshot-{session_id}-{int(time.time() * 1000)}{suffix}"
+    path.write_bytes(base64.b64decode(payload))
+    return path, mime
+
+
 async def browser_handler(tool_input: dict, context: "ToolContext") -> str:
     session = context._session
     bridge = getattr(session, "_chrome_bridge", None)
@@ -148,11 +191,14 @@ async def browser_handler(tool_input: dict, context: "ToolContext") -> str:
     try:
         result = await bridge.send_command(action, params)
         if action == "screenshot":
+            artifact_path, artifact_mime = _save_screenshot_artifact(str(result), session)
+            artifact_note = f" Saved to {artifact_path}." if artifact_path else ""
             compatibility, _ = session.get_model_runtime(session.config.model)
             if not getattr(compatibility, "supports_vision", False):
                 return (
                     f"Screenshot captured, but current model '{session.config.model}' is not configured for vision. "
-                    "Bob skipped attaching the raw image to avoid bloating context. "
+                    "Bob skipped attaching the raw image to avoid bloating context."
+                    f"{artifact_note} "
                     "Use get_page_text/get_page_html or switch to a vision-capable model."
                 )
 
@@ -177,7 +223,10 @@ async def browser_handler(tool_input: dict, context: "ToolContext") -> str:
             return (
                 f"Screenshot attached: detail={prepared.detail_level}, "
                 f"approx_tokens={prepared.approx_tokens:,}, mime={prepared.mime}"
+                f"{artifact_note}"
             )
+        if action == "execute_js" and _is_csp_execute_js_error(str(result)):
+            return _CSP_EXECUTE_JS_MESSAGE
         return result
     except RuntimeError as exc:
         return f"Browser error: {exc}"

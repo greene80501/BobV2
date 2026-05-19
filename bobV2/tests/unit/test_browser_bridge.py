@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import pytest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from bob.tools.browser import browser_handler
 
@@ -27,6 +30,8 @@ class _FakeSession:
         self._chrome_bridge = bridge
         self.config = SimpleNamespace(model="vision-model")
         self._attachments: list[tuple[str, str, str, str]] = []
+        self.bob_home = Path(tempfile.mkdtemp())
+        self.session_id = "test-session-id"
 
     def get_model_runtime(self, _model: str):
         compatibility = SimpleNamespace(supports_vision=True)
@@ -82,6 +87,7 @@ async def test_browser_handler_attaches_screenshot_instead_of_returning_raw_base
     result = await browser_handler({"action": "screenshot", "quality": "low"}, context)
 
     assert "Screenshot attached" in result
+    assert "Saved to" in result
     assert len(session._attachments) == 1
     assert session._attachments[0][3] == "low"
 
@@ -107,4 +113,26 @@ async def test_browser_handler_skips_screenshot_attachment_for_non_vision_model(
     result = await browser_handler({"action": "screenshot"}, context)
 
     assert "not configured for vision" in result
+    assert "Saved to" in result
     assert session._attachments == []
+
+
+@pytest.mark.asyncio
+async def test_browser_handler_converts_csp_execute_js_error_to_recoverable_message() -> None:
+    class _CspBridge(_FakeBridge):
+        async def send_command(self, action: str, params: dict | None = None) -> str:
+            self.calls.append((action, params or {}))
+            return (
+                "Error: Evaluating a string as JavaScript violates the following "
+                "Content Security Policy directive because 'unsafe-eval' is not allowed."
+            )
+
+    context = _FakeContext(_FakeSession(_CspBridge()))
+
+    result = await browser_handler(
+        {"action": "execute_js", "code": "document.body.innerText.includes('Experience')"},
+        context,
+    )
+
+    assert result.startswith("JavaScript execution was blocked")
+    assert not result.startswith("Error:")

@@ -353,11 +353,15 @@ async function cmdExecuteJs({ code }) {
     return results[0]?.result ?? "";
   } catch (err) {
     const msg = err.message || String(err);
-    if (msg.includes("Content Security Policy") || msg.includes("unsafe-eval")) {
+    if (
+      msg.includes("Content Security Policy") ||
+      msg.includes("unsafe-eval") ||
+      msg.includes("Evaluating a string as JavaScript violates")
+    ) {
       return (
-        "Error: This page blocks eval() via Content Security Policy. " +
-        "Use 'type_text' to type into editors, 'click' to click elements, " +
-        "or 'form_input' for standard HTML input fields."
+        "JavaScript execution was blocked by this page's Content Security Policy. " +
+        "Use 'get_page_text', 'get_page_html', 'find_elements', 'scroll', " +
+        "'click', 'form_input', or 'type_text' instead."
       );
     }
     throw err;
