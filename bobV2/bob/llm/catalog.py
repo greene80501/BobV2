@@ -17,7 +17,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
-_DEFAULT_DB = Path.home() / ".bob" / "llm_database.db"
+from bob.paths import bob_home_path
+
+_DEFAULT_DB = bob_home_path("llm_database.db")
 
 
 class ModelCatalog:
@@ -187,6 +189,7 @@ _catalog: Optional[ModelCatalog] = None
 def get_catalog(db_path: Optional[Path] = None) -> ModelCatalog:
     """Return the shared ModelCatalog instance (lazy-initialized)."""
     global _catalog
-    if _catalog is None:
-        _catalog = ModelCatalog(db_path or _DEFAULT_DB)
+    resolved = db_path or bob_home_path("llm_database.db")
+    if _catalog is None or _catalog.db_path != resolved:
+        _catalog = ModelCatalog(resolved)
     return _catalog

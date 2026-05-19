@@ -21,3 +21,5 @@ cd bobV2
 py -3.11 -m pip install -e .
 bob
 ```
+
+MacBook-specific global setup is documented in [bobV2/MACBOOK_SETUP.md](bobV2/MACBOOK_SETUP.md).

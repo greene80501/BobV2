@@ -15,12 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bob.paths import bob_home_path
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
 def _db_path() -> Path:
-    p = Path.home() / ".bob" / "schedules.db"
+    p = bob_home_path("schedules.db")
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 

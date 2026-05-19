@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+from bob.paths import bob_home
 from bob.plugins.manager import PluginInfo
 
 
 def list_demo_plugins() -> list[PluginInfo]:
-    base = Path.home() / ".bob" / "plugins"
+    base = bob_home() / "plugins"
     return [
         PluginInfo(
             name="github",

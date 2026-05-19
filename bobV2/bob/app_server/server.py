@@ -5,7 +5,6 @@ import json
 import sys
 import time
 import uuid
-from pathlib import Path
 from typing import Any, Optional
 
 from bob.app_server.context import ConnectionContext, RequestContext
@@ -17,16 +16,17 @@ from bob.app_server.router import RpcRouter
 from bob.app_server.routes import ALL_ROUTE_MODULES
 from bob.app_server.schemas import JsonRpcRequest, JsonRpcResponse
 from bob.core.tasks import TaskRuntime
+from bob.paths import bob_home_path
 
 
 class AppServer:
     def __init__(self, logger=None) -> None:
         self.logger = logger
         self.router = RpcRouter()
-        self.event_bus = EventBus(Path.home() / ".bob" / "app_events.sqlite")
+        self.event_bus = EventBus(bob_home_path("app_events.sqlite"))
         self.registry = SessionRegistry(self.event_bus)
         self.task_runtime = TaskRuntime(
-            db_path=Path.home() / ".bob" / "tasks_runtime.sqlite",
+            db_path=bob_home_path("tasks_runtime.sqlite"),
             event_bus=self.event_bus,
             registry=self.registry,
         )

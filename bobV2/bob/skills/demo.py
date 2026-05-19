@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+from bob.paths import bob_home
 from bob.protocol.items import SkillMetadata, SkillsListEntry
 
 
 def list_demo_skill_entries() -> list[SkillsListEntry]:
-    base = Path.home() / ".bob" / "skills"
+    base = bob_home() / "skills"
     skills = [
         SkillMetadata(
             name="code-review",

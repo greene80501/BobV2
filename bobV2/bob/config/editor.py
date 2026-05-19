@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
+from bob.paths import user_config_path
+
 
 def _config_path() -> Path:
-    return Path(os.environ.get("BOB_HOME", Path.home() / ".bob")) / "config.toml"
+    return user_config_path()
 
 
 def _load_raw() -> dict:

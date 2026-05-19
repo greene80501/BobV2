@@ -2,6 +2,8 @@
 
 bob is a terminal AI coding agent. It runs in your shell, reads and edits files, executes commands, and works across every major LLM provider.
 
+MacBook setup guide: [MACBOOK_SETUP.md](MACBOOK_SETUP.md)
+
 ---
 
 ## Requirements
@@ -23,9 +25,12 @@ py -3.11 -m pip install -e .
 ### macOS
 
 ```bash
-cd /path/to/bob_v2_new_code_geb/bobV2
-python3.11 -m pip install -e .
+brew install python@3.11 pipx git
+pipx ensurepath
+pipx install -e /absolute/path/to/bobV2
 ```
+
+For the full MacBook workflow, including running `bob` from any folder and upgrading after `git pull`, see [MACBOOK_SETUP.md](MACBOOK_SETUP.md).
 
 ### Linux
 
@@ -38,7 +43,7 @@ python3.11 -m pip install -e .
 
 ## Set Your API Key (.env recommended)
 
-Best practice: create a `.env` file (project root or `~/.bob/.env`). Bob auto-loads both.
+Best practice: create a `.env` file in the project root or Bob home (`~/.bob/.env` by default). Bob auto-loads both.
 
 ```bash
 cp .env.example .env
@@ -236,6 +241,8 @@ When bob wants to run a shell command:
 ## Config File
 
 Create `~/.bob/config.toml` to set persistent defaults.
+
+If you set `BOB_HOME`, Bob will use `$BOB_HOME/config.toml` and `$BOB_HOME/.env` instead.
 
 Tip: keep secrets in `.env` instead of putting API keys directly in `config.toml`.
 

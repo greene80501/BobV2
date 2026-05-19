@@ -3,16 +3,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from bob.paths import user_env_path
+
 
 def _candidate_env_files(cwd: Path) -> list[Path]:
     """Return candidate .env files in load order (low -> high priority).
 
     Order:
-    1) ~/.bob/.env
+    1) Bob home .env
     2) nearest project .env found by walking cwd upward
     """
     candidates: list[Path] = []
-    user_env = Path.home() / ".bob" / ".env"
+    user_env = user_env_path()
     if user_env.is_file():
         candidates.append(user_env)
 

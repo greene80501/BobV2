@@ -10,6 +10,7 @@ from pathlib import Path
 logger = logging.getLogger("bob.core.session")
 from typing import Optional, AsyncIterator, Any
 from bob.config.schema import BobConfig
+from bob.paths import bob_home
 from bob.protocol.config_types import SandboxPolicy, SandboxMode, AskForApproval
 from bob.protocol.ops import (
     Op, Submission, UserTurnOp, InterruptOp, CompactOp, ShutdownOp,
@@ -187,8 +188,8 @@ class BobSession:
 
     @property
     def bob_home(self) -> Path:
-        """Return the ~/.bob directory (or $BOB_HOME if set)."""
-        return Path(os.environ.get("BOB_HOME", Path.home() / ".bob"))
+        """Return Bob's user data directory."""
+        return bob_home()
 
     @property
     def action_log_path(self) -> Path:

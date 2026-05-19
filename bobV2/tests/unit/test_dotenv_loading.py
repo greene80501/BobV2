@@ -63,3 +63,41 @@ def test_project_dotenv_overrides_blank_user_value(tmp_path: Path, monkeypatch) 
 
     auth = resolve_provider_auth("kimi/kimi-for-coding", cfg)
     assert auth.api_key == "from-project"
+
+
+def test_candidate_env_files_uses_bob_home_override(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "home"
+    bob_home = tmp_path / "custom-bob"
+    project = tmp_path / "workspace" / "repo"
+    nested = project / "src"
+    bob_home.mkdir(parents=True)
+    nested.mkdir(parents=True)
+
+    user_env = bob_home / ".env"
+    project_env = project / ".env"
+    user_env.write_text("OPENAI_API_KEY=user-key\n", encoding="utf-8")
+    project_env.write_text("OPENAI_API_KEY=project-key\n", encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("BOB_HOME", str(bob_home))
+
+    files = _candidate_env_files(nested)
+
+    assert files == [user_env, project_env]
+
+
+def test_load_config_uses_bob_home_user_config(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "home"
+    bob_home = tmp_path / "custom-bob"
+    project = fake_home / "repo"
+    fake_home.mkdir(parents=True)
+    bob_home.mkdir(parents=True)
+    project.mkdir()
+    (bob_home / "config.toml").write_text('model = "gpt-4o"\n', encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("BOB_HOME", str(bob_home))
+
+    cfg = load_config(cwd=project)
+
+    assert cfg.model == "gpt-4o"

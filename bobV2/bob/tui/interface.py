@@ -42,6 +42,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
 from bob.config.schema import BobConfig
+from bob.paths import bob_home, user_config_path
 from bob.tui.markdown_engine import MarkdownRenderStyle, StreamState, create_markdown_engine
 from bob.tui.slash_commands import (
     AVAILABLE_DURING_TASK,
@@ -1552,20 +1553,11 @@ class Interface:
         return None if cancelled else (submitted[0] if submitted else None)
 
     async def _save_config(self):
-        """Save current config to ~/.bob/config.toml"""
-        import toml
-        from pathlib import Path
-        
-        config_path = Path.home() / ".bob" / "config.toml"
-        
-        # Convert config to dict
-        config_dict = self._config.dict()
-        
-        # Write to file
+        """Save current config to Bob's user config file."""
+        from bob.config.editor import _save_raw
+
         try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(config_path, 'w') as f:
-                toml.dump(config_dict, f)
+            _save_raw(self._config.model_dump(mode="json", exclude_none=True))
         except Exception as exc:
             _p(f"  {_y('⚠')} Failed to save config: {exc}")
 
@@ -3116,12 +3108,15 @@ class Interface:
 
         elif cmd == SlashCommand.STATUS:
             sid = self._session.session_id
+            runner = getattr(self._session, "_sandbox_runner", None)
             _p()
             rows = [
                 ("model",    self._config.model),
                 ("sandbox",  self._config.sandbox_mode.value),
+                ("backend",  type(runner).__name__ if runner is not None else "unknown"),
                 ("approval", self._config.ask_for_approval.value),
-                ("cwd",      str(Path.cwd())),
+                ("cwd",      str(self._session.cwd)),
+                ("bob_home", str(bob_home())),
                 ("session",  sid),
             ]
             for key, val in rows:
@@ -3485,12 +3480,18 @@ class Interface:
 
         elif cmd == SlashCommand.DOCTOR:
             import shutil as _shutil
+            from bob.sandbox.base import NoSandbox
             runtime = self._session.describe_model_runtime(self._config.model)
             _p()
             checks: list[tuple[bool, str]] = []
+            runner = getattr(self._session, "_sandbox_runner", None)
+            sandbox_backend = type(runner).__name__ if runner is not None else "unknown"
 
             missing_auth = runtime.get("missing_auth", [])
             checks.append((not missing_auth, f"auth configured for provider '{runtime['provider']}'"))
+            checks.append((sys.version_info >= (3, 11), f"python {sys.version.split()[0]} (requires 3.11+)"))
+            checks.append((bool(_shutil.which("pipx")), "pipx in PATH (recommended global install)"))
+            checks.append((bool(_shutil.which("bob")), "bob is in PATH"))
 
             # 2. Git available
             checks.append((bool(_shutil.which("git")), "git is in PATH"))
@@ -3512,8 +3513,19 @@ class Interface:
             # 5. Node.js available (for js_repl)
             checks.append((bool(_shutil.which("node")), "node.js in PATH (js_repl)"))
 
+            if self._config.sandbox_mode.value == "danger-full-access":
+                checks.append((True, f"sandbox disabled by config ({sandbox_backend})"))
+            elif sys.platform == "darwin":
+                sandbox_ok = runner is not None and not isinstance(runner, NoSandbox)
+                checks.append((sandbox_ok, f"macOS sandbox available ({sandbox_backend})"))
+            else:
+                sandbox_ok = runner is not None and not isinstance(runner, NoSandbox)
+                checks.append((sandbox_ok, f"sandbox backend active ({sandbox_backend})"))
+
             _p("  " + _d(f"model: {runtime['requested_model']}"))
             _p("  " + _d(f"provider: {runtime['provider']}  route: {runtime['route']}  support: {runtime['support_level']}"))
+            _p("  " + _d(f"bob_home: {bob_home()}"))
+            _p("  " + _d(f"config: {user_config_path()}"))
             if runtime.get("canonical_model") and runtime["canonical_model"] != runtime["requested_model"]:
                 _p("  " + _d(f"canonical: {runtime['canonical_model']}"))
 
@@ -3523,6 +3535,8 @@ class Interface:
                 _p(f"  {icon} {label}")
             if missing_auth:
                 _p(f"  {_y('WARN')} Missing provider settings: {', '.join(missing_auth)}")
+            if sys.platform == "darwin" and self._config.sandbox_mode.value != "danger-full-access" and not sandbox_ok:
+                _p(f"  {_y('WARN')} sandbox-exec is unavailable on this Mac; Bob will run commands without seatbelt isolation.")
             for note in runtime.get("notes", [])[:3]:
                 _p(f"  {_d(note)}")
 
@@ -3739,7 +3753,7 @@ class Interface:
             for key, val in config_items:
                 _p(f"  {_d(f'{key:<20}')}  {val}")
             _p()
-            _p(f"  {_d('Config file: ~/.bob/config.toml')}")
+            _p(f"  {_d(f'Config file: {user_config_path()}')}")
             _p(f"  {_d('Edit with: /config edit')}")
             _p()
 
@@ -3768,18 +3782,21 @@ class Interface:
                 _p()
 
         elif cmd == SlashCommand.SESSION:
+            runner = getattr(self._session, "_sandbox_runner", None)
             _p()
             _p(f"  {_b('Session Information:')}")
             _p()
             _p(f"  {_d('Session ID')}     {self._session.session_id}")
             _p(f"  {_d('Model')}          {self._config.model}")
-            _p(f"  {_d('Working dir')}    {Path.cwd()}")
+            _p(f"  {_d('Working dir')}    {self._session.cwd}")
+            _p(f"  {_d('Bob home')}       {bob_home()}")
             _p(f"  {_d('Sandbox mode')}   {self._config.sandbox_mode.value}")
+            _p(f"  {_d('Sandbox impl')}   {type(runner).__name__ if runner is not None else 'unknown'}")
             _p(f"  {_d('Total tokens')}   {self._total_input_tokens + self._total_output_tokens:,}")
             _p()
 
         elif cmd == SlashCommand.MEMORY:
-            memory_path = Path.home() / ".bob" / "memory.md"
+            memory_path = bob_home() / "memory.md"
             if not args.strip():
                 # Show memory contents
                 if memory_path.exists():
@@ -4274,8 +4291,8 @@ class Interface:
 
     async def run(self) -> None:  # noqa: C901
         completer = _SlashCompleter()
-        # Persist history across sessions in ~/.bob/history
-        _hist_dir = Path.home() / ".bob"
+        # Persist history across sessions in Bob home.
+        _hist_dir = bob_home()
         _hist_dir.mkdir(parents=True, exist_ok=True)
         _history = FileHistory(str(_hist_dir / "history"))
 

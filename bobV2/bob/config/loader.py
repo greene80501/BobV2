@@ -31,6 +31,7 @@ else:
 
 from bob.config.dotenv import load_dotenv_files
 from bob.config.schema import BobConfig
+from bob.paths import user_config_path
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +92,8 @@ def _find_project_config(cwd: Path) -> dict[str, Any]:
 
 
 def _user_config_path() -> Path:
-    """Return the path to the user-global config file (~/.bob/config.toml)."""
-    return Path.home() / ".bob" / "config.toml"
+    """Return the path to the user-global config file."""
+    return user_config_path()
 
 
 def _load_claude_settings() -> dict[str, Any]:

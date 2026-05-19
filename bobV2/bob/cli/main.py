@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Optional
 import typer
 
+from bob.paths import bob_home
+
 app = typer.Typer(
     name="bob",
     help="bob — Your AI-Powered Development Partner",
@@ -287,19 +289,13 @@ app.add_typer(plugin_app, name="plugin")
 
 
 def _get_plugins_manager():
-    import os
-    from pathlib import Path as _Path
-    plugins_dir = _Path(os.environ.get("BOB_HOME", _Path.home() / ".bob")) / "plugins"
     from bob.plugins.manager import PluginsManager
-    return PluginsManager(plugins_dir)
+    return PluginsManager(bob_home() / "plugins")
 
 
 def _get_plugin_roots(cwd: Optional[Path] = None) -> list[tuple[str, Path]]:
-    import os
-    from pathlib import Path as _Path
-
     active_cwd = (cwd or Path.cwd()).resolve()
-    roots = [("user", _Path(os.environ.get("BOB_HOME", _Path.home() / ".bob")) / "plugins")]
+    roots = [("user", bob_home() / "plugins")]
     repo_root = active_cwd / ".bob" / "plugins"
     if repo_root not in [root for _, root in roots]:
         roots.append(("repo", repo_root))
