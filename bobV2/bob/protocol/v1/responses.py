@@ -66,9 +66,12 @@ class TaskObject(BaseModel):
 
 
 class AgentObject(BaseModel):
+    task_id: Optional[str] = None
     agent_id: str
+    session_id: Optional[str] = None
     path: str
     name: str
+    title: Optional[str] = None
     agent_type: str
     task: str = ""
     status: str
@@ -86,3 +89,6 @@ class AgentObject(BaseModel):
     error: Optional[str] = None
     created_at_ts: Optional[int] = None
     updated_at_ts: Optional[int] = None
+    background: bool = False
+    run_count: int = 0
+    transcript_tail: list[str] = Field(default_factory=list)

@@ -36,8 +36,10 @@ class AgentRunStore:
                     path TEXT NOT NULL,
                     name TEXT NOT NULL,
                     agent_type TEXT NOT NULL,
+                    title TEXT,
                     task TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    session_id TEXT,
                     cwd TEXT,
                     worktree_path TEXT,
                     definition_source TEXT,
@@ -51,28 +53,54 @@ class AgentRunStore:
                     tokens INTEGER NOT NULL DEFAULT 0,
                     last_activity TEXT,
                     started_at_ts INTEGER,
+                    completed_at_ts INTEGER,
+                    background INTEGER NOT NULL DEFAULT 0,
+                    run_count INTEGER NOT NULL DEFAULT 0,
+                    group_id TEXT,
+                    group_size INTEGER NOT NULL DEFAULT 0,
+                    group_index INTEGER NOT NULL DEFAULT 0,
                     created_at_ts INTEGER NOT NULL,
                     updated_at_ts INTEGER NOT NULL
                 )
                 """
             )
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(agent_runs)").fetchall()
+            }
+            for name, ddl in (
+                ("title", "ALTER TABLE agent_runs ADD COLUMN title TEXT"),
+                ("session_id", "ALTER TABLE agent_runs ADD COLUMN session_id TEXT"),
+                ("completed_at_ts", "ALTER TABLE agent_runs ADD COLUMN completed_at_ts INTEGER"),
+                ("background", "ALTER TABLE agent_runs ADD COLUMN background INTEGER NOT NULL DEFAULT 0"),
+                ("run_count", "ALTER TABLE agent_runs ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0"),
+                ("group_id", "ALTER TABLE agent_runs ADD COLUMN group_id TEXT"),
+                ("group_size", "ALTER TABLE agent_runs ADD COLUMN group_size INTEGER NOT NULL DEFAULT 0"),
+                ("group_index", "ALTER TABLE agent_runs ADD COLUMN group_index INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in existing:
+                    conn.execute(ddl)
 
     def upsert_record(self, thread_id: str, record: Any) -> None:
         now = _now_ms()
         created_at = int((getattr(record, "started_at", 0.0) or 0.0) * 1000) or now
         started_at_ts = int((getattr(record, "started_at", 0.0) or 0.0) * 1000) or None
+        completed_at_ts = int((getattr(record, "completed_at", 0.0) or 0.0) * 1000) or None
         merge_success = getattr(record, "merge_success", None)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO agent_runs (
-                    agent_id, thread_id, path, name, agent_type, task, status,
+                    agent_id, thread_id, path, name, agent_type, title, task, status, session_id,
                     cwd, worktree_path, definition_source, isolation_mode, permission_mode,
                     result, error, merge_status, merge_success, tool_uses, tokens,
-                    last_activity, started_at_ts, created_at_ts, updated_at_ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_activity, started_at_ts, completed_at_ts, background, run_count,
+                    group_id, group_size, group_index, created_at_ts, updated_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id) DO UPDATE SET
+                    title=excluded.title,
                     status=excluded.status,
+                    session_id=excluded.session_id,
                     cwd=excluded.cwd,
                     worktree_path=excluded.worktree_path,
                     definition_source=excluded.definition_source,
@@ -86,6 +114,12 @@ class AgentRunStore:
                     tokens=excluded.tokens,
                     last_activity=excluded.last_activity,
                     started_at_ts=COALESCE(excluded.started_at_ts, agent_runs.started_at_ts),
+                    completed_at_ts=excluded.completed_at_ts,
+                    background=excluded.background,
+                    run_count=excluded.run_count,
+                    group_id=excluded.group_id,
+                    group_size=excluded.group_size,
+                    group_index=excluded.group_index,
                     updated_at_ts=excluded.updated_at_ts
                 """,
                 (
@@ -93,9 +127,11 @@ class AgentRunStore:
                     thread_id,
                     str(record.path),
                     record.path.name,
-                    getattr(record, "agent_type", "worker"),
+                    getattr(record, "agent_type", "general"),
+                    getattr(record, "title", None),
                     record.task,
                     record.status.value,
+                    getattr(record, "session_id", None),
                     getattr(record, "cwd", None),
                     getattr(record, "worktree_path", None),
                     getattr(record, "definition_source", None),
@@ -109,6 +145,12 @@ class AgentRunStore:
                     getattr(record.progress, "token_count", 0),
                     getattr(record.progress, "last_activity", ""),
                     started_at_ts,
+                    completed_at_ts,
+                    1 if bool(getattr(record, "background", False)) else 0,
+                    int(getattr(record, "run_count", 0) or 0),
+                    getattr(record, "group_id", None),
+                    int(getattr(record, "group_size", 0) or 0),
+                    int(getattr(record, "group_index", 0) or 0),
                     created_at,
                     now,
                 ),
@@ -150,8 +192,10 @@ class AgentRunStore:
             "path": row["path"],
             "name": row["name"],
             "agent_type": row["agent_type"],
+            "title": row["title"],
             "task": row["task"],
             "status": row["status"],
+            "session_id": row["session_id"],
             "cwd": row["cwd"],
             "worktree_path": row["worktree_path"],
             "definition_source": row["definition_source"],
@@ -167,4 +211,10 @@ class AgentRunStore:
             "created_at_ts": row["created_at_ts"],
             "updated_at_ts": row["updated_at_ts"],
             "started_at_ts": row["started_at_ts"],
+            "completed_at_ts": row["completed_at_ts"],
+            "background": bool(row["background"]),
+            "run_count": row["run_count"],
+            "group_id": row["group_id"],
+            "group_size": row["group_size"],
+            "group_index": row["group_index"],
         }

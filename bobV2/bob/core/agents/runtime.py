@@ -7,6 +7,12 @@ from typing import Optional
 from pydantic import BaseModel, Field, model_validator
 
 
+class AgentMode(str, Enum):
+    PRIMARY = "primary"
+    SUBAGENT = "subagent"
+    ALL = "all"
+
+
 class AgentIsolationMode(str, Enum):
     SHARED_WORKSPACE = "shared_workspace"
     GIT_WORKTREE = "git_worktree"
@@ -21,7 +27,12 @@ class AgentDefinition(BaseModel):
     name: str
     description: str = ""
     instructions: str = ""
+    mode: AgentMode = AgentMode.ALL
+    hidden: bool = False
     model: Optional[str] = None
+    prompt: Optional[str] = None
+    color: Optional[str] = None
+    steps: Optional[int] = None
     allowed_tools: list[str] = Field(default_factory=list)
     fork_mode: str = "none"
     isolation_mode: AgentIsolationMode = AgentIsolationMode.SHARED_WORKSPACE

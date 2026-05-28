@@ -70,6 +70,7 @@ class SlashCommand(str, Enum):
     THINK = "think"
     BRIEF = "brief"
     TASKS = "tasks"
+    AGENTS = "agents"
     # Chrome extension bridge
     BOB_IN_CHROME = "bob-in-chrome"
 
@@ -138,6 +139,7 @@ COMMAND_DESCRIPTIONS: dict[SlashCommand, str] = {
     SlashCommand.THINK: "set thinking budget for next turn: /think [tokens]",
     SlashCommand.BRIEF: "alias for /output-style brief",
     SlashCommand.TASKS: "list all tasks or filter by status: /tasks [status]",
+    SlashCommand.AGENTS: "manage and message running subagents",
     # Chrome bridge
     SlashCommand.BOB_IN_CHROME: "toggle Chrome extension browser bridge on/off",
 }
@@ -158,7 +160,7 @@ SUPPORTS_INLINE_ARGS: set[SlashCommand] = {
     SlashCommand.MODEL, SlashCommand.EFFORT, SlashCommand.ANALYTICS,
     SlashCommand.TOKENS, SlashCommand.BRANCH,
     SlashCommand.EXPORT, SlashCommand.REWIND, SlashCommand.CONTEXT,
-    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK,
+    SlashCommand.OUTPUT_STYLE, SlashCommand.THINK, SlashCommand.AGENTS,
 }
 
 

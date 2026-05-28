@@ -5,7 +5,8 @@ from typing import Any
 from bob.tools.path_utils import resolve_tool_path
 
 READ_FILE_DESCRIPTION = (
-    "Read the contents of a file. Supports partial reads via start_line/end_line. "
+    "Read the contents of a file. Use this only for actual files, not directories; "
+    "use list_dir for directories. Supports partial reads via start_line/end_line. "
     "Lines are 1-indexed and inclusive. Output is capped at 10,000 lines."
 )
 
@@ -14,7 +15,10 @@ READ_FILE_SCHEMA = {
     "properties": {
         "path": {
             "type": "string",
-            "description": "Path to the file to read (relative to cwd or absolute).",
+            "description": (
+                "Path to the file to read (relative to cwd or absolute). "
+                "This must point to a file, not a directory."
+            ),
         },
         "start_line": {
             "type": "integer",
@@ -47,6 +51,8 @@ async def read_file_handler(tool_input: dict, context: Any) -> str:
     if not p.exists():
         return f"Error: file not found: {p}"
     if not p.is_file():
+        if p.is_dir():
+            return f"Error: not a file: {p}. This path is a directory; use list_dir to inspect directories."
         return f"Error: not a file: {p}"
 
     try:

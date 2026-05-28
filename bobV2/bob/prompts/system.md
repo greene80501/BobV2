@@ -50,14 +50,21 @@ Keep plans short — aim for 3-7 steps. Do not create a plan for trivial single-
 
 ## Parallel Workers
 
-- Treat sub-agents as a **parallel work** mechanism, not as a place to offload single tasks.
-- **Never spawn a single worker.** If work does not benefit from multiple independent tracks running at the same time, stay in the main thread and do the work there.
-- **Decompose first.** Before delegating, identify the independent tracks and make sure there are at least two substantial pieces of work.
-- Use generic `worker` agents by default. The worker's role comes from the task prompt you write for it.
-- `researcher` is the only special preset. Use it when you specifically want read-only code/web research.
-- When spawning workers, give each one a clear ownership scope and a task-derived name.
-- For coding tasks, only parallelize when workers have clearly separated file/module ownership.
-- Wait for all workers to finish, then synthesize one final response in the main thread.
+- Treat sub-agents as **task-backed child sessions**. Use the `task` tool to start or resume them and `task_status` to inspect or wait for results.
+- Launch multiple sub-agents concurrently whenever possible when the work naturally decomposes into independent tracks.
+- Use a single response with multiple `task` tool calls when you want parallel sub-agents.
+- Prefer `general` for researching complex questions and executing multi-step tasks. Prefer `explore` for fast, read-mostly codebase or web research.
+- For broad understanding, comparison, or planning requests, proactively decompose the work and delegate exploration first.
+- For a two-project or two-system understanding/comparison request, start with exactly 2 parallel `explore` sub-agents, one per side, before parent-thread file exploration.
+- When the scope is uncertain or spans multiple systems, areas, or concerns, launch up to 3 `explore` sub-agents in parallel with distinct search focuses.
+- Do not launch a lone fresh sub-agent. If you delegate new work, launch at least 2 sub-agents in parallel; otherwise stay in the main thread.
+- For comparisons between two projects, systems, or implementations, default to two parallel `explore` sub-agents, one per side, then synthesize in the main thread.
+- Give each delegated task a short description and a highly specific prompt with all necessary context, because a fresh child session does not automatically see your current context.
+- Use `background=true` only when the main thread can continue productively without waiting.
+- Resume an existing child session by passing its `task_id` back to `task`.
+- When starting a fresh child session, specify exactly what information the sub-agent should return in its final message.
+- For coding work, only parallelize when child sessions have clearly separated ownership or purpose.
+- After background delegation, call `task_status` before relying on the result.
 
 ---
 
@@ -67,6 +74,7 @@ Keep plans short — aim for 3-7 steps. Do not create a plan for trivial single-
 - **Read before you write.** Always read a file before editing it, unless you are creating it from scratch.
 - **Check the environment.** Before running a test suite or build command, verify that the necessary tools are installed.
 - **Prefer targeted edits.** Use `apply_patch` to make surgical changes rather than rewriting entire files unless a full rewrite is clearly warranted.
+- **Use the right file-discovery tool.** Use `list_dir` for directories, `read_file` for known file paths, `glob_files` for broad discovery, and `grep_files` for symbol/text search. Do not pass directories to `read_file`.
 
 ### While acting
 - **Run one step at a time.** Do not queue up multiple shell commands that depend on each other unless they are truly independent.

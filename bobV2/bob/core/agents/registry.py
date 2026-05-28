@@ -18,7 +18,12 @@ class AgentStatus(str, Enum):
 
     @property
     def is_terminal(self) -> bool:
-        return self in (AgentStatus.COMPLETED, AgentStatus.ERRORED, AgentStatus.SHUTDOWN)
+        return self in (
+            AgentStatus.COMPLETED,
+            AgentStatus.ERRORED,
+            AgentStatus.INTERRUPTED,
+            AgentStatus.SHUTDOWN,
+        )
 
 
 @dataclass
@@ -40,11 +45,13 @@ class AgentRecord:
     agent_id: str
     path: "AgentPath"
     task: str
-    agent_type: str = "worker"
+    title: str = ""
+    agent_type: str = "general"
     status: AgentStatus = AgentStatus.PENDING
     progress: AgentProgress = field(default_factory=AgentProgress)
     result: Optional[str] = None
     error: Optional[str] = None
+    session_id: Optional[str] = None
     cwd: Optional[str] = None
     worktree_path: Optional[str] = None
     definition_source: Optional[str] = None
@@ -53,6 +60,13 @@ class AgentRecord:
     merge_status: Optional[str] = None
     merge_success: Optional[bool] = None
     started_at: float = 0.0
+    completed_at: float = 0.0
+    background: bool = False
+    run_count: int = 0
+    group_id: Optional[str] = None
+    group_size: int = 0
+    group_index: int = 0
+    transcript_tail: list[str] = field(default_factory=list)
     _done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 

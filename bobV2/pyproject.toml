@@ -38,6 +38,7 @@ windows = ["pywin32>=306"]
 
 [project.scripts]
 bob = "bob.cli.main:cli_main"
+bob_v2 = "bob.cli.main:cli_main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

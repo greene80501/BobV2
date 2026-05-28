@@ -12,11 +12,13 @@ def test_definition_registry_exposes_builtin_agent_types(tmp_path: Path) -> None
 
     names = {definition.name for definition in registry.list_all()}
 
-    assert "worker" in names
-    assert "researcher" in names
-    assert "planner" not in names
-    assert "implementer" not in names
-    assert "reviewer" not in names
+    assert "build" in names
+    assert "plan" in names
+    assert "general" in names
+    assert "explore" in names
+    assert "scout" in names
+    assert "worker" not in names
+    assert "researcher" not in names
 
 
 def test_definition_registry_prefers_repo_over_user_scope(tmp_path: Path) -> None:
@@ -83,10 +85,10 @@ def test_definition_registry_loads_instructions_from_agent_markdown(tmp_path: Pa
     assert definition.instructions == "Review the auth and sandbox changes."
 
 
-def test_definition_registry_unknown_builtin_falls_back_to_worker_shape(tmp_path: Path) -> None:
+def test_definition_registry_unknown_builtin_falls_back_to_general_shape(tmp_path: Path) -> None:
     registry = AgentDefinitionRegistry(tmp_path / "home", tmp_path / "repo")
 
-    worker = registry.find("worker")
+    worker = registry.find("general")
     unknown = registry.find("planner")
 
     assert worker is not None

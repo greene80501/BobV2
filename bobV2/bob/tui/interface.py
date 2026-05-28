@@ -1832,6 +1832,22 @@ class Interface:
 
     # ── Agent inspector helpers ───────────────────────────────────────────────
 
+    @staticmethod
+    def _pretty_agent_name(name: str) -> str:
+        text = str(name or "subagent").replace("_", " ").strip()
+        words = []
+        for word in text.split():
+            lower = word.lower()
+            if lower == "bob":
+                words.append("Bob")
+            elif lower == "v2":
+                words.append("V2")
+            elif lower == "opencode":
+                words.append("OpenCode")
+            else:
+                words.append(word.capitalize())
+        return " ".join(words) or "Subagent"
+
     def _compute_spinner_label(self) -> str:
         if not self._active_agents:
             return self._spinner_label
@@ -1840,11 +1856,12 @@ class Interface:
         for info in self._active_agents.values():
             elapsed = int(now - info["started_at"])
             timer = f"{elapsed // 60}:{elapsed % 60:02d}"
-            parts.append(f"[{info['name']}] {timer}")
+            label = _truncate_visible(self._pretty_agent_name(info["name"]), 24)
+            parts.append(f"{label} {timer}")
         n = len(parts)
         if n == 1:
-            return f"agent: {parts[0]}"
-        return f"{n} agents: {' · '.join(parts)}"
+            return f"subagent working · {parts[0]} · ↑↓ details"
+        return f"{n} subagents working · {' · '.join(parts)} · ↑↓ details"
 
     @staticmethod
     def _format_spinner_frame(frame: str, spinner_label: str, columns: int) -> str:
@@ -1864,22 +1881,29 @@ class Interface:
         selected = min(selected, len(records) - 1)
         now = time.time()
         out = sys.__stdout__
-        lines = 0
-        out.write(f"\r  {_DIM}── agents {'─' * 40}{_R}\n")
-        lines += 1
+        term_w = shutil.get_terminal_size((120, 24)).columns
+        inner_w = max(56, min(term_w - 6, 104))
+        panel_lines: list[str] = [
+            f"  {_bd('╭─')} {_b('subagents')} {_d(f'{len(records)} active')}"
+        ]
         for i, rec in enumerate(records):
             cursor = "▶" if i == selected else " "
             info = self._active_agents.get(rec.agent_id, {})
             t0 = info.get("started_at", now)
             elapsed = int(now - t0)
             timer = f"{elapsed // 60}:{elapsed % 60:02d}"
-            activity = rec.progress.last_activity[:42] if rec.progress.last_activity else "starting…"
-            out.write(f"  {cursor} {_BLD}[{rec.path.name}]{_R} {_DIM}{timer}{_R}  {activity}\n")
-            lines += 1
-        out.write(f"  {_DIM}↑↓ navigate · Enter inspect · Esc close{_R}\n")
-        lines += 1
+            name = _truncate_visible(str(rec.path.name), 28)
+            activity = _truncate_visible(rec.progress.last_activity or "starting…", max(16, inner_w - 48))
+            status = _truncate_visible(str(rec.status.value), 12)
+            panel_lines.append(
+                f"  {_bd('│')} {cursor} {_b(name)}  {_d(status)}  {_s(timer)}  {activity}"
+            )
+        hint = _truncate_visible("↑↓ select · Enter details · Esc close", inner_w - 4)
+        panel_lines.append(f"  {_bd('╰─')} {_d(hint)}")
+        for line in panel_lines:
+            out.write(line + "\n")
         out.flush()
-        return lines
+        return len(panel_lines)
 
     def _clear_inspector_panel(self, lines: int) -> None:
         """Erase the inspector panel by moving cursor up and clearing to end of screen."""
@@ -1902,15 +1926,29 @@ class Interface:
         t0 = info.get("started_at", time.time())
         elapsed = int(time.time() - t0)
         timer = f"{elapsed // 60}:{elapsed % 60:02d}"
+        term_w = shutil.get_terminal_size((120, 24)).columns
+        inner_w = max(56, min(term_w - 6, 104))
+        name = _truncate_visible(str(rec.path.name), inner_w - 16)
         out = sys.__stdout__
-        out.write(f"\r  {_BLD}── {rec.path.name} {_R}{_DIM}{'─' * 36}{_R}\n")
-        out.write(f"  {_DIM}{rec.status.value} · {rec.progress.tool_use_count} tools · {rec.progress.token_count:,} tok · {timer}{_R}\n")
+        lines = [
+            f"  {_bd('╭─')} {_b('subagent')} {_b(name)}",
+            (
+                f"  {_bd('│')} {_d(rec.status.value)}"
+                f"  {_d('·')} {rec.progress.tool_use_count} tools"
+                f"  {_d('·')} {rec.progress.token_count:,} tok"
+                f"  {_d('·')} {timer}"
+            ),
+        ]
         if rec.progress.recent_activities:
-            out.write(f"  {_DIM}recent activity:{_R}\n")
+            lines.append(f"  {_bd('│')} {_d('recent')}")
             for act in rec.progress.recent_activities[-5:]:
-                out.write(f"    {_DIM}·{_R} {act}\n")
+                lines.append(f"  {_bd('│')}   {_d('·')} {_truncate_visible(str(act), inner_w - 8)}")
         if rec.task:
-            out.write(f"  {_DIM}task:{_R} {rec.task[:120]}\n")
+            task = _truncate_visible(str(rec.task).replace("\n", " "), inner_w - 9)
+            lines.append(f"  {_bd('│')} {_d('task')} {task}")
+        lines.append(f"  {_bd('╰─')} {_d('details')}")
+        for line in lines:
+            out.write(line + "\n")
         out.write("\n")
         out.flush()
 
@@ -2519,7 +2557,11 @@ class Interface:
 
                 elif isinstance(msg, AgentSpawnedEvent):
                     await self._stop_spinner()
-                    _p(f"  {_c('⟳')} {_b(f'[{msg.name}]')} {_d('spawned')} {_s(f'· {msg.task[:70]}')}")
+                    title = _truncate_visible(self._pretty_agent_name(msg.name), 42)
+                    task_preview = _truncate_visible(str(msg.task).replace("\n", " "), 88)
+                    _p(f"  {_bd('╭─')} {_d('subagent')} {_b(title)} {_g('started')}")
+                    _p(f"  {_bd('│')} {_s(task_preview)}")
+                    _p(f"  {_bd('╰─')} {_d('press ↑↓ to inspect running subagents')}")
                     self._active_agents[msg.agent_id] = {
                         "name": msg.name,
                         "started_at": time.time(),
@@ -2541,17 +2583,14 @@ class Interface:
                 elif isinstance(msg, AgentCompletedEvent):
                     await self._stop_spinner()
                     if msg.status == "completed":
-                        icon = _g("✓")
                         status_txt = _g("done")
                     elif msg.status == "errored":
-                        icon = _r("✗")
                         status_txt = _r("errored")
                     else:
-                        icon = _y("·")
                         status_txt = _y(msg.status)
                     _p(
-                        f"  {icon} {_b(f'[{msg.name}]')} {status_txt}"
-                        f"  {_d(f'{msg.tool_use_count} tools · {msg.token_count:,} tok')}"
+                        f"  {_d('subagent')} {_b(f'[{msg.name}]')} {status_txt}"
+                        f"  {_d(f'· {msg.tool_use_count} tools · {msg.token_count:,} tok')}"
                     )
                     if msg.status == "errored" and msg.error:
                         _p(f"  {_r('  error:')} {_d(msg.error[:120])}")

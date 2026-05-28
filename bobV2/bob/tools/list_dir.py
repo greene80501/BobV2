@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 from bob.tools.path_utils import resolve_tool_path
 
-LIST_DIR_DESCRIPTION = "List the contents of a directory."
+LIST_DIR_DESCRIPTION = "List the contents of a directory. Use this for folders; use read_file for actual files."
 
 LIST_DIR_SCHEMA = {
     "type": "object",
@@ -39,6 +39,8 @@ async def list_dir_handler(tool_input: dict, context: Any) -> str:
     if not path.exists():
         return f"Error: directory not found: {path}"
     if not path.is_dir():
+        if path.is_file():
+            return f"Error: not a directory: {path}. This path is a file; use read_file to inspect file contents."
         return f"Error: not a directory: {path}"
 
     try:

@@ -5,6 +5,7 @@ from typing import Optional
 
 from bob.core.agents.runtime import (
     AgentDefinition,
+    AgentMode,
     AgentIsolationMode,
     AgentPermissionMode,
 )
@@ -52,7 +53,12 @@ def _load_definition_from_toml(path: Path, *, source: str) -> Optional[AgentDefi
             name=name,
             description=str(data.get("description") or ""),
             instructions=instructions,
+            mode=AgentMode(str(data.get("mode") or AgentMode.ALL.value)),
+            hidden=bool(data.get("hidden", False)),
             model=(str(data.get("model")).strip() if data.get("model") else None),
+            prompt=(str(data.get("prompt")).strip() if data.get("prompt") else None),
+            color=(str(data.get("color")).strip() if data.get("color") else None),
+            steps=(int(data.get("steps")) if data.get("steps") is not None else None),
             allowed_tools=[
                 str(tool).strip()
                 for tool in (data.get("allowed_tools") or [])
@@ -164,29 +170,113 @@ def _builtin_definitions() -> list[AgentDefinition]:
         "mcp_list_resources",
         "mcp_read_resource",
     ]
+    planning_tools = [
+        "list_dir",
+        "read_file",
+        "read_pdf",
+        "glob_files",
+        "grep_files",
+        "view_image",
+        "web_search",
+        "web_fetch",
+        "tool_search",
+        "request_user_input",
+        "mcp_list_resources",
+        "mcp_read_resource",
+        "browser",
+    ]
     return [
         AgentDefinition(
-            name="worker",
-            description="General-purpose background worker for bounded subtasks.",
+            name="build",
+            description="Primary coding agent with the full Bob tool surface.",
             instructions=(
-                "You are a focused background worker. The lead agent decides your task, not a "
-                "hardcoded persona. You may be asked to plan, inspect, implement, review, or "
-                "debug. Complete the assigned task, stay within scope, and return a concise "
-                "summary of what you changed or found."
+                "You are the primary coding agent. Execute tools directly, stay outcome-focused, "
+                "and prefer completing the task in the current thread unless delegation is useful."
             ),
             allowed_tools=coding_tools,
-            fork_mode="none",
+            mode=AgentMode.PRIMARY,
+            fork_mode="all",
             isolation_mode=AgentIsolationMode.GIT_WORKTREE,
             permission_mode=AgentPermissionMode.FULL_AUTO,
         ),
         AgentDefinition(
-            name="researcher",
-            description="Read-only researcher for documentation, repo analysis, and web findings.",
+            name="plan",
+            description="Planning-first primary agent that avoids mutating tools.",
             instructions=(
-                "Act as a researcher. Gather relevant evidence from the codebase and the web, "
-                "then return sourced findings and practical recommendations."
+                "You are in planning mode. Produce decision-complete plans and avoid mutating the "
+                "workspace unless the user explicitly exits planning."
+            ),
+            allowed_tools=planning_tools,
+            mode=AgentMode.PRIMARY,
+            fork_mode="all",
+            isolation_mode=AgentIsolationMode.SHARED_WORKSPACE,
+            permission_mode=AgentPermissionMode.READ_ONLY,
+        ),
+        AgentDefinition(
+            name="general",
+            description=(
+                "General-purpose agent for researching complex questions and executing "
+                "multi-step tasks. Use this agent to execute multiple units of work in parallel."
+            ),
+            instructions=(
+                "You are a general-purpose subagent for researching complex questions and executing "
+                "multi-step tasks. Complete the assigned task autonomously, stay within scope, and "
+                "return a concise result the parent can use immediately."
+            ),
+            allowed_tools=coding_tools,
+            mode=AgentMode.SUBAGENT,
+            fork_mode="all",
+            isolation_mode=AgentIsolationMode.SHARED_WORKSPACE,
+            permission_mode=AgentPermissionMode.FULL_AUTO,
+        ),
+        AgentDefinition(
+            name="explore",
+            description=(
+                "Fast agent specialized for exploring codebases. Use this when you need "
+                "to quickly find files by patterns, search code for keywords, or answer "
+                "questions about how the codebase works."
+            ),
+            instructions=(
+                "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.\n\n"
+                "Your strengths:\n"
+                "- Rapidly finding files using glob patterns\n"
+                "- Searching code and text with powerful regex patterns\n"
+                "- Reading and analyzing file contents\n\n"
+                "Guidelines:\n"
+                "- For repo-understanding work, start from top-level structure, key entrypoints, configuration, and tests before going deeper\n"
+                "- Use glob_files for broad file pattern matching\n"
+                "- Use grep_files for searching file contents with regex\n"
+                "- Use read_file when you know the specific file path you need to read\n"
+                "- Never pass a directory path to read_file; use list_dir for directories\n"
+                "- Adapt your search approach based on the thoroughness level specified by the caller\n"
+                "- Return file paths in your final response\n"
+                "- Do not create any files or run shell commands that modify the user's system state in any way\n\n"
+                "Complete the user's search request efficiently and report your findings clearly."
             ),
             allowed_tools=readonly_tools,
+            mode=AgentMode.SUBAGENT,
+            fork_mode="all",
+            isolation_mode=AgentIsolationMode.SHARED_WORKSPACE,
+            permission_mode=AgentPermissionMode.READ_ONLY,
+        ),
+        AgentDefinition(
+            name="scout",
+            description="External-docs and dependency-source specialist.",
+            instructions=(
+                "You are scout, a read-only research agent for external libraries, dependency source, "
+                "and documentation.\n\n"
+                "Your purpose is to investigate code outside the local workspace and return "
+                "evidence-backed findings without modifying the user's workspace.\n\n"
+                "Use this agent when asked to:\n"
+                "- inspect external documentation or public source references\n"
+                "- compare local code against upstream documentation or public implementations\n"
+                "- explain how a library or framework works by reading its source and docs\n"
+                "- investigate third-party APIs, workflows, or behavior outside the current workspace\n\n"
+                "Prefer direct code and documentation evidence over assumptions. Call out uncertainty "
+                "clearly instead of smoothing over gaps."
+            ),
+            allowed_tools=readonly_tools,
+            mode=AgentMode.SUBAGENT,
             fork_mode="all",
             isolation_mode=AgentIsolationMode.SHARED_WORKSPACE,
             permission_mode=AgentPermissionMode.READ_ONLY,

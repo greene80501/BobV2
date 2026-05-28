@@ -275,6 +275,12 @@ class BobConfig(BaseModel):
     no_color: bool = False
     # Color theme (dark, light, no-color)
     theme: str = "dark"
+    # UI density for prompt/footer/panel rendering.
+    ui_density: Literal["comfortable", "compact"] = "comfortable"
+    # Subagent panel presentation mode.
+    subagent_panel_mode: Literal["auto", "closed", "pinned"] = "auto"
+    # Transcript timestamp mode.
+    transcript_timestamps: Literal["off", "relative"] = "off"
     # Suppress the welcome banner
     quiet: bool = False
     # Show token usage after each turn

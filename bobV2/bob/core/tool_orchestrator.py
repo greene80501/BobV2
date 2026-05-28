@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import re
 import shlex
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from bob.llm.client import ToolCallEvent
 from bob.protocol.config_types import AskForApproval, ExecCommandSource, ExecCommandStatus, ReviewDecision
 from bob.protocol.events import (
     ExecApprovalRequestedEvent,
@@ -78,6 +81,14 @@ class ToolOrchestrator:
         if not policy_calls:
             return tool_results
 
+        policy_calls = await self._enforce_parallel_understanding_delegation(policy_calls, tool_results)
+        if not policy_calls:
+            return tool_results
+
+        policy_calls, task_batches = await self._prepare_task_batches(policy_calls, tool_results)
+        if not policy_calls:
+            return tool_results
+
         parallel_calls: list[Any] = []
         sequential_calls: list[Any] = []
         for tc in policy_calls:
@@ -89,7 +100,7 @@ class ToolOrchestrator:
 
         if parallel_calls:
             parallel_results = await asyncio.gather(
-                *[self._execute_single(tc) for tc in parallel_calls],
+                *[self._execute_single(tc, task_batches.get(tc.id)) for tc in parallel_calls],
                 return_exceptions=False,
             )
             tool_results.extend([r for r in parallel_results if r is not None])
@@ -97,7 +108,7 @@ class ToolOrchestrator:
         for tc in sequential_calls:
             if self.cancel_event.is_set():
                 break
-            result = await self._execute_single(tc)
+            result = await self._execute_single(tc, task_batches.get(tc.id))
             if result is not None:
                 tool_results.append(result)
 
@@ -324,7 +335,247 @@ class ToolOrchestrator:
         ctx.on_request_user_input = self.session.request_user_input
         return ctx
 
-    async def _execute_single(self, tc: Any) -> dict | None:
+    def _extract_parallel_understanding_targets(self) -> list[str]:
+        prompt = str(getattr(self.session, "_current_prompt_text", "") or "").strip()
+        if not prompt:
+            return []
+
+        match = re.search(
+            r"\bboth\s+(?:the\s+)?(?P<left>.+?)\s+and\s+(?:the\s+)?(?P<right>.+?)(?:[.!?\n]|$)",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            left = re.sub(r"\s+", " ", match.group("left")).strip(" ,")
+            right = re.sub(r"\s+", " ", match.group("right")).strip(" ,")
+            if left and right:
+                return [left, right]
+
+        prompt_lower = prompt.lower()
+        if "bob v2" in prompt_lower and "opencode" in prompt_lower:
+            return ["Bob V2 Project", "OpenCode Project"]
+        return []
+
+    @staticmethod
+    def _make_understanding_task_call(target: str, *, workspace_root: Path, in_workspace_hint: bool) -> ToolCallEvent:
+        if in_workspace_hint:
+            prompt = (
+                f"You are exploring {target} in the current workspace at {workspace_root}.\n\n"
+                f"Build a full understanding of {target}: what it is, how it looks, how it works, "
+                "its architecture, key modules, configuration, tests, workflows, and notable implementation details.\n"
+                "Start from top-level structure and key entrypoints, then read concrete files.\n\n"
+                "Return a comprehensive, evidence-backed summary with concrete file paths."
+            )
+        else:
+            prompt = (
+                f"You are researching {target} for a broad comparison request.\n\n"
+                f"Understand what {target} is, how it works, its architecture, key components, main workflows, "
+                "and any official docs or source locations.\n"
+                "If it exists in the current workspace, inspect local files. Otherwise, use web_search/web_fetch "
+                "to research it externally.\n\n"
+                "Return a comprehensive, evidence-backed summary with concrete file paths or URLs."
+            )
+        return ToolCallEvent(
+            id=f"auto_task_{uuid.uuid4().hex[:12]}",
+            name="task",
+            input={
+                "description": f"Explore {target}"[:80],
+                "prompt": prompt,
+                "subagent_type": "explore",
+            },
+        )
+
+    def _build_parallel_understanding_task_pair(self) -> list[Any] | None:
+        targets = self._extract_parallel_understanding_targets()
+        if len(targets) != 2:
+            return None
+        cwd_text = str(getattr(self.session, "cwd", "") or "").lower()
+        left, right = targets
+        left_in_workspace = any(token in cwd_text for token in left.lower().split()[:2])
+        right_in_workspace = any(token in cwd_text for token in right.lower().split()[:2])
+        workspace_root = Path(getattr(self.session, "cwd", Path(".")))
+        return [
+            self._make_understanding_task_call(left, workspace_root=workspace_root, in_workspace_hint=left_in_workspace or not right_in_workspace),
+            self._make_understanding_task_call(right, workspace_root=workspace_root, in_workspace_hint=right_in_workspace and not left_in_workspace),
+        ]
+
+    @staticmethod
+    def _replace_tool_call(tc: Any, *, input: dict[str, Any]) -> Any:
+        if isinstance(tc, ToolCallEvent):
+            return replace(tc, input=input)
+        return type(tc)(
+            **{
+                **getattr(tc, "__dict__", {}),
+                "input": input,
+            }
+        )
+
+    def _needs_parallel_understanding_delegation(self, tool_calls: list[Any]) -> bool:
+        prompt = str(getattr(self.session, "_current_prompt_text", "") or "").lower()
+        if not prompt:
+            return False
+        if any(tc.name == "task" for tc in tool_calls):
+            return False
+
+        broad_markers = (
+            "full understanding",
+            "understand",
+            "understanding",
+            "analyze",
+            "analysis",
+            "map out",
+            "overview",
+        )
+        compare_markers = ("both", "compare", "comparison", "vs", "versus", "between")
+        subject_markers = ("project", "codebase", "repo", "repository", "system", "implementation")
+        if not any(marker in prompt for marker in broad_markers):
+            return False
+        if not any(marker in prompt for marker in compare_markers):
+            return False
+        if not any(marker in prompt for marker in subject_markers):
+            return False
+
+        exploration_tools = {
+            "list_dir",
+            "read_file",
+            "glob_files",
+            "grep_files",
+            "web_search",
+            "web_fetch",
+        }
+        return bool(tool_calls) and all(tc.name in exploration_tools for tc in tool_calls)
+
+    async def _enforce_parallel_understanding_delegation(
+        self,
+        tool_calls: list[Any],
+        tool_results: list[dict],
+    ) -> list[Any]:
+        if not self._needs_parallel_understanding_delegation(tool_calls):
+            return tool_calls
+        auto_tasks = self._build_parallel_understanding_task_pair()
+        if auto_tasks is None:
+            return tool_calls
+        retained = [tc for tc in tool_calls if tc.name not in {"list_dir", "read_file", "glob_files", "grep_files", "web_search", "web_fetch"}]
+        return retained + auto_tasks
+
+    def _auto_expand_single_understanding_task(self, tool_calls: list[Any]) -> list[Any] | None:
+        targets = self._extract_parallel_understanding_targets()
+        if len(targets) != 2:
+            return None
+
+        fresh_tasks = [
+            tc for tc in tool_calls
+            if tc.name == "task" and not str(tc.input.get("task_id", "") or "").strip()
+        ]
+        if len(fresh_tasks) != 1:
+            return None
+
+        original = fresh_tasks[0]
+        original_text = (
+            f"{original.input.get('description', '')}\n{original.input.get('prompt', '')}"
+        ).casefold()
+        matching_targets = [target for target in targets if target.casefold() in original_text]
+        if len(matching_targets) == 1:
+            primary_target = matching_targets[0]
+            companion_target = targets[1] if targets[0] == primary_target else targets[0]
+        else:
+            primary_target = targets[0]
+            companion_target = targets[1]
+
+        repaired_original = self._replace_tool_call(
+            original,
+            input={
+                **dict(original.input),
+                "subagent_type": "explore",
+                "description": str(original.input.get("description") or f"Explore {primary_target}")[:80],
+            },
+        )
+        if primary_target.casefold() not in original_text:
+            repaired_original = self._replace_tool_call(
+                repaired_original,
+                input={
+                    **dict(repaired_original.input),
+                    "description": f"Explore {primary_target}"[:80],
+                },
+            )
+
+        companion = self._make_understanding_task_call(
+            companion_target,
+            workspace_root=Path(getattr(self.session, "cwd", Path("."))),
+            in_workspace_hint=False,
+        )
+
+        repaired_calls: list[Any] = []
+        for tc in tool_calls:
+            if tc.id == original.id:
+                repaired_calls.append(repaired_original)
+            elif tc.name in {"list_dir", "read_file", "glob_files", "grep_files", "web_search", "web_fetch"}:
+                continue
+            else:
+                repaired_calls.append(tc)
+        repaired_calls.append(companion)
+        return repaired_calls
+
+    async def _prepare_task_batches(
+        self,
+        tool_calls: list[Any],
+        tool_results: list[dict],
+    ) -> tuple[list[Any], dict[str, dict[str, int | str]]]:
+        fresh_task_calls = [
+            tc for tc in tool_calls
+            if tc.name == "task" and not str(tc.input.get("task_id", "") or "").strip()
+        ]
+        if not fresh_task_calls:
+            return tool_calls, {}
+
+        if len(fresh_task_calls) == 1:
+            repaired_calls = self._auto_expand_single_understanding_task(tool_calls)
+            if repaired_calls is not None:
+                tool_calls = repaired_calls
+                fresh_task_calls = [
+                    tc for tc in tool_calls
+                    if tc.name == "task" and not str(tc.input.get("task_id", "") or "").strip()
+                ]
+
+        if len(fresh_task_calls) == 1:
+            tc = fresh_task_calls[0]
+            message = (
+                "Parallel delegation policy: fresh subagent delegation requires at least 2 task calls in the same response. "
+                "Either launch 2 or more distinct subagents in parallel, or stay in the main thread."
+            )
+            await self.emit(ToolCallStartedEvent(
+                type="tool_call_started",
+                tool_call_id=tc.id,
+                tool_name=tc.name,
+                tool_input=tc.input,
+            ))
+            await self.emit(ToolCallCompletedEvent(
+                type="tool_call_completed",
+                tool_call_id=tc.id,
+                tool_name=tc.name,
+                output=message,
+                duration_ms=0,
+                error=message,
+            ))
+            tool_results.append({
+                "type": "function_call_output",
+                "call_id": tc.id,
+                "output": message,
+            })
+            return [call for call in tool_calls if call.id != tc.id], {}
+
+        group_id = uuid.uuid4().hex[:8]
+        batches = {
+            tc.id: {
+                "group_id": group_id,
+                "group_size": len(fresh_task_calls),
+                "group_index": index + 1,
+            }
+            for index, tc in enumerate(fresh_task_calls)
+        }
+        return tool_calls, batches
+
+    async def _execute_single(self, tc: Any, task_batch: dict[str, int | str] | None = None) -> dict | None:
         if self.cancel_event.is_set():
             return None
 
@@ -356,6 +607,7 @@ class ToolOrchestrator:
 
         ctx = await self._build_tool_context()
         ctx.current_tool_call_id = call_id
+        ctx.task_batch = dict(task_batch or {})
         t0 = time.monotonic()
         tool_error: str | None = None
         try:

@@ -176,13 +176,17 @@ class TasksCancelParams(BaseModel):
 
 class AgentsSpawnParams(BaseModel):
     thread_id: str
-    task: str
-    name: Optional[str] = None
+    task: Optional[str] = None
+    prompt: Optional[str] = None
+    description: Optional[str] = None
+    task_id: Optional[str] = None
     agent_type: Optional[str] = None
+    subagent_type: Optional[str] = None
     model: Optional[str] = None
-    fork_mode: str = "none"
+    fork_mode: str = "all"
     isolation_mode: Optional[str] = None
     permission_mode: Optional[str] = None
+    background: bool = False
 
 
 class AgentsGetParams(BaseModel):
@@ -205,6 +209,7 @@ class AgentsMessageParams(BaseModel):
 class AgentsWaitParams(BaseModel):
     thread_id: str
     agent_ids: list[str] = Field(default_factory=list)
+    task_ids: list[str] = Field(default_factory=list)
     timeout_ms: int = 300000
 
 

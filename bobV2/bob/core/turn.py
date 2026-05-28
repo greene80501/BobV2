@@ -314,6 +314,7 @@ async def run_turn(
     # Turn started                                                        #
     # ------------------------------------------------------------------ #
     await emit(TurnStartedEvent(type="turn_started", turn_id=turn_id))
+    session._current_turn_id = turn_id
 
     # Analytics: begin timing this turn
     if hasattr(session, "analytics") and session.analytics is not None:
@@ -335,6 +336,7 @@ async def run_turn(
     # ------------------------------------------------------------------ #
     user_content: list[dict] = []
     prompt_text = "\n".join(item.text for item in op.items if item.type == "text")
+    session._current_prompt_text = prompt_text
     for item in op.items:
         if item.type == "text":
             user_content.append({"type": "input_text", "text": item.text})
@@ -796,3 +798,8 @@ async def run_turn(
             type="turn_interrupted", turn_id=turn_id, graceful=False
         ))
         raise
+    finally:
+        session._current_turn_id = None
+        session._current_on_output_delta = None
+        session._current_on_plan_update = None
+        session._current_prompt_text = ""

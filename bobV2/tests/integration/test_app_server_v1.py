@@ -106,14 +106,16 @@ def test_agent_routes():
                     "method": "agents.spawn",
                     "params": {
                         "thread_id": thread_id,
-                        "task": "Inspect the repository and report likely risk areas.",
+                        "description": "Inspect repository",
+                        "prompt": "Inspect the repository and report likely risk areas.",
+                        "subagent_type": "explore",
                     },
                 }
             )
             assert spawned is not None
-            agent_id = spawned["result"]["agent"]["agent_id"]
-            assert spawned["result"]["agent"]["agent_type"] == "worker"
-            assert spawned["result"]["agent"]["name"] == "inspect_repository_report_likely"
+            agent_id = spawned["result"]["agent"]["task_id"]
+            assert spawned["result"]["agent"]["agent_type"] == "explore"
+            assert spawned["result"]["agent"]["title"] == "Inspect repository"
 
             listed = await server.handle_message(
                 {
@@ -131,7 +133,7 @@ def test_agent_routes():
                     "jsonrpc": "2.0",
                     "id": 13,
                     "method": "agents.wait",
-                    "params": {"thread_id": thread_id, "agent_ids": [agent_id], "timeout_ms": 1000},
+                    "params": {"thread_id": thread_id, "task_ids": [agent_id], "timeout_ms": 1000},
                 }
             )
             assert waited is not None

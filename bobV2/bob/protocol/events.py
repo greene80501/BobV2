@@ -527,6 +527,12 @@ class AgentSpawnedEvent(BaseModel):
     path: str
     name: str
     task: str
+    title: Optional[str] = None
+    session_id: Optional[str] = None
+    agent_type: Optional[str] = None
+    group_id: Optional[str] = None
+    group_size: int = 0
+    group_index: int = 0
 
 
 class AgentProgressEvent(BaseModel):
@@ -538,6 +544,12 @@ class AgentProgressEvent(BaseModel):
     last_activity: str
     tool_use_count: int
     token_count: int
+    title: Optional[str] = None
+    session_id: Optional[str] = None
+    agent_type: Optional[str] = None
+    group_id: Optional[str] = None
+    group_size: int = 0
+    group_index: int = 0
 
 
 class AgentCompletedEvent(BaseModel):
@@ -550,6 +562,12 @@ class AgentCompletedEvent(BaseModel):
     error: Optional[str] = None
     tool_use_count: int = 0
     token_count: int = 0
+    title: Optional[str] = None
+    session_id: Optional[str] = None
+    agent_type: Optional[str] = None
+    group_id: Optional[str] = None
+    group_size: int = 0
+    group_index: int = 0
 
 
 # ===========================================================================

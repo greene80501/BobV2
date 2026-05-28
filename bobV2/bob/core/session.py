@@ -34,6 +34,7 @@ class ToolContext:
         self.on_plan_update = None   # set per-turn
         self.on_request_user_input = None
         self.current_tool_call_id = None
+        self.task_batch = None
         self.attach_image = session.attach_image
         # Back-reference so plan_mode tools can toggle the flag
         self._session = session
@@ -70,6 +71,8 @@ class BobSession:
         # Scratch attributes set per-turn so tool context can read them
         self._current_on_output_delta = None
         self._current_on_plan_update = None
+        self._current_turn_id: str | None = None
+        self._current_prompt_text: str = ""
 
         # Setup sandbox
         sandbox_policy = SandboxPolicy(
@@ -325,23 +328,11 @@ class BobSession:
         from bob.tools.notebook_edit import (
             notebook_edit_handler, NOTEBOOK_EDIT_DESCRIPTION, NOTEBOOK_EDIT_SCHEMA,
         )
-        from bob.tools.task_create import (
-            task_create_handler, TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA,
+        from bob.tools.task import (
+            task_handler, TASK_DESCRIPTION, TASK_SCHEMA,
         )
-        from bob.tools.task_update import (
-            task_update_handler, TASK_UPDATE_DESCRIPTION, TASK_UPDATE_SCHEMA,
-        )
-        from bob.tools.task_list import (
-            task_list_handler, TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA,
-        )
-        from bob.tools.task_get import (
-            task_get_handler, TASK_GET_DESCRIPTION, TASK_GET_SCHEMA,
-        )
-        from bob.tools.task_output import (
-            task_output_handler, TASK_OUTPUT_DESCRIPTION, TASK_OUTPUT_SCHEMA,
-        )
-        from bob.tools.task_stop import (
-            task_stop_handler, TASK_STOP_DESCRIPTION, TASK_STOP_SCHEMA,
+        from bob.tools.task_status import (
+            task_status_handler, TASK_STATUS_DESCRIPTION, TASK_STATUS_SCHEMA,
         )
         from bob.tools.request_user_input import (
             request_user_input_handler, REQUEST_USER_INPUT_DESCRIPTION, REQUEST_USER_INPUT_SCHEMA,
@@ -479,26 +470,18 @@ class BobSession:
         # Phase 4 â€” multi-agent
         # Task management tools
         self.tool_registry.register(
-            "task_create", TASK_CREATE_DESCRIPTION, TASK_CREATE_SCHEMA, task_create_handler
-        )
-        self.tool_registry.register(
-            "task_update", TASK_UPDATE_DESCRIPTION, TASK_UPDATE_SCHEMA, task_update_handler
-        )
-        self.tool_registry.register(
-            "task_list", TASK_LIST_DESCRIPTION, TASK_LIST_SCHEMA, task_list_handler,
+            "task", TASK_DESCRIPTION, TASK_SCHEMA, task_handler,
             is_mutating=False,
             supports_parallel=True,
+            source="agents",
+            keywords=["task", "subagent", "delegate", "child session", "background"],
         )
         self.tool_registry.register(
-            "task_get", TASK_GET_DESCRIPTION, TASK_GET_SCHEMA, task_get_handler,
+            "task_status", TASK_STATUS_DESCRIPTION, TASK_STATUS_SCHEMA, task_status_handler,
             is_mutating=False,
             supports_parallel=True,
-        )
-        self.tool_registry.register(
-            "task_output", TASK_OUTPUT_DESCRIPTION, TASK_OUTPUT_SCHEMA, task_output_handler
-        )
-        self.tool_registry.register(
-            "task_stop", TASK_STOP_DESCRIPTION, TASK_STOP_SCHEMA, task_stop_handler
+            source="agents",
+            keywords=["task", "status", "wait", "result", "subagent"],
         )
         # User interaction tool
         self.tool_registry.register(
@@ -619,75 +602,6 @@ class BobSession:
             mcp_authenticate_handler,
             source="mcp",
         )
-        # Multi-agent tools (only for non-ephemeral sessions)
-        if not self.ephemeral:
-            from bob.tools.agents import (
-                spawn_agents_handler, SPAWN_AGENTS_DESCRIPTION, SPAWN_AGENTS_SCHEMA,
-                spawn_agent_handler, SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
-                wait_agent_handler, WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
-                send_message_handler, SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
-                assign_task_handler, ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
-                close_agent_handler, CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
-                list_agents_handler, LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
-            )
-            self.tool_registry.register(
-                "spawn_agents", SPAWN_AGENTS_DESCRIPTION, SPAWN_AGENTS_SCHEMA,
-                spawn_agents_handler,
-                is_mutating=True,
-                supports_parallel=False,
-                source="agents",
-                keywords=["agents", "parallel", "spawn", "workers", "batch", "team"],
-            )
-            self.tool_registry.register(
-                "spawn_agent", SPAWN_AGENT_DESCRIPTION, SPAWN_AGENT_SCHEMA,
-                spawn_agent_handler,
-                is_mutating=True,
-                supports_parallel=False,
-                expose_to_model=False,
-                source="agents",
-                keywords=["agent", "spawn", "legacy", "worker", "background"],
-            )
-            self.tool_registry.register(
-                "wait_agent", WAIT_AGENT_DESCRIPTION, WAIT_AGENT_SCHEMA,
-                wait_agent_handler,
-                is_mutating=False,
-                supports_parallel=False,
-                source="agents",
-                keywords=["agent", "wait", "join", "result"],
-            )
-            self.tool_registry.register(
-                "send_message", SEND_MESSAGE_DESCRIPTION, SEND_MESSAGE_SCHEMA,
-                send_message_handler,
-                is_mutating=True,
-                supports_parallel=False,
-                source="agents",
-                keywords=["agent", "message", "communicate"],
-            )
-            self.tool_registry.register(
-                "assign_task", ASSIGN_TASK_DESCRIPTION, ASSIGN_TASK_SCHEMA,
-                assign_task_handler,
-                is_mutating=True,
-                supports_parallel=False,
-                source="agents",
-                keywords=["agent", "task", "assign", "redirect"],
-            )
-            self.tool_registry.register(
-                "close_agent", CLOSE_AGENT_DESCRIPTION, CLOSE_AGENT_SCHEMA,
-                close_agent_handler,
-                is_mutating=True,
-                supports_parallel=False,
-                source="agents",
-                keywords=["agent", "close", "cancel", "stop", "kill"],
-            )
-            self.tool_registry.register(
-                "list_agents", LIST_AGENTS_DESCRIPTION, LIST_AGENTS_SCHEMA,
-                list_agents_handler,
-                is_mutating=False,
-                supports_parallel=True,
-                source="agents",
-                keywords=["agent", "list", "status", "running"],
-            )
-
         # MCP resource tools
         from bob.tools.mcp_resource_tools import (
             mcp_list_resources_handler, MCP_LIST_RESOURCES_DESCRIPTION, MCP_LIST_RESOURCES_SCHEMA,
@@ -1190,6 +1104,14 @@ class BobSession:
 
         env_ctx = EnvironmentContext.build(self.cwd)
         base += f"\n\n# Environment\n\n{env_ctx.to_prompt_text()}"
+        base += (
+            "\n\n# Workspace Startup Guidance\n"
+            "- The environment block already includes the current working directory and its top-level items at session start.\n"
+            "- Use that startup snapshot as your first source of truth.\n"
+            "- Do not waste early tool calls rediscovering the current directory or repeating the top-level listing unless the workspace may have changed or you need deeper inspection inside a specific path.\n"
+            "- Do not guess parent directories or alternate repo roots outside the current working directory unless the user explicitly asks for that scope.\n"
+            "- Use list_dir for directories, read_file for concrete files, glob_files for discovery, and grep_files for targeted content search.\n"
+        )
 
         # Add output style directive
         from bob.protocol.config_types import OutputStyle
@@ -1219,8 +1141,12 @@ class BobSession:
         if collab_mode == CollaborationModeKind.PLAN:
             base += (
                 "\n\n# COLLABORATION MODE: PLAN\n"
-                "- You are in planning mode. Use read-only tools and stay in the main thread unless there are at least two substantial independent research tracks.\n"
-                "- If you delegate, decompose first and spawn multiple workers in parallel; never spawn a single worker.\n"
+                "- You are in planning mode. Use read-only tools.\n"
+                "- During initial understanding, prefer explore subagents for broad codebase research.\n"
+                "- Launch up to 3 parallel explore subagents when the scope spans multiple areas or the task is a broad comparison.\n"
+                "- Do not launch a lone fresh subagent. If you delegate, launch at least 2 parallel explore subagents; otherwise stay in the main thread.\n"
+                "- Give each explore subagent a distinct search focus and synthesize the findings in the main thread.\n"
+                "- If you delegate, use task/task_status and prefer explore for read-mostly research.\n"
                 "- Do NOT write or edit files until the user approves the plan.\n"
                 "- Produce a detailed, step-by-step plan with clear deliverables."
             )
@@ -1229,19 +1155,22 @@ class BobSession:
                 "\n\n# COLLABORATION MODE: PAIR PROGRAMMING\n"
                 "- Work closely with the user. Explain your reasoning as you go.\n"
                 "- Suggest alternatives and ask clarifying questions when appropriate.\n"
-                "- Use sub-agents only for real parallel work. If the task does not need multiple workers, stay in the main thread.\n"
-                "- Decompose first. Spawn multiple workers only when there are at least two substantial independent tracks.\n"
-                "- Use the worker task prompt to define whether each worker should plan, inspect, implement, or review."
+                "- Use task/task_status for delegation. Launch parallel explore subagents when the work involves broad understanding, comparisons, or multiple independent research tracks.\n"
+                "- Prefer general by default and explore for read-mostly investigation.\n"
+                "- Use background tasks only when the main thread can continue while the child session works."
             )
         elif collab_mode == CollaborationModeKind.EXECUTE:
             base += (
                 "\n\n# COLLABORATION MODE: EXECUTE\n"
                 "- Focus on getting things done with minimal back-and-forth.\n"
-                "- Use sub-agents only for true parallelism. Never spawn a single worker.\n"
-                "- Decompose first. Spawn multiple workers only when there are at least two substantial independent tracks.\n"
-                "- Use the worker task prompt to specify whether each worker should research, plan, implement, or test/review.\n"
-                "- For coding work, parallel workers should have clearly separated scope ownership.\n"
-                "- Wait for all workers to finish before synthesizing the final response.\n"
+                "- Use task/task_status for delegation.\n"
+                "- For broad understanding, comparison, or planning requests, proactively launch parallel explore subagents with distinct focus areas before synthesizing.\n"
+                "- For a two-project or two-system understanding/comparison request, start with exactly 2 parallel explore subagents, one per side, before parent-thread file exploration.\n"
+                "- In the parent thread, keep early repo exploration minimal and anchored to known top-level files or folders only.\n"
+                "- Prefer general by default and explore for read-mostly research.\n"
+                "- When the work naturally splits into independent tracks, make multiple task calls in a single response.\n"
+                "- For coding work, parallel child sessions should still have clearly separated scope ownership.\n"
+                "- Wait for background child sessions before relying on their output.\n"
                 "- Only ask the user for input when truly blocked."
             )
         # DEFAULT mode has no extra directive

@@ -10,10 +10,17 @@ def test_agent_store_round_trip(tmp_path: Path) -> None:
     store = AgentRunStore(tmp_path / "agent_runs.sqlite")
     record = AgentRecord(
         agent_id="abc12345",
-        path=AgentPath.parse("/root/worker"),
+        path=AgentPath.parse("/root/general"),
         task="Review the auth changes",
-        agent_type="worker",
+        agent_type="general",
     )
+    record.title = "Review auth"
+    record.session_id = "sess-child-1"
+    record.background = True
+    record.run_count = 2
+    record.group_id = "grp-1"
+    record.group_size = 2
+    record.group_index = 1
     record.cwd = str(tmp_path)
     record.isolation_mode = "shared_workspace"
     record.permission_mode = "read_only"
@@ -27,7 +34,14 @@ def test_agent_store_round_trip(tmp_path: Path) -> None:
 
     assert fetched is not None
     assert fetched["agent_id"] == "abc12345"
-    assert fetched["agent_type"] == "worker"
+    assert fetched["agent_type"] == "general"
+    assert fetched["title"] == "Review auth"
+    assert fetched["session_id"] == "sess-child-1"
+    assert fetched["background"] is True
+    assert fetched["run_count"] == 2
+    assert fetched["group_id"] == "grp-1"
+    assert fetched["group_size"] == 2
+    assert fetched["group_index"] == 1
     assert fetched["tool_uses"] == 3
     assert fetched["tokens"] == 120
     assert fetched["last_activity"] == "grep_files: auth"

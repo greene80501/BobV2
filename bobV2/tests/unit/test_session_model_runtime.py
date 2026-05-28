@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from bob.config.schema import BobConfig
 from bob.core.session import BobSession
 
@@ -138,3 +142,24 @@ def test_session_passes_kimi_openai_compatible_defaults(monkeypatch) -> None:
     assert client.kwargs["provider_kwargs"]["extra_headers"]["X-Client-Name"] == "claude-code"
     assert client.kwargs["default_timeout_seconds"] == 90.0
     assert session._model_compatibility.provider == "kimi"
+
+
+@pytest.mark.asyncio
+async def test_load_system_prompt_includes_workspace_startup_guidance(tmp_path: Path) -> None:
+    (tmp_path / "bob").mkdir()
+    (tmp_path / "README.md").write_text("# test", encoding="utf-8")
+    session = BobSession.__new__(BobSession)
+    session.config = BobConfig(include_agents_md=False)
+    session.cwd = tmp_path
+    session._system_prompt = None
+
+    await BobSession._load_system_prompt(session)
+
+    assert session._system_prompt is not None
+    assert "Workspace Startup Guidance" in session._system_prompt
+    assert "Startup workspace snapshot:" in session._system_prompt
+    assert "Do not waste early tool calls rediscovering the current directory" in session._system_prompt
+    assert "Do not probe parent directories with `..`" in session._system_prompt
+    assert "Use list_dir for directories, read_file for concrete files" in session._system_prompt
+    assert "  - bob/" in session._system_prompt
+    assert "  - README.md" in session._system_prompt

@@ -8,11 +8,14 @@ import sys
 if sys.platform == "win32" and not sys.flags.utf8_mode:
     import os
     import subprocess
-    result = subprocess.run(
-        [sys.executable, "-X", "utf8", "-m", "bob"] + sys.argv[1:],
-        env=os.environ,
-    )
-    sys.exit(result.returncode)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", "-m", "bob"] + sys.argv[1:],
+            env=os.environ,
+        )
+        sys.exit(result.returncode)
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 from bob.cli.main import cli_main
 

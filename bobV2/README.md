@@ -22,6 +22,8 @@ cd C:\path\to\bob_v2_new_code_geb\bobV2
 py -3.11 -m pip install -e .
 ```
 
+That installs both `bob` and `bob_v2` console commands.
+
 ### macOS
 
 ```bash
@@ -93,9 +95,21 @@ echo 'export OPENAI_API_KEY="sk-..."' >> ~/.zshrc && source ~/.zshrc
 bob
 ```
 
+or:
+
+```powershell
+bob_v2
+```
+
 If `bob` is not on your PATH:
 ```powershell
 C:\Users\<you>\AppData\Local\Programs\Python\Python311\Scripts\bob.exe
+```
+
+If you want to launch without installing a console script first, use:
+
+```powershell
+py -3.11 -m bob
 ```
 
 ### macOS / Linux

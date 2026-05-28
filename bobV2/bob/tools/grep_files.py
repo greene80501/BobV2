@@ -7,6 +7,15 @@ from pathlib import Path
 from typing import Any
 from bob.tools.path_utils import resolve_tool_path
 
+_SKIP_DIR_GLOBS = [
+    "!.git/**",
+    "!__pycache__/**",
+    "!node_modules/**",
+    "!.tox/**",
+    "!.mypy_cache/**",
+]
+_SKIP_SUFFIXES = {".pyc", ".pyo", ".so", ".dll", ".exe"}
+
 GREP_FILES_DESCRIPTION = (
     "Search files for lines matching a regular expression. "
     "Returns results in filepath:lineno:line format, capped at max_results lines."
@@ -104,7 +113,11 @@ def _grep_with_ripgrep(
         "never",
         "--hidden",
         "--no-ignore",
+        "--glob",
+        "!*.pyc",
     ]
+    for skip_glob in _SKIP_DIR_GLOBS:
+        cmd.extend(["--glob", skip_glob])
     if case_insensitive:
         cmd.append("--ignore-case")
     if file_pattern and file_pattern != "**/*":
@@ -172,6 +185,10 @@ def _grep_with_python_fallback(
     for file_path in files:
         if truncated:
             break
+        if any(part in {".git", "__pycache__", "node_modules", ".tox", ".mypy_cache"} for part in file_path.parts):
+            continue
+        if file_path.suffix.lower() in _SKIP_SUFFIXES:
+            continue
         try:
             text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception:

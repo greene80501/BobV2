@@ -36,3 +36,24 @@ async def test_list_dir_handles_symlink_entries_without_follow_symlinks_kwarg(tm
     out = await list_dir_handler({"path": "."}, _ctx(tmp_path))
 
     assert "target/" in out or "target-link@ ->" in out
+
+
+@pytest.mark.asyncio
+async def test_list_dir_recovers_from_redundant_workspace_prefix(tmp_path: Path) -> None:
+    workspace = tmp_path / "bobV2"
+    workspace.mkdir()
+    (workspace / "bob").mkdir()
+
+    out = await list_dir_handler({"path": "bobV2"}, _ctx(workspace))
+
+    assert "bob/" in out
+
+
+@pytest.mark.asyncio
+async def test_list_dir_returns_file_guidance_for_file_paths(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("ok", encoding="utf-8")
+
+    out = await list_dir_handler({"path": "README.md"}, _ctx(tmp_path))
+
+    assert "This path is a file" in out
+    assert "use read_file" in out
