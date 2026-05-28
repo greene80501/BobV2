@@ -1913,14 +1913,14 @@ class Interface:
         out.write(f"\033[{lines}A\033[J")
         out.flush()
 
-    def _print_agent_detail(self, selected: int) -> None:
-        """Print detailed status of the selected agent directly to stdout."""
+    def _print_agent_detail(self, selected: int) -> int:
+        """Draw detailed status of the selected agent. Returns line count."""
         agent_ctrl = getattr(self._session, "agent_control", None)
         if not agent_ctrl:
-            return
+            return 0
         records = [r for r in agent_ctrl.registry._agents.values() if not r.status.is_terminal]
         if not records or selected >= len(records):
-            return
+            return 0
         rec = records[selected]
         info = self._active_agents.get(rec.agent_id, {})
         t0 = info.get("started_at", time.time())
@@ -1949,8 +1949,8 @@ class Interface:
         lines.append(f"  {_bd('╰─')} {_d('details')}")
         for line in lines:
             out.write(line + "\n")
-        out.write("\n")
         out.flush()
+        return len(lines)
 
     # ── Tool-call block helpers ───────────────────────────────────────────────
 
@@ -4047,6 +4047,7 @@ class Interface:
         _inspector_sel = 0
         _inspector_lines = 0
         _inspector_refresh = 0.0
+        _inspector_detail = False
         try:
             while self._task_running or self._pending_approval is not None:
                 if self._pending_approval is not None:
@@ -4090,6 +4091,7 @@ class Interface:
                                     if not _inspector_open:
                                         await self._stop_spinner()
                                         _inspector_sel = 0
+                                        _inspector_detail = False
                                         _inspector_lines = self._draw_inspector_panel(_inspector_sel)
                                         _inspector_open = True
                                         _inspector_refresh = time.time()
@@ -4101,18 +4103,20 @@ class Interface:
                                         else:
                                             _inspector_sel = min(max(0, len(_recs) - 1), _inspector_sel + 1)
                                         self._clear_inspector_panel(_inspector_lines)
-                                        _inspector_lines = self._draw_inspector_panel(_inspector_sel)
+                                        if _inspector_detail:
+                                            _inspector_lines = self._print_agent_detail(_inspector_sel)
+                                        else:
+                                            _inspector_lines = self._draw_inspector_panel(_inspector_sel)
                             elif ch == b'\r' and _inspector_open:
                                 self._clear_inspector_panel(_inspector_lines)
-                                _inspector_lines = 0
-                                self._print_agent_detail(_inspector_sel)
-                                _inspector_open = False
-                                if self._task_running and not self._spinner_active:
-                                    await self._start_spinner()
+                                _inspector_detail = True
+                                _inspector_lines = self._print_agent_detail(_inspector_sel)
+                                _inspector_refresh = time.time()
                             elif ch in (b'\x1b', b'q', b'Q') and _inspector_open:
                                 self._clear_inspector_panel(_inspector_lines)
                                 _inspector_lines = 0
                                 _inspector_open = False
+                                _inspector_detail = False
                                 if self._task_running and not self._spinner_active:
                                     await self._start_spinner()
                     except ImportError:
@@ -4127,11 +4131,15 @@ class Interface:
                             if _recs:
                                 _inspector_sel = min(_inspector_sel, len(_recs) - 1)
                                 self._clear_inspector_panel(_inspector_lines)
-                                _inspector_lines = self._draw_inspector_panel(_inspector_sel)
+                                if _inspector_detail:
+                                    _inspector_lines = self._print_agent_detail(_inspector_sel)
+                                else:
+                                    _inspector_lines = self._draw_inspector_panel(_inspector_sel)
                             else:
                                 self._clear_inspector_panel(_inspector_lines)
                                 _inspector_lines = 0
                                 _inspector_open = False
+                                _inspector_detail = False
                                 if self._task_running and not self._spinner_active:
                                     await self._start_spinner()
                             _inspector_refresh = _now_t
