@@ -1,4 +1,0 @@
-name = "quality-kit"
-version = "0.1.0"
-description = "Quality and review plugin with text utilities and a review-focused skill."
-enabled = true

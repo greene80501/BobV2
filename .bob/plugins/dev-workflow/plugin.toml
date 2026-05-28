@@ -1,4 +1,0 @@
-name = "dev-workflow"
-version = "0.1.0"
-description = "Development workflow plugin with a task-focused MCP server and test guidance skill."
-enabled = true

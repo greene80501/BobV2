@@ -1,4 +1,0 @@
-name = "repo-helper"
-version = "0.1.0"
-description = "Repository exploration plugin with a local MCP server and orientation skill."
-enabled = true

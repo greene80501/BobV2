@@ -47,3 +47,9 @@ Thumbs.db
 
 # Bob agent worktrees (runtime artifact)
 .bob_worktrees/
+
+# Local Bob runtime/plugin state
+.bob/
+
+# Local-only CI/workflow experiments
+.github/workflows/
